@@ -2,10 +2,7 @@ import ollama
 import json
 import re
 
-
-def load_ou_data(path="gen1_ou_data.json"):
-    with open(path) as f:
-        return json.load(f)
+from gen1_data import load_format_data, build_prompt_context
 
 
 def build_reminders(errors):
@@ -13,11 +10,11 @@ def build_reminders(errors):
     reminders = []
     for error in errors:
         if "cannot learn" in error:
-            match = re.match(r'(\S+) cannot learn (\S+) in Gen 1 OU\. Legal moves are: (.+)', error)
+            match = re.match(r'(\S+) cannot learn (\S+) in (\S+)\. Legal moves are: (.+)', error)
             if match:
-                pokemon = match.group(1)
+                pokemon  = match.group(1)
                 bad_move = match.group(2)
-                legal = match.group(3)
+                legal    = match.group(4)
                 reminders.append(
                     f"- {pokemon}: '{bad_move}' is ILLEGAL. Legal moves are: {legal}"
                 )
@@ -26,7 +23,16 @@ def build_reminders(errors):
     return ""
 
 
-def build_prompt(ou_data, battle_feedback=None, validation_errors=None):
+def clean_response(text):
+    """Remove deepseek-r1 thinking blocks and markdown before parsing"""
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    text = re.sub(r'#{1,6}\s+', '', text)
+    text = re.sub(r'\*\*|\*', '', text)
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+    return text.strip()
+
+
+def build_prompt(format_data, format_name="OU", battle_feedback=None, validation_errors=None):
     """
     Build the team generation prompt.
     Battle feedback influences team composition.
@@ -34,14 +40,12 @@ def build_prompt(ou_data, battle_feedback=None, validation_errors=None):
     These are kept separate so battle feedback doesn't destabilise move selection.
     """
 
-    # Build the viable pool context
     pool_lines = []
-    for internal, info in ou_data.items():
+    for internal, info in format_data.items():
         moves = ", ".join(info["moves"])
         pool_lines.append(f"{info['name']}: {moves}")
     pool_text = "\n".join(pool_lines)
 
-    # Battle feedback influences WHICH pokemon to pick
     battle_feedback_text = ""
     if battle_feedback:
         battle_feedback_text = f"""
@@ -52,7 +56,6 @@ Use this to decide which Pokemon to include or replace.
 Do NOT let this affect your move selection - always use the VIABLE POOL for moves.
 """
 
-    # Validation errors reinforce WHICH moves to use
     validation_reminder_text = ""
     if validation_errors:
         reminders = build_reminders(validation_errors)
@@ -64,7 +67,13 @@ MOVES YOU USED INCORRECTLY LAST TIME - DO NOT REPEAT THESE MISTAKES:
 Remember: ONLY use moves exactly as listed in the VIABLE POOL below.
 """
 
-    prompt = f"""You are a Pokemon Gen 1 OU team builder. Follow these steps carefully.
+    prompt = f"""You are a Pokemon Gen 1 {format_name} team builder. Follow these steps carefully.
+
+IMPORTANT: Output ONLY the Showdown import format team.
+Do not think out loud. Do not explain your choices.
+Do not use markdown, headers, numbers or bullet points.
+Do not include any text before or after the 6 Pokemon.
+Your entire response must be parseable as a Showdown team import.
 
 STEP 1 - TEAM SELECTION:
 Choose exactly 6 different Pokemon from the VIABLE POOL below.
@@ -90,7 +99,7 @@ Respond with EXACTLY 6 Pokemon in plain text Showdown import format.
 Each Pokemon MUST have EXACTLY 4 moves - not 3, not 5, EXACTLY 4.
 Count your moves before submitting each Pokemon.
 
-Use exactly this format (X = exactly 4 moves per Pokemon):
+Use exactly this format:
 
 PokemonName1
 - move1of4
@@ -131,17 +140,15 @@ PokemonName6
     return prompt
 
 
-def clean_team_text(team_text, ou_data):
+def clean_team_text(team_text, format_data):
     """Strip any lines that aren't pokemon names or move lines"""
-    valid_names = {info["name"].lower() for info in ou_data.values()}
+    valid_names = {info["name"].lower() for info in format_data.values()}
 
     cleaned = []
     for line in team_text.strip().split('\n'):
         stripped = line.strip()
-        
-        # Strip markdown bold/italic formatting
         stripped = stripped.replace('**', '').replace('*', '').strip()
-        
+
         if not stripped:
             cleaned.append('')
             continue
@@ -158,21 +165,20 @@ def clean_team_text(team_text, ou_data):
     return '\n'.join(cleaned)
 
 
-def validate_team(team_text, ou_data):
+def validate_team(team_text, format_data, format_name="OU"):
     """
-    Validate a generated team against the OU data.
+    Validate a generated team against the format data.
     Returns (is_valid, list of errors)
     """
     errors = []
 
-    # Build lookup by normalised display name
     name_lookup = {}
-    for internal, info in ou_data.items():
+    for internal, info in format_data.items():
         display = info["name"].lower().replace(' ', '').replace('.', '').replace("'", '')
         name_lookup[display] = {
             "internal": internal,
-            "display": info["name"],
-            "moves": set(info["moves"])
+            "display":  info["name"],
+            "moves":    set(info["moves"])
         }
 
     teams = {}
@@ -194,13 +200,12 @@ def validate_team(team_text, ou_data):
     if current_pokemon:
         teams[current_pokemon] = current_moves
 
-    # Validate count
     if len(teams) != 6:
         errors.append(f"Team has {len(teams)} Pokemon, needs exactly 6")
 
     for poke_name, moves in teams.items():
         if poke_name not in name_lookup:
-            errors.append(f"{poke_name} is not in the Gen 1 OU viable pool")
+            errors.append(f"{poke_name} is not in the Gen 1 {format_name} viable pool")
             continue
 
         if len(moves) != 4:
@@ -212,25 +217,22 @@ def validate_team(team_text, ou_data):
         for move in moves:
             if move not in legal_moves:
                 errors.append(
-                    f"{name_lookup[poke_name]['display']} cannot learn {move} in Gen 1 OU. "
+                    f"{name_lookup[poke_name]['display']} cannot learn {move} in {format_name}. "
                     f"Legal moves are: {', '.join(sorted(legal_moves))}"
                 )
 
         if len(moves) != len(set(moves)):
-            errors.append(
-                f"{name_lookup[poke_name]['display']} has duplicate moves"
-            )
+            errors.append(f"{name_lookup[poke_name]['display']} has duplicate moves")
 
-    poke_names = list(teams.keys())
-    if len(poke_names) != len(set(poke_names)):
+    if len(teams) != len(set(teams.keys())):
         errors.append("Team has duplicate Pokemon")
 
     return len(errors) == 0, errors
 
 
-def generate_team(ou_data, battle_feedback=None, max_retries=5):
+def generate_team(format_data, format_name="OU", battle_feedback=None, max_retries=5):
     """
-    Ask model to generate a team.
+    Ask model to generate a team for the given format.
     Battle feedback influences team composition.
     Validation errors accumulate across retries to reinforce move accuracy.
     """
@@ -240,7 +242,8 @@ def generate_team(ou_data, battle_feedback=None, max_retries=5):
         print(f"\n🤖 Generating team (attempt {attempt + 1}/{max_retries})...")
 
         prompt = build_prompt(
-            ou_data,
+            format_data,
+            format_name=format_name,
             battle_feedback=battle_feedback,
             validation_errors=last_errors
         )
@@ -251,12 +254,13 @@ def generate_team(ou_data, battle_feedback=None, max_retries=5):
         )
 
         team_text = response['message']['content'].strip()
-        team_text = clean_team_text(team_text, ou_data)
+        team_text = clean_response(team_text)
+        team_text = clean_team_text(team_text, format_data)
 
         print("\nGenerated team:")
         print(team_text)
 
-        is_valid, errors = validate_team(team_text, ou_data)
+        is_valid, errors = validate_team(team_text, format_data, format_name)
 
         if is_valid:
             print("\n✅ Team is valid!")
@@ -272,15 +276,23 @@ def generate_team(ou_data, battle_feedback=None, max_retries=5):
 
 
 if __name__ == "__main__":
-    print("Loading Gen 1 OU data...")
-    ou_data = load_ou_data()
+    import argparse
 
-    team = generate_team(ou_data)
+    parser = argparse.ArgumentParser(description="Generate a Gen 1 Pokemon team")
+    parser.add_argument("--format", default="OU", help="Format to generate for (OU, UU, LC etc)")
+    args = parser.parse_args()
+
+    print(f"Loading Gen 1 {args.format} data...")
+    format_data = load_format_data(args.format)
+    print(f"Pool: {len(format_data)} Pokemon\n")
+
+    team = generate_team(format_data, format_name=args.format)
 
     if team:
         print("\n🏆 Final team:")
         print(team)
 
-        with open("current_team.txt", "w") as f:
+        filename = f"current_team_{args.format.lower()}.txt"
+        with open(filename, "w") as f:
             f.write(team)
-        print("\nSaved to current_team.txt")
+        print(f"\nSaved to {filename}")
