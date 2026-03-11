@@ -85,6 +85,8 @@ VIABLE POOL (ONLY use Pokemon and moves from this list):
 {pool_text}
 
 RESPONSE FORMAT:
+Do NOT use markdown formatting. No bold, no headers, no asterisks.
+Respond with EXACTLY 6 Pokemon in plain text Showdown import format.
 Each Pokemon MUST have EXACTLY 4 moves - not 3, not 5, EXACTLY 4.
 Count your moves before submitting each Pokemon.
 
@@ -136,6 +138,10 @@ def clean_team_text(team_text, ou_data):
     cleaned = []
     for line in team_text.strip().split('\n'):
         stripped = line.strip()
+        
+        # Strip markdown bold/italic formatting
+        stripped = stripped.replace('**', '').replace('*', '').strip()
+        
         if not stripped:
             cleaned.append('')
             continue
@@ -240,7 +246,7 @@ def generate_team(ou_data, battle_feedback=None, max_retries=5):
         )
 
         response = ollama.chat(
-            model="qwen3:8b",
+            model="deepseek-r1:7b",
             messages=[{"role": "user", "content": prompt}]
         )
 
