@@ -1,8 +1,7 @@
 import ollama
-import json
 import re
 
-from gen1_data import load_format_data, build_prompt_context
+from gen1_data import load_format_data
 
 
 def build_reminders(errors):
@@ -23,21 +22,49 @@ def build_reminders(errors):
     return ""
 
 
+def distil_feedback(battle_feedback):
+    """
+    Convert verbose battle stats into a tight one-line team building constraint.
+    Keeps the feedback surgical so deepseek-r1 doesn't reason its way off the rails.
+    """
+    avoid  = []
+    prefer = []
+
+    for line in battle_feedback.split('\n'):
+        # Look for pokemon performance lines e.g. "  alakazam: fainted 100% of battles"
+        match = re.match(r'\s+(\w+):\s+fainted\s+(\d+)%', line)
+        if match:
+            name      = match.group(1)
+            faint_pct = int(match.group(2))
+            if faint_pct == 100:
+                avoid.append(name)
+            elif faint_pct <= 30:
+                prefer.append(name)
+
+    parts = []
+    if avoid:
+        parts.append(f"Replace these (fainted every battle): {', '.join(avoid)}")
+    if prefer:
+        parts.append(f"Keep these (strong performers): {', '.join(prefer)}")
+
+    return " | ".join(parts) if parts else ""
+
+
 def clean_response(text):
     """Remove deepseek-r1 thinking blocks and markdown before parsing"""
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     text = re.sub(r'#{1,6}\s+', '', text)
     text = re.sub(r'\*\*|\*', '', text)
     text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^-{3,}$', '', text, flags=re.MULTILINE)  # strip --- dividers
     return text.strip()
 
 
 def build_prompt(format_data, format_name="OU", battle_feedback=None, validation_errors=None):
     """
     Build the team generation prompt.
-    Battle feedback influences team composition.
-    Validation errors reinforce move accuracy.
-    These are kept separate so battle feedback doesn't destabilise move selection.
+    Battle feedback is distilled to a single tight constraint.
+    Validation errors are kept separate to reinforce move accuracy.
     """
 
     pool_lines = []
@@ -49,11 +76,9 @@ def build_prompt(format_data, format_name="OU", battle_feedback=None, validation
     battle_feedback_text = ""
     if battle_feedback:
         battle_feedback_text = f"""
-TEAM BUILDING GUIDANCE FROM PREVIOUS BATTLES:
-{battle_feedback}
-
-Use this to decide which Pokemon to include or replace.
-Do NOT let this affect your move selection - always use the VIABLE POOL for moves.
+TEAM SELECTION GUIDANCE: {battle_feedback}
+Use this only to decide which Pokemon to include or replace.
+Do NOT let this affect your move selection - always copy moves from the VIABLE POOL.
 """
 
     validation_reminder_text = ""
@@ -61,17 +86,17 @@ Do NOT let this affect your move selection - always use the VIABLE POOL for move
         reminders = build_reminders(validation_errors)
         if reminders:
             validation_reminder_text = f"""
-MOVES YOU USED INCORRECTLY LAST TIME - DO NOT REPEAT THESE MISTAKES:
+MOVES YOU USED INCORRECTLY LAST TIME - DO NOT REPEAT:
 {reminders}
 
-Remember: ONLY use moves exactly as listed in the VIABLE POOL below.
+Remember: ONLY use moves exactly as listed in the VIABLE POOL.
 """
 
     prompt = f"""You are a Pokemon Gen 1 {format_name} team builder. Follow these steps carefully.
 
 IMPORTANT: Output ONLY the Showdown import format team.
 Do not think out loud. Do not explain your choices.
-Do not use markdown, headers, numbers or bullet points.
+Do not use markdown, headers, numbers, bullet points or dividers.
 Do not include any text before or after the 6 Pokemon.
 Your entire response must be parseable as a Showdown team import.
 
@@ -85,8 +110,8 @@ CRITICAL RULES FOR MOVES:
 - Copy move names EXACTLY as they appear in the VIABLE POOL - character for character
 - Do NOT use any move not explicitly listed for that Pokemon
 - Do NOT invent move names or use variations (e.g. if "surf" is listed, do NOT write "hydropump")
-- Do NOT add type suffixes (e.g. never write "hiddenpower(ice)")
 - Do NOT use moves from other Pokemon's lists
+- "psychic" is the correct move name — NOT "psycho", "psychics" or "psychicm"
 - If you are unsure whether a move is legal, pick a different one from the list
 {validation_reminder_text}
 
@@ -94,12 +119,10 @@ VIABLE POOL (ONLY use Pokemon and moves from this list):
 {pool_text}
 
 RESPONSE FORMAT:
-Do NOT use markdown formatting. No bold, no headers, no asterisks.
+No markdown. No bold. No headers. No asterisks. No dividers.
 Respond with EXACTLY 6 Pokemon in plain text Showdown import format.
 Each Pokemon MUST have EXACTLY 4 moves - not 3, not 5, EXACTLY 4.
 Count your moves before submitting each Pokemon.
-
-Use exactly this format:
 
 PokemonName1
 - move1of4
@@ -148,6 +171,7 @@ def clean_team_text(team_text, format_data):
     for line in team_text.strip().split('\n'):
         stripped = line.strip()
         stripped = stripped.replace('**', '').replace('*', '').strip()
+        stripped = stripped.rstrip(':').strip()
 
         if not stripped:
             cleaned.append('')
@@ -189,8 +213,10 @@ def validate_team(team_text, format_data, format_name="OU"):
 
     for line in lines:
         if line.startswith('-'):
+            # Strip and ignore empty move lines (phantom carriage returns)
             move = line.lstrip('- ').strip().lower().replace(' ', '').replace('-', '')
-            current_moves.append(move)
+            if move:
+                current_moves.append(move)
         elif line:
             if current_pokemon:
                 teams[current_pokemon] = current_moves
@@ -233,10 +259,13 @@ def validate_team(team_text, format_data, format_name="OU"):
 def generate_team(format_data, format_name="OU", battle_feedback=None, max_retries=5):
     """
     Ask model to generate a team for the given format.
-    Battle feedback influences team composition.
-    Validation errors accumulate across retries to reinforce move accuracy.
+    Battle feedback is distilled before passing to the prompt.
+    Validation errors accumulate across retries.
     """
     last_errors = []
+
+    # Distil verbose battle feedback into a tight constraint
+    tight_feedback = distil_feedback(battle_feedback) if battle_feedback else None
 
     for attempt in range(max_retries):
         print(f"\n🤖 Generating team (attempt {attempt + 1}/{max_retries})...")
@@ -244,7 +273,7 @@ def generate_team(format_data, format_name="OU", battle_feedback=None, max_retri
         prompt = build_prompt(
             format_data,
             format_name=format_name,
-            battle_feedback=battle_feedback,
+            battle_feedback=tight_feedback,
             validation_errors=last_errors
         )
 
