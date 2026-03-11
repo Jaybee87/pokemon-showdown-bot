@@ -1,0 +1,35 @@
+Alakazam
+- confusion
+- hyperbeam
+- psychic
+- teleport
+
+Cloyster
+- aurorabeam
+- icebeam
+- hyperbeam
+- substitute
+
+Gengar
+- psywave
+- hypnosis
+- hyperbeam
+- rage
+
+Exeggutor
+- hyperbeam
+- solarbeam
+- psywave
+- takedown
+
+Rhydon
+- earthquake
+- hyperbeam
+- rage
+- substitute
+
+Zapdos
+- agility
+- hyperbeam
+- thunderbolt
+- thunderwave

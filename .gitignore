@@ -1,0 +1,18 @@
+# Credentials - never commit these
+credentials.py
+
+# Generated data files (can be regenerated)
+gen1_ou_data.json
+current_team.txt
+battle_feedback.txt
+team_iteration_*.txt
+feedback_iteration_*.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+*.log
