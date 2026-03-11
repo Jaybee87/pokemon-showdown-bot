@@ -138,15 +138,14 @@ async def run_vs_self(team, n_battles=10):
         battle_format="gen1ou",
         team=team,
         server_configuration=LocalhostServerConfiguration,
-        account_configuration=AccountConfiguration("SelfBot1", None),
+        account_configuration=AccountConfiguration(f"SelfBot1_{random_suffix()}", None),
         log_level=20
     )
-
     player2 = StatTrackingPlayer(
         battle_format="gen1ou",
         team=team,
         server_configuration=LocalhostServerConfiguration,
-        account_configuration=AccountConfiguration("SelfBot2", None),
+        account_configuration=AccountConfiguration(f"SelfBot2_{random_suffix()}", None),
         log_level=20
     )
 
