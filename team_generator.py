@@ -15,17 +15,18 @@ Usage:
     python3 team_generator.py --format OU  # random anchor from pool
 """
 
-import ollama
 import re
 import random
 import argparse
 from collections import defaultdict
 
+from config import LLM_MODEL
 from gen1_data import load_format_data
-from gen1_type_chart import (
+from gen1_engine import (
     TYPES, get_weaknesses, get_strengths,
     get_weaknesses_summary, get_immunities, get_resistances
 )
+from llm_bridge import call_llm, strip_think_tags, parse_move_picks
 
 
 # =============================================================================
@@ -545,28 +546,29 @@ move3
 move4"""
 
     for attempt in range(max_retries):
-        response = ollama.chat(
-            model="deepseek-r1:7b",
-            messages=[{"role": "user", "content": prompt}]
-        )
+        raw, err = call_llm(prompt)
+        if err:
+            print(f"  ✗ {display_name} attempt {attempt+1}: LLM error: {err}")
+            continue
 
-        raw = response['message']['content'].strip()
-        raw = re.sub(r'<think>.*?</think>', '', raw, flags=re.DOTALL)
-        raw = re.sub(r'\*\*|\*|#{1,6}', '', raw)
-        raw = re.sub(r'^[-\d]+[\.\)]\s*', '', raw, flags=re.MULTILINE)
-
-        legal_set = set(filtered_moves)
-        picked    = []
-        for line in raw.strip().split('\n'):
-            move = line.strip().lower().replace(' ', '').replace('-', '')
-            if move in legal_set and move not in picked:
-                picked.append(move)
+        picked = parse_move_picks(raw, filtered_moves, expected_count=4)
 
         if len(picked) == 4:
             print(f"  ✓ {display_name}: {', '.join(picked)}")
             return picked
         else:
             print(f"  ✗ {display_name} attempt {attempt+1}: got {len(picked)} valid moves ({picked})")
+            if attempt < max_retries - 1:
+                cleaned = strip_think_tags(raw)
+                cleaned = re.sub(r'\*\*|\*|#{1,6}', '', cleaned)
+                cleaned = re.sub(r'^[-\d]+[\.\)]\s*', '', cleaned, flags=re.MULTILINE)
+                legal_set = set(filtered_moves)
+                bad = [
+                    l.strip().lower().replace(' ', '').replace('-', '')
+                    for l in cleaned.strip().split('\n')
+                    if l.strip().lower().replace(' ', '').replace('-', '') not in legal_set
+                    and l.strip()
+                ]
             if attempt < max_retries - 1:
                 bad = [
                     l.strip().lower().replace(' ', '').replace('-', '')

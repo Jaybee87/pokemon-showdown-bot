@@ -6,47 +6,102 @@ Python handles clear-cut decisions instantly. The LLM is called only when genuin
 
 ---
 
+## How It Works
+
+```
+python3 main.py          # Build a team (interactive anchor selection, 5 iterations)
+python3 live_challenge.py --accept   # Go live on Showdown
+```
+
+That's it. `main.py` handles everything: fetches Gen 1 data from pokered, builds teams with LLM-assisted move selection, stress tests them locally, and iterates. Then `live_challenge.py` takes the final team online.
+
+---
+
+## Quick Start
+
+See [INSTALL.md](INSTALL.md) for full setup (Python, Showdown server, Ollama, credentials).
+
+Once set up:
+
+```bash
+# Step 1 — Build and test a team (runs locally, needs Showdown server + Ollama)
+python3 main.py
+
+# Step 2 — Go live (connects to play.pokemonshowdown.com)
+python3 live_challenge.py --accept
+# Then challenge the bot from your browser: /challenge BotName, gen1ou
+```
+
+### Console output during live play
+
+The bot runs in compact mode — one line per turn so you can monitor at a glance:
+
+```
+  ⚡ T01 gengar(100%) vs alakazam(100%) → nightshade [py]
+  🤖 T03 exeggutor(85%) vs alakazam(69%) → psychic [llm]
+  ⚡ T06 rhydon(100%) vs zapdos(46%) → rockslide [py]
+  🤖 T11 alakazam(100%) vs exeggutor(32%) → seismictoss [llm]
+```
+
+`⚡` = Python fast-path decision, `🤖` = LLM decision. Full verbose detail is always captured in the log file.
+
+---
+
 ## Project Structure
 
 ```
-gen1_data.py              # Gen 1 Pokemon/move data sourced from pokered ASM
-gen1_type_chart.py        # Gen 1 specific type chart (with RBY bugs intact)
-team_generator.py         # LLM-driven Gen 1 OU team builder
-battle_runner.py          # Dumb stress tester (RandomPlayer vs RandomPlayer)
-competitive_player.py     # Smart hybrid Python/LLM player (main entry point)
-main.py                   # Orchestrates team builder iteration loop
+pokemon-showdown-bot/
+├── main.py                # Single entry point — build team, stress test, iterate
+├── live_challenge.py      # Connect to live Showdown, challenge real players
+├── competitive_player.py  # Hybrid Python/LLM decision engine
+├── gen1_engine.py         # Gen 1 type chart + effectiveness (single source of truth)
+├── gen1_data.py           # Pokemon/move data from pokered ASM + Showdown tiers
+├── team_generator.py      # LLM-driven team builder with battle feedback loop
+├── battle_runner.py       # Local stress tester (StatTrackingPlayer vs RandomPlayer)
+├── llm_bridge.py          # All LLM interaction — thread-safe timeout, response parsing
+├── config.py              # Central config — model name, server URLs, format settings
+├── credentials.py         # Bot's Showdown login (gitignored, you create this)
+├── teams/                 # Generated team iterations + feedback (gitignored)
+│   ├── team_ou_iteration_1.txt
+│   ├── feedback_ou_iteration_1.txt
+│   └── ...
+├── live_logs/             # Battle logs from live and local play (gitignored)
+│   ├── live_log_001.txt
+│   └── ...
+└── archive/
+    └── showdown.py        # Retired raw websocket client (reference only)
 ```
 
 ---
 
-## competitive_player.py
-
-The main bot. Runs a hybrid decision engine against a local RandomPlayer opponent.
-
-```bash
-python3 competitive_player.py              # auto-loads highest team_ou_iteration_N.txt
-python3 competitive_player.py --battles 5  # run multiple battles
-python3 competitive_player.py --format ou  # explicit format
-```
-
-Logs are auto-numbered: `competitive_log_001.txt`, `002.txt`, etc. Output is tee'd to both stdout and file.
-
-### Decision Tree
+## Decision Tree
 
 ```
+PRE-FILTER          → remove all immune moves (0x) from options
+                       Electric → Ground, Normal → Ghost, Ghost → Normal,
+                       Fighting → Ghost, Ground → Flying, Psychic → Ghost (Gen 1)
+                       Fixed-damage moves (Seismic Toss, Night Shade) are kept
 RECHARGE TURN       → forced, instant
 STEP 1              → no moves + no switches → default
-STEP 2              → faint / no real moves  → LLM picks switch-in (or auto if only one left)
+STEP 2              → faint / no real moves  → LLM picks switch-in
 STEP 3              → compute best_move (STAB-aware, Hyper Beam penalised)
 STEP 4              → immune to all opponent known moves → attack freely
-STEP 5              → danger switch
-                       Tier A: confirmed 2x from revealed moves + <40% HP
-                       Tier B: STAB type threat + <50% HP (conservative fallback)
+STEP 5              → danger switch (confirmed threat or STAB threat)
 STEP 6              → dominant 2x+ advantage (bp ≥ 60) → attack
 STEP 7a             → Rest available + HP < 40% → use Rest
-STEP 7b             → opponent asleep + Dream Eater available → use Dream Eater
-STEP 8              → AMBIGUOUS → LLM called
+STEP 7b             → opponent asleep + Dream Eater → use Dream Eater
+STEP 8              → AMBIGUOUS → LLM called with full battle context
 ```
+
+### Move Filtering (before LLM or Python sees options)
+
+Moves are removed from the available options when they would be wasted:
+
+- All moves dealing 0x damage to the opponent (type immunities)
+- Thunder Wave if opponent already has a status condition
+- Thunder Wave against Ground types (immune to Electric)
+- Dream Eater unless opponent is asleep
+- Explosion / Self-Destruct never auto-picked (LLM decision only)
 
 ### LLM Trigger Conditions
 
@@ -55,47 +110,54 @@ The LLM is called when Python can't confidently resolve the situation:
 - Best move is resisted or we're in danger
 - Neutral matchup with unknown opponent moveset
 - A switch-in resists the opponent's known moves
-- Sleep move available (Hypnosis, Sleep Powder, Spore, Lovely Kiss) + opponent unstatused
+- Sleep move available + opponent unstatused
 - Thunder Wave available + opponent unstatused
 - Hyper Beam is the best move (recharge cost needs weighing)
 
-### Filtered Moves
-
-- **Thunder Wave** — removed from options if opponent already has a status
-- **Dream Eater** — removed unless opponent is asleep (SLP)
-- **Explosion / Self-Destruct** — never auto-picked; LLM-only decision
-- **Struggle / Recharge** — handled as forced turns, bypass decision tree
-
 ---
 
-## Team Builder Loop
+## Live Play
+
+### Accept mode (recommended)
 
 ```bash
-python3 main.py
+python3 live_challenge.py --accept
 ```
 
-Runs an iterative loop: generate team → stress test with battle_runner → collect feedback → regenerate. Teams are saved as `team_ou_iteration_N.txt`. The competitive player auto-loads the highest iteration.
+The bot logs into Showdown, then waits. You challenge it from your browser. This bypasses Showdown's IP-based spam restrictions on new bot accounts.
+
+### Challenge mode
+
+```bash
+python3 live_challenge.py --opponent YourUsername
+```
+
+The bot sends the challenge. Your opponent accepts in their browser. May be blocked for new accounts on flagged IPs — use accept mode instead.
+
+### Features
+
+- Auto-starts the battle timer (disconnected opponents auto-forfeit)
+- Compact console output — one line per turn for monitoring
+- Full verbose reasoning captured in `live_logs/live_log_NNN.txt`
+- Thread-safe LLM calls (won't freeze the websocket connection)
+- All type immunities filtered before the LLM sees move options
 
 ---
 
-## Battle Results (vs RandomPlayer, iteration 5 team)
+## Configuration
 
-| Log | Result | Turns | LLM% | Notes |
-|-----|--------|-------|------|-------|
-| 001 | WIN    | 43    | 85%  | Early build, LLM fallback heavy |
-| 002 | WIN    | 46    | 16%  | Recharge + type chart fixes |
-| 003 | LOSS   | 48    | 11%  | Hyper Beam spam, no STAB |
-| 004 | WIN    | 31    | 25%  | Rest working, faint→LLM |
-| 007 | WIN    | 27    | 37%  | Team preview, opponent HP visible |
-| 008 | WIN    | 29    | 41%  | Status tracking, Dream Eater fix |
-| 009 | LOSS   | 43    | 27%  | Close — paralysis RNG endgame |
-| 010 | WIN    | 25    | 40%  | Hypnosis trigger, clean Thunder Wave |
+All settings live in `config.py`:
 
----
+```python
+LLM_MODEL = "deepseek-r1:7b"     # Change to use a different model
+LLM_TIMEOUT_SECONDS = 30          # Hard timeout for live play safety
+```
 
-## Current Team (iteration 5)
+Override with environment variables:
 
-Gengar / Exeggutor / Zapdos / Cloyster / Tauros / Alakazam
+```bash
+LLM_MODEL=deepseek-r1:14b python3 live_challenge.py --accept
+```
 
 ---
 
@@ -103,6 +165,7 @@ Gengar / Exeggutor / Zapdos / Cloyster / Tauros / Alakazam
 
 - `Ghost → Psychic = 0x` (RBY programming bug — Ghost moves don't work on Psychic)
 - `Psychic → Ghost = 1x` (not 0x — Ghost is not immune to Psychic in Gen 1)
+- `Ice → Fire = 1x` (neutral in Gen 1, not resisted as in Gen 2+)
 - No Dark / Steel / Fairy types
 - Seismic Toss / Night Shade deal fixed damage equal to user level (ignore type chart)
 - Sleep is the strongest status — Dream Eater combo is explicitly supported
@@ -111,8 +174,16 @@ Gengar / Exeggutor / Zapdos / Cloyster / Tauros / Alakazam
 
 ## Roadmap
 
-- [ ] Connect to live Showdown ladder
+- [x] Connect to live Showdown server
+- [x] Challenge real players (accept + challenge modes)
+- [x] Thread-safe LLM calls
+- [x] Opponent move type tracking
+- [x] Type immunity pre-filtering
+- [x] Compact console output for ladder monitoring
+- [x] Battle timer (disconnect protection)
+- [x] Interactive anchor selection
+- [x] Organised output directories
 - [ ] Upgrade LLM backend (14b+ model for better reasoning)
-- [ ] Gen 1 move data from pokered source (`gen1_moves.py`)
 - [ ] Gen 2 support (held items, expanded pool)
-- [ ] Scale battle_runner iterations
+- [ ] Win/loss tracking across sessions
+- [ ] Ladder mode (continuous matchmaking)

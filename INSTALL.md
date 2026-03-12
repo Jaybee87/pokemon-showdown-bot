@@ -5,7 +5,7 @@
 - Python 3.12+
 - Node.js 18+ (for local Pokemon Showdown server)
 - [Ollama](https://ollama.com) with a downloaded model
-- GPU recommended (RTX 5070 or similar — 12GB VRAM runs deepseek-r1:7b at ~40% utilisation)
+- GPU recommended (12GB+ VRAM for deepseek-r1:7b)
 
 ---
 
@@ -24,34 +24,32 @@ cd pokemon-showdown-bot
 pip install poke-env ollama --break-system-packages
 ```
 
-> **Note:** `--break-system-packages` is required on Pop!_OS / Ubuntu 24 with system Python.
-> Use a virtualenv if you prefer to keep things isolated.
+> `--break-system-packages` is needed on Ubuntu 24 / Pop!_OS with system Python.
+> Use a virtualenv if you prefer isolation.
 
 ---
 
 ## 3. Local Pokemon Showdown server
 
-The bot runs against a local Showdown instance with security disabled.
+Required for team building (`main.py`) and local testing (`competitive_player.py`).
+Not needed for live play (`live_challenge.py`) — that connects directly to Showdown's servers.
 
 ```bash
-# Clone Showdown if you don't have it
-git clone https://github.com/smogon/pokemon-showdown.git
-cd pokemon-showdown
+git clone https://github.com/smogon/pokemon-showdown.git ~/pokemon-showdown
+cd ~/pokemon-showdown
 npm install
 
 # Start the server (leave running in a separate terminal)
 node pokemon-showdown start --no-security
 ```
 
-Server runs on `localhost:8000` by default. The bot is configured for this — no changes needed.
+Server runs on `localhost:8000` by default.
 
 ---
 
-## 4. Ollama and model setup
+## 4. Ollama setup
 
-This project uses [Ollama](https://ollama.com) as the local LLM backend. The decision engine calls Ollama's API to resolve ambiguous battle situations.
-
-### Install Ollama
+### Install
 
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
@@ -59,96 +57,167 @@ curl -fsSL https://ollama.com/install.sh | sh
 
 ### Download a model
 
-The bot is currently configured for `deepseek-r1:7b`:
-
 ```bash
 ollama pull deepseek-r1:7b
 ```
 
 ### Using a different model
 
-The model name is set in `competitive_player.py` and `team_generator.py`. Search for:
-
-```python
-model="deepseek-r1:7b"
-```
-
-Replace with any model available in your Ollama installation, for example:
-
-```python
-model="deepseek-r1:14b"     # Better reasoning, needs ~10GB VRAM
-model="llama3.1:8b"         # Alternative if deepseek unavailable
-model="mistral:7b"           # Lighter option
-```
-
-List your locally available models:
+Set in `config.py` or override with an environment variable:
 
 ```bash
-ollama list
+LLM_MODEL=deepseek-r1:14b python3 main.py
 ```
 
-> **Model quality note:** Larger models produce significantly better battle decisions.
-> The 7b model occasionally hallucinates type matchups and move properties.
-> A 14b+ model is recommended once you're ready to go live on the Showdown ladder.
+Alternatives: `deepseek-r1:14b` (better reasoning, ~10GB VRAM), `llama3.1:8b`, `mistral:7b`.
 
-### Verify Ollama is running
+> Larger models produce significantly better battle decisions. The 7b model occasionally hallucinates type matchups. 14b+ is recommended for live ladder play.
+
+### Verify
 
 ```bash
 ollama run deepseek-r1:7b "say hello"
 ```
 
-Ollama must be running as a service before launching the bot. On most systems it starts automatically after install. If not:
+---
 
-```bash
-ollama serve
+## 5. Credentials (for live play only)
+
+Create `credentials.py` in the project root:
+
+```python
+username = "YourBotUsername"
+password = "YourBotPassword"
 ```
+
+**Important:** use lowercase `username` and `password` — uppercase `USERNAME` will not work.
+
+The bot account must be registered at [play.pokemonshowdown.com](https://play.pokemonshowdown.com). This file is gitignored.
 
 ---
 
-## 5. Run the bot
+## 6. Build a team
 
 ```bash
-# Make sure Showdown server is running first (step 3)
-
-# Single battle
-python3 competitive_player.py
-
-# Multiple battles
-python3 competitive_player.py --battles 10
-
-# Run the team builder iteration loop
 python3 main.py
 ```
 
----
+This runs preflight checks, fetches Gen 1 data (first run only), then walks you through:
 
-## Switching to a different LLM backend
+1. **Anchor selection** — pick your lead Pokemon from the OU roster or type any name
+2. **Team composition** — Python analyses type coverage and selects complementary teammates
+3. **Move selection** — LLM picks 4 moves per Pokemon from their legal move pool
+4. **Stress testing** — runs battles vs random opponents and self-play
+5. **Iteration** — feeds battle results back into the next team generation
 
-The bot currently uses Ollama exclusively. All LLM calls go through two functions:
+Teams and feedback are saved to `teams/`:
 
-- `call_llm_for_decision()` in `competitive_player.py`
-- The team generation prompts in `team_generator.py`
-
-Both use the `ollama` Python library:
-
-```python
-import ollama
-response = ollama.chat(
-    model="deepseek-r1:7b",
-    messages=[{"role": "user", "content": prompt}]
-)
-raw = response['message']['content']
+```
+teams/team_ou_iteration_1.txt
+teams/feedback_ou_iteration_1.txt
+teams/team_ou_iteration_2.txt
+...
 ```
 
-To swap in a different backend (e.g. Anthropic API, OpenAI, local llama.cpp), replace these calls with your preferred client. The prompt strings and response parsing are backend-agnostic — only the `ollama.chat(...)` call needs changing.
+Options:
+
+```bash
+python3 main.py --anchor gengar        # skip interactive prompt
+python3 main.py --iterations 10        # more improvement cycles
+python3 main.py --battles 20           # more battles per test
+python3 main.py --rebuild-data         # force refresh Pokemon data from pokered
+```
 
 ---
 
-## File locations (defaults)
+## 7. Go live
 
-| Path | Purpose |
+### Accept mode (recommended)
+
+```bash
+python3 live_challenge.py --accept
+```
+
+The bot logs into Showdown and waits. From your personal account in the browser, type:
+
+```
+/challenge BotUsername, gen1ou
+```
+
+This bypasses Showdown's IP-based restrictions on new accounts.
+
+### Challenge mode
+
+```bash
+python3 live_challenge.py --opponent YourPersonalAccount
+```
+
+The bot sends the challenge. May be blocked for new bot accounts — use accept mode instead.
+
+### Options
+
+```bash
+python3 live_challenge.py --accept --battles 5      # accept 5 consecutive challenges
+python3 live_challenge.py --accept --format gen1uu   # different format
+```
+
+### What you'll see
+
+Compact one-liner per turn on the console:
+
+```
+  ⚡ T01 gengar(100%) vs alakazam(100%) → nightshade [py]
+  🤖 T03 exeggutor(85%) vs alakazam(69%) → psychic [llm]
+  ⚡ T06 rhydon(100%) vs zapdos(46%) → rockslide [py]
+```
+
+Full verbose reasoning is saved to `live_logs/live_log_NNN.txt`.
+
+### Battle timer
+
+The bot auto-starts Showdown's battle timer. If your opponent disconnects, they'll auto-forfeit after the timeout. No more hanging battles.
+
+---
+
+## 8. Local testing (optional)
+
+Test the decision engine locally without connecting to Showdown:
+
+```bash
+python3 competitive_player.py --battles 5
+```
+
+Requires the local Showdown server running. Logs saved to `live_logs/competitive_log_NNN.txt`.
+
+---
+
+## File overview
+
+| File | Purpose |
 |------|---------|
-| `~/pokemon-showdown/` | Local Showdown server |
-| `~/pokemon-showdown-bot/` | This repo |
-| `team_ou_iteration_N.txt` | Generated teams (auto-loaded by bot) |
-| `competitive_log_NNN.txt` | Battle logs (auto-numbered) |
+| `main.py` | Single entry point — preflight, team build, stress test, iterate |
+| `live_challenge.py` | Live Showdown — accept or send challenges |
+| `competitive_player.py` | Hybrid Python/LLM decision engine |
+| `gen1_engine.py` | Gen 1 type chart + effectiveness + move scoring |
+| `gen1_data.py` | Pokemon/move data from pokered ASM + Showdown tiers |
+| `team_generator.py` | LLM team builder with battle feedback loop |
+| `battle_runner.py` | Local stress tester (random + self-play) |
+| `llm_bridge.py` | LLM call wrapper (thread-safe timeout, parsing) |
+| `config.py` | Central config — model, servers, format |
+| `credentials.py` | Bot login for live Showdown (gitignored) |
+| `teams/` | Generated teams + feedback per iteration (gitignored) |
+| `live_logs/` | Battle logs from live + local play (gitignored) |
+
+---
+
+## Troubleshooting
+
+**"credentials.py uses USERNAME"** — use lowercase: `username = "Bot"` not `USERNAME = "Bot"`
+
+**"spam from your internet provider"** — Showdown blocks challenges from new accounts on flagged IPs. Use `--accept` mode instead (you challenge the bot from your browser).
+
+**"signal only works in main thread"** — you're running an old version of `llm_bridge.py`. The current version uses thread-pool timeouts.
+
+**LLM timeout errors** — increase the timeout in `config.py`: `LLM_TIMEOUT_SECONDS = 60`. Or use a faster model.
+
+**"gen1_data.json not found"** — run `python3 main.py` first. It auto-builds from pokered on first run. Needs internet access and a local Showdown install.

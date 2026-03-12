@@ -27,7 +27,11 @@ from collections import Counter
 
 POKERED_BASE_STATS = "https://raw.githubusercontent.com/pret/pokered/master/data/pokemon/base_stats/{}.asm"
 POKERED_LEARNSETS  = "https://raw.githubusercontent.com/pret/pokered/master/data/pokemon/moves/{}.asm"
-SHOWDOWN_PATH      = os.path.expanduser("~/pokemon-showdown")
+try:
+    from config import SHOWDOWN_INSTALL_PATH
+    SHOWDOWN_PATH = SHOWDOWN_INSTALL_PATH
+except ImportError:
+    SHOWDOWN_PATH = os.path.expanduser("~/pokemon-showdown")
 
 # =============================================================================
 # ALL 151 POKEMON
@@ -398,15 +402,54 @@ def build_gen1_data():
 # PUBLIC API
 # =============================================================================
 
+def ensure_gen1_data(path="gen1_data.json"):
+    """
+    Check if gen1_data.json exists. If not, build it from pokered + Showdown.
+    Returns the path to the JSON file.
+
+    Requirements:
+    - Internet access (fetches from github.com/pret/pokered)
+    - Local Pokemon Showdown install (for tier data)
+    """
+    if os.path.exists(path):
+        return path
+
+    print(f"📦 {path} not found — building from pokered source...")
+    print(f"   This fetches all 151 Pokemon from github.com/pret/pokered")
+    print(f"   and reads tier data from your local Showdown install.\n")
+
+    data = build_gen1_data()
+
+    if not data:
+        raise RuntimeError(
+            f"Failed to build gen1_data.json. Check:\n"
+            f"  1. Internet connectivity (fetches from github.com/pret/pokered)\n"
+            f"  2. Local Showdown install at: {SHOWDOWN_PATH}\n"
+            f"     (git clone https://github.com/smogon/pokemon-showdown.git)"
+        )
+
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    tier_counts = Counter(v["tier"] for v in data.values())
+    print(f"\n✅ Built {path}: {len(data)} Pokemon")
+    for tier, count in sorted(tier_counts.items(), key=lambda x: x[1], reverse=True):
+        print(f"   {tier:8s}: {count}")
+
+    return path
+
+
 def load_format_data(format_name="OU", path="gen1_data.json"):
     """
     Load gen1_data.json and return only Pokemon legal in the given format.
+    Auto-builds the JSON from pokered if it doesn't exist.
 
     Examples:
         load_format_data("OU")   → 12 OU Pokemon
         load_format_data("UU")   → UU Pokemon
         load_format_data("LC")   → LC Pokemon
     """
+    ensure_gen1_data(path)
     allowed_tiers = FORMAT_INCLUDES.get(format_name, {format_name})
     with open(path) as f:
         all_data = json.load(f)
