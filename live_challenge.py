@@ -273,6 +273,8 @@ async def run_challenge(opponent_name, team, n_battles=1, format_name="gen1ou"):
         start_timer_on_battle_start=True,
         verbose=False,
         live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
+        ping_interval=30.0,
+        ping_timeout=30.0,
     )
 
     # Wait for connection + auth
@@ -306,53 +308,95 @@ async def run_challenge(opponent_name, team, n_battles=1, format_name="gen1ou"):
 
 async def run_accept(team, n_battles=1, format_name="gen1ou"):
     """
-    Wait for an incoming challenge on the live Showdown server.
-    YOU send the challenge from your browser. The bot accepts automatically.
-
-    This bypasses Showdown's IP-based spam restrictions on new accounts.
+    Wait for incoming challenges with automatic reconnection on disconnect.
     """
     bot_account = get_bot_account()
     setup_filtered_logging(bot_account.username)
 
-    print(f"\n🌐 Connecting to live Showdown...")
-    print(f"   Format: {format_name}")
-    print(f"   Mode:   accepting challenges")
-    print(f"   LLM:    {LLM_MODEL}")
+    games_completed = 0
+    total_wins = 0
+    total_py = 0
+    total_llm = 0
+    max_retries = 5
 
-    player = CompetitivePlayer(
-        battle_format=format_name,
-        team=team,
-        server_configuration=ShowdownServerConfiguration,
-        account_configuration=bot_account,
-        log_level=20,
-        start_listening=True,
-        start_timer_on_battle_start=True,
-        verbose=False,
-        live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
-    )
+    retry_count = 0
+    while games_completed < n_battles and retry_count <= max_retries:
+        remaining = n_battles - games_completed
 
-    # Wait for connection + auth
-    print(f"   Authenticating...")
-    await asyncio.sleep(3)
+        print(f"\n🌐 Connecting to live Showdown...")
+        print(f"   Format: {format_name}")
+        print(f"   Mode:   accepting challenges ({remaining} remaining)")
+        print(f"   LLM:    {LLM_MODEL}")
 
-    bot_name = bot_account.username
-    print(f"\n⏳ Bot is online and waiting for a challenge.")
-    print(f"   In your browser (logged into your personal account), type:")
-    print(f"")
-    print(f"     /challenge {bot_name}, {format_name}")
-    print(f"")
-    print(f"   Or click {bot_name}'s name and select 'Challenge'.\n")
+        try:
+            player = CompetitivePlayer(
+                battle_format=format_name,
+                team=team,
+                server_configuration=ShowdownServerConfiguration,
+                account_configuration=bot_account,
+                log_level=20,
+                start_listening=True,
+                start_timer_on_battle_start=True,
+                verbose=False,
+                live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
+                ping_interval=30.0,
+                ping_timeout=30.0,
+            )
 
-    try:
-        await player.accept_challenges(None, n_challenges=n_battles)
-    except Exception as e:
-        print(f"\n  ❌ Error: {e}")
-        return
+            print(f"   Authenticating...")
+            await asyncio.sleep(3)
 
-    wins = sum(1 for b in player.battles.values() if b.won)
-    print(f"\n📊 Final: {wins}/{n_battles} wins")
-    print(f"   Python decisions: {player._python_call_count}")
-    print(f"   LLM decisions:    {player._llm_call_count}")
+            bot_name = bot_account.username
+            print(f"\n⏳ Bot is online and waiting for a challenge.")
+            print(f"   In your browser (logged into your personal account), type:")
+            print(f"")
+            print(f"     /challenge {bot_name}, {format_name}")
+            print(f"")
+            print(f"   Or click {bot_name}'s name and select 'Challenge'.\n")
+
+            await player.accept_challenges(None, n_challenges=remaining)
+
+            # Count results
+            for b in player.battles.values():
+                games_completed += 1
+                if b.won:
+                    total_wins += 1
+            total_py += player._python_call_count
+            total_llm += player._llm_call_count
+            retry_count = 0  # reset on success
+
+        except (ConnectionError, OSError, Exception) as e:
+            error_msg = str(e).lower()
+            is_disconnect = any(x in error_msg for x in [
+                'keepalive', 'ping timeout', 'connection closed',
+                'websocket', 'timed out', '1011',
+            ])
+
+            # Count any battles completed before the crash
+            if 'player' in locals():
+                for b in player.battles.values():
+                    if b.finished:
+                        games_completed += 1
+                        if b.won:
+                            total_wins += 1
+                total_py += player._python_call_count
+                total_llm += player._llm_call_count
+
+            if is_disconnect:
+                retry_count += 1
+                print(f"\n  🔌 Connection lost — reconnecting in 10 seconds... "
+                      f"(attempt {retry_count}/{max_retries})")
+                print(f"     {games_completed}/{n_battles} games completed so far")
+                await asyncio.sleep(10)
+                continue
+            else:
+                print(f"\n  ❌ Error: {e}")
+                break
+
+    print(f"\n📊 Final: {total_wins}W / {games_completed - total_wins}L "
+          f"across {games_completed} games")
+    print(f"   Python decisions: {total_py}")
+    print(f"   LLM decisions:    {total_llm}")
 
 
 # =============================================================================
@@ -361,58 +405,98 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
 
 async def run_ladder(team, n_games=5, format_name="gen1ou"):
     """
-    Play games on the Showdown ranked ladder.
-    The bot queues for matchmaking and plays against whoever it's paired with.
-
-    Requires the bot account to have played enough games to not be rate-limited.
-    If you get errors, build trust on the account first with --accept mode.
+    Play games on the Showdown ranked ladder with automatic reconnection.
+    If the websocket drops, the bot reconnects and continues remaining games.
     """
     bot_account = get_bot_account()
     setup_filtered_logging(bot_account.username)
 
-    print(f"\n🌐 Connecting to live Showdown...")
-    print(f"   Format: {format_name}")
-    print(f"   Mode:   ladder ({n_games} games)")
-    print(f"   LLM:    {LLM_MODEL}")
+    games_completed = 0
+    total_wins = 0
+    total_py = 0
+    total_llm = 0
+    max_retries = 5
+    last_rating = None
 
-    player = CompetitivePlayer(
-        battle_format=format_name,
-        team=team,
-        server_configuration=ShowdownServerConfiguration,
-        account_configuration=bot_account,
-        log_level=20,
-        start_listening=True,
-        start_timer_on_battle_start=True,
-        verbose=False,
-        live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
-    )
+    retry_count = 0
+    while games_completed < n_games and retry_count <= max_retries:
+        remaining = n_games - games_completed
 
-    # Wait for connection + auth
-    print(f"   Authenticating...")
-    await asyncio.sleep(3)
+        print(f"\n🌐 Connecting to live Showdown...")
+        print(f"   Format: {format_name}")
+        print(f"   Mode:   ladder ({remaining} games remaining of {n_games})")
+        print(f"   LLM:    {LLM_MODEL}")
 
-    print(f"\n🏆 Searching for ladder games...")
-    print(f"   The bot will queue and play {n_games} ranked game(s).\n")
+        try:
+            player = CompetitivePlayer(
+                battle_format=format_name,
+                team=team,
+                server_configuration=ShowdownServerConfiguration,
+                account_configuration=bot_account,
+                log_level=20,
+                start_listening=True,
+                start_timer_on_battle_start=True,
+                verbose=False,
+                live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
+                ping_interval=30.0,
+                ping_timeout=30.0,
+            )
 
-    try:
-        await player.ladder(n_games)
-    except Exception as e:
-        print(f"\n  ❌ Ladder error: {e}")
-        print(f"     The bot account may need more activity before ladder is available.")
-        print(f"     Try --accept mode first to build trust on the account.")
-        return
+            print(f"   Authenticating...")
+            await asyncio.sleep(3)
 
-    wins = sum(1 for b in player.battles.values() if b.won)
-    losses = sum(1 for b in player.battles.values() if b.lost)
-    print(f"\n📊 Ladder results: {wins}W / {losses}L across {n_games} games")
-    print(f"   Python decisions: {player._python_call_count}")
-    print(f"   LLM decisions:    {player._llm_call_count}")
+            print(f"\n🏆 Searching for ladder games...\n")
+            await player.ladder(remaining)
 
-    # Show rating if available
-    for battle in player.battles.values():
-        if battle.rating:
-            print(f"   Rating: {battle.rating}")
-            break
+            # Count results from this session
+            for b in player.battles.values():
+                games_completed += 1
+                if b.won:
+                    total_wins += 1
+                if b.rating:
+                    last_rating = b.rating
+            total_py += player._python_call_count
+            total_llm += player._llm_call_count
+            retry_count = 0  # reset on success
+
+        except (ConnectionError, OSError, Exception) as e:
+            error_msg = str(e).lower()
+            is_disconnect = any(x in error_msg for x in [
+                'keepalive', 'ping timeout', 'connection closed',
+                'websocket', 'timed out', '1011',
+            ])
+
+            # Count any battles completed before the crash
+            if 'player' in locals():
+                session_counted = 0
+                for b in player.battles.values():
+                    if b.finished:
+                        session_counted += 1
+                        if b.won:
+                            total_wins += 1
+                        if b.rating:
+                            last_rating = b.rating
+                games_completed += session_counted
+                total_py += player._python_call_count
+                total_llm += player._llm_call_count
+
+            if is_disconnect:
+                retry_count += 1
+                print(f"\n  🔌 Connection lost — reconnecting in 10 seconds... "
+                      f"(attempt {retry_count}/{max_retries})")
+                print(f"     {games_completed}/{n_games} games completed so far")
+                await asyncio.sleep(10)
+                continue
+            else:
+                print(f"\n  ❌ Ladder error: {e}")
+                break
+
+    print(f"\n📊 Ladder results: {total_wins}W / {games_completed - total_wins}L "
+          f"across {games_completed} games")
+    print(f"   Python decisions: {total_py}")
+    print(f"   LLM decisions:    {total_llm}")
+    if last_rating:
+        print(f"   Rating: {last_rating}")
 
 
 # =============================================================================

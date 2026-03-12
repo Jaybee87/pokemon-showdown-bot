@@ -102,6 +102,19 @@ def best_move_effectiveness(moves, defender_types, attacker_types=None):
         eff = type_effectiveness(move_type, defender_types)
         raw_bp = move.base_power or 0
 
+        # Fixed-damage moves: score them at their actual damage (100 at L100)
+        # unless they're immune (Night Shade vs Normal, Seismic Toss vs Ghost)
+        if move.id in FIXED_DAMAGE_MOVES:
+            if eff == 0:
+                score = 0
+            else:
+                score = 100  # consistent 100 damage, ignores type chart
+            if score > best_score:
+                best_score = score
+                best_move = move
+                best_eff = 1.0  # neutral — they ignore type chart
+            continue
+
         # STAB bonus
         stab = 1.5 if attacker_types and move_type in attacker_types else 1.0
 

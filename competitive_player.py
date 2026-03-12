@@ -40,6 +40,9 @@ from gen1_engine import (
     register_move_type, get_move_type,
     FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, LLM_ONLY_MOVES, IGNORE_MOVES,
 )
+from gen1_calc import (
+    calc_damage_pct, can_ko, find_ko_move, outspeeds, get_speed,
+)
 from llm_bridge import (
     call_llm, call_llm_async, strip_think_tags,
     parse_battle_decision, parse_lead_choice, ensure_ollama_running,
@@ -557,15 +560,24 @@ LEAD: <species>"""
         if switches:
             print(f"  Switches: {[p.species for p in switches]}")
 
-        # If WE are asleep — server ignores input, queue best move
-        if my_is_asleep and real_moves:
-            best_asleep, _ = best_move_effectiveness(
-                real_moves, opp_types, attacker_types=my_types
-            )
-            fallback = best_asleep or real_moves[0]
-            print(f"  💤 PYTHON: WE ARE ASLEEP — queuing {fallback.id}")
-            self._python_call_count += 1
-            return self.create_order(fallback)
+        # If WE are asleep — switch out if possible, otherwise queue best move
+        if my_is_asleep:
+            if switches:
+                # Switch out instead of sitting asleep taking damage.
+                # Pick the best switch-in based on type matchup.
+                best_sw = find_best_switch(battle)
+                if best_sw:
+                    print(f"  💤 PYTHON: WE ARE ASLEEP — switching to {best_sw.species}")
+                    self._python_call_count += 1
+                    return self.create_order(best_sw)
+            if real_moves:
+                best_asleep, _ = best_move_effectiveness(
+                    real_moves, opp_types, attacker_types=my_types
+                )
+                fallback = best_asleep or real_moves[0]
+                print(f"  💤 PYTHON: WE ARE ASLEEP (no switches) — queuing {fallback.id}")
+                self._python_call_count += 1
+                return self.create_order(fallback)
 
         # ------------------------------------------------------------------
         # STEP 1 — Forced: no real moves and no switches
@@ -710,6 +722,46 @@ LEAD: <species>"""
                           f"{opp_poke.species} for {best_eff}x — staying aggressive")
                     self._python_call_count += 1
                     return self.create_order(best_move)
+
+        # ------------------------------------------------------------------
+        # STEP 6b — KO check: can we finish the opponent this turn?
+        # Uses the damage calculator for concrete maths, not guessing.
+        # Fires BEFORE healing — don't Soft-Boiled when you can KO.
+        # ------------------------------------------------------------------
+        opp_hp_pct = opp_poke.current_hp_fraction or 1.0
+        my_species = my_poke.species.lower()
+        opp_species = opp_poke.species.lower()
+
+        ko_move_ids = [m.id for m in real_moves if m.id not in ('explosion', 'selfdestruct')]
+        ko_result, ko_guaranteed = find_ko_move(my_species, ko_move_ids, opp_species, opp_hp_pct)
+        if ko_result:
+            ko_move_obj = next((m for m in real_moves if m.id == ko_result), None)
+            if ko_move_obj:
+                label = "guaranteed KO" if ko_guaranteed else "likely KO"
+                print(f"  🎯 PYTHON {label.upper()}: {ko_result} finishes "
+                      f"{opp_poke.species} at {int(opp_hp_pct*100)}%")
+                self._python_call_count += 1
+                return self.create_order(ko_move_obj)
+
+        # ------------------------------------------------------------------
+        # STEP 6c — Thunder Wave fast-path: paralyse unstatused opponents
+        # Paralysis is almost always correct in Gen 1 — it permanently
+        # cripples speed and gives 25% full para chance every turn.
+        # Only fire this if:
+        #   - Opponent has no status
+        #   - We have Thunder Wave
+        #   - We're not in a dominant matchup (already handled above)
+        #   - Opponent is faster than us (paralysis matters most here)
+        # ------------------------------------------------------------------
+        if not opp_status_now:
+            twave = next((m for m in real_moves if m.id == 'thunderwave'), None)
+            if twave:
+                my_par = my_status_now and my_status_now.name == 'PAR'
+                they_faster = outspeeds(opp_species, my_species, b_par=my_par)
+                if they_faster:
+                    print(f"  ⚡ PYTHON: Thunder Wave — {opp_poke.species} is faster, paralysing")
+                    self._python_call_count += 1
+                    return self.create_order(twave)
 
         # ------------------------------------------------------------------
         # STEP 7a — Recover / Soft-Boiled at ~50% HP

@@ -23,9 +23,12 @@ LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT", "30"))
 
 # Shorter timeout for live play — the event loop must stay responsive
 # for websocket pings and Showdown's battle timer.
-# 8 seconds is enough for a warmed-up 7b model; if it hasn't responded
-# by then, it's stuck and the Python fallback is better than timing out.
-LLM_LIVE_TIMEOUT_SECONDS = int(os.environ.get("LLM_LIVE_TIMEOUT", "8"))
+#
+# Showdown timer: 150 seconds total + 60 second grace period per battle.
+# With the damage calc handling KOs, Thunder Wave, and healing,
+# LLM calls are now rare (~3-5 per game). At 20s per call that's
+# 60-100 seconds max, well within the 210-second limit.
+LLM_LIVE_TIMEOUT_SECONDS = int(os.environ.get("LLM_LIVE_TIMEOUT", "20"))
 
 # =============================================================================
 # POKEMON SHOWDOWN SERVER
