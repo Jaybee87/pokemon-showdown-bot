@@ -121,6 +121,16 @@ MOVES = {
     'swift':         (60,  'normal',    'special'),
     'strength':      (80,  'normal',    'physical'),
     'rage':          (20,  'normal',    'physical'),
+    'counter':       (0,   'fighting',  'status'),    # reflects physical damage 2x — special handling needed
+    'wrap':          (15,  'normal',    'physical'),
+    'bind':          (15,  'normal',    'physical'),
+    'clamp':         (35,  'water',     'physical'),
+    'firespin':      (15,  'fire',      'special'),
+    'amnesia':       (0,   'psychic',   'status'),
+    'swordsdance':   (0,   'normal',    'status'),
+    'agility':       (0,   'psychic',   'status'),
+    'reflect':       (0,   'psychic',   'status'),
+    'lightscreen':   (0,   'psychic',   'status'),
 }
 
 
@@ -168,19 +178,42 @@ POKEMON_TYPES = {
 
 
 # =============================================================================
-# DAMAGE CALCULATOR
+# GEN 1 STAT STAGE MULTIPLIERS
+# In Gen 1, the multiplier for stage s is: max(2, 2+s) / max(2, 2-s)
+# These are the approximate numerator/denominator pairs used in RBY.
 # =============================================================================
 
-def calc_damage(attacker, move_id, defender, crit=False, par_attacker=False):
+STAGE_MULTIPLIERS = {
+    -6: (2, 8), -5: (2, 7), -4: (2, 6), -3: (2, 5),
+    -2: (2, 4), -1: (2, 3),  0: (2, 2),  1: (3, 2),
+     2: (4, 2),  3: (5, 2),  4: (6, 2),  5: (7, 2),
+     6: (8, 2),
+}
+
+def apply_stage(stat, stage):
+    """Apply a stat stage modifier to a base stat. Capped at 999 in Gen 1."""
+    stage = max(-6, min(6, stage))
+    num, den = STAGE_MULTIPLIERS[stage]
+    modified = stat * num // den
+    return min(999, max(1, modified))
+
+
+def calc_damage(attacker, move_id, defender, crit=False, par_attacker=False,
+                atk_boosts=None, def_boosts=None,
+                reflect=False, light_screen=False):
     """
     Calculate the damage range for a specific attack.
 
     Args:
-        attacker:  species name (e.g. 'tauros')
-        move_id:   move ID (e.g. 'bodyslam')
-        defender:  species name (e.g. 'alakazam')
-        crit:      critical hit (doubles in Gen 1 — ignores stat mods)
-        par_attacker: is the attacker paralyzed? (not used in damage, just for speed)
+        attacker:      species name (e.g. 'tauros')
+        move_id:       move ID (e.g. 'bodyslam')
+        defender:      species name (e.g. 'alakazam')
+        crit:          critical hit (ignores stat stages in Gen 1)
+        par_attacker:  is the attacker paralyzed? (for speed, not damage)
+        atk_boosts:    attacker's stat boosts dict {'atk': 0, 'def': 0, 'spc': 0, 'spe': 0}
+        def_boosts:    defender's stat boosts dict (same format)
+        reflect:       is Reflect active on the defender's side?
+        light_screen:  is Light Screen active on the defender's side?
 
     Returns:
         (min_damage, max_damage) tuple, or (100, 100) for fixed-damage moves.
@@ -190,6 +223,8 @@ def calc_damage(attacker, move_id, defender, crit=False, par_attacker=False):
         return (0, 0)
 
     bp, move_type, category = MOVES[move_id]
+    atk_boosts = atk_boosts or {}
+    def_boosts = def_boosts or {}
 
     # Status moves do no damage
     if category == 'status':
@@ -197,7 +232,6 @@ def calc_damage(attacker, move_id, defender, crit=False, par_attacker=False):
 
     # Fixed damage moves
     if category == 'fixed' or move_id in FIXED_DAMAGE_MOVES:
-        # Check immunity: Night Shade (ghost) can't hit Normal, Seismic Toss (fighting) can't hit Ghost
         def_types = list(POKEMON_TYPES.get(defender, ('normal',)))
         eff = type_effectiveness(move_type, def_types)
         if eff == 0:
@@ -213,22 +247,36 @@ def calc_damage(attacker, move_id, defender, crit=False, par_attacker=False):
     atk_types = POKEMON_TYPES.get(attacker, ('normal',))
     def_types = list(POKEMON_TYPES.get(defender, ('normal',)))
 
-    # Determine attack and defense stats
-    if category == 'physical' or move_type not in SPECIAL_TYPES:
-        attack = atk_stats[1]   # Attack
-        defense = def_stats[2]  # Defense
-    else:
+    # Determine attack and defense stats + which boost keys to use
+    is_special = move_type in SPECIAL_TYPES
+    if is_special:
         attack = atk_stats[3]   # Special (offense)
         defense = def_stats[3]  # Special (defense)
+        # Gen 1: "Special" is one stat, 'spc' in boosts or 'spa'/'spd' from poke-env
+        atk_stage = atk_boosts.get('spc', atk_boosts.get('spa', 0))
+        def_stage = def_boosts.get('spc', def_boosts.get('spd', 0))
+    else:
+        attack = atk_stats[1]   # Attack
+        defense = def_stats[2]  # Defense
+        atk_stage = atk_boosts.get('atk', 0)
+        def_stage = def_boosts.get('def', 0)
+
+    # Apply stat stages (crits ignore stages in Gen 1)
+    if not crit:
+        attack = apply_stage(attack, atk_stage)
+        defense = apply_stage(defense, def_stage)
 
     # Explosion/Self-Destruct halve target's defense in Gen 1
     if move_id in ('explosion', 'selfdestruct'):
         defense = max(1, defense // 2)
 
-    # Critical hit: use base stats * 2 (simplified — ignores stat stages)
-    if crit:
-        attack = attack * 2
-        defense = defense * 2
+    # Reflect halves physical damage, Light Screen halves special damage
+    # In Gen 1, these double the relevant defense stat (same effect)
+    if not crit:  # crits ignore screens in Gen 1
+        if not is_special and reflect:
+            defense = min(999, defense * 2)
+        elif is_special and light_screen:
+            defense = min(999, defense * 2)
 
     # Type effectiveness
     eff = type_effectiveness(move_type, def_types)
@@ -268,17 +316,18 @@ def calc_damage_pct(attacker, move_id, defender, **kwargs):
 # KO CHECKS
 # =============================================================================
 
-def can_ko(attacker, move_id, defender, hp_pct=1.0, use_avg=True):
+def can_ko(attacker, move_id, defender, hp_pct=1.0, use_avg=True, **kwargs):
     """
     Can this move KO the defender at the given HP percentage?
 
     Args:
         hp_pct:  defender's current HP as a fraction (0.0 to 1.0)
         use_avg: if True, use average damage; if False, use minimum (conservative)
+        **kwargs: passed through to calc_damage (atk_boosts, def_boosts, reflect, light_screen)
 
     Returns True if the move can KO.
     """
-    lo, hi = calc_damage(attacker, move_id, defender)
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
     def_stats = STATS.get(defender)
     if not def_stats:
         return False
@@ -289,10 +338,12 @@ def can_ko(attacker, move_id, defender, hp_pct=1.0, use_avg=True):
     return lo >= current_hp  # guaranteed KO
 
 
-def find_ko_move(attacker, moves, defender, hp_pct=1.0):
+def find_ko_move(attacker, moves, defender, hp_pct=1.0, **kwargs):
     """
     From a list of move IDs, find the best one that can KO the defender.
     Prefers guaranteed KOs (min roll) over average KOs.
+
+    **kwargs: passed through to calc_damage (atk_boosts, def_boosts, reflect, light_screen)
 
     Returns (move_id, guaranteed) or (None, False) if nothing KOs.
     """
@@ -300,18 +351,16 @@ def find_ko_move(attacker, moves, defender, hp_pct=1.0):
     best_avg = None
 
     for move_id in moves:
-        lo, hi = calc_damage(attacker, move_id, defender)
+        lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
         def_stats = STATS.get(defender)
         if not def_stats:
             continue
         current_hp = int(def_stats[0] * hp_pct)
 
         if lo >= current_hp:
-            # Guaranteed KO — prefer highest overkill
             if best_guaranteed is None or lo > best_guaranteed[1]:
                 best_guaranteed = (move_id, lo)
         elif (lo + hi) // 2 >= current_hp:
-            # Average KO
             if best_avg is None or (lo + hi) > best_avg[1]:
                 best_avg = (move_id, lo + hi)
 
@@ -377,6 +426,155 @@ def can_2hko(attacker, move_id, defender, hp_pct=1.0):
     current_hp = int(def_stats[0] * hp_pct)
     avg = (lo + hi) // 2
     return avg * 2 >= current_hp
+
+
+# =============================================================================
+# MATCHUP EVALUATOR — smart switching
+#
+# Evaluates how well a Pokemon matches up against an opponent by considering:
+#   1. Best damage output (what % can we do per turn?)
+#   2. Defensive resilience (what % do we take per turn?)
+#   3. Speed advantage (do we move first?)
+#
+# Returns a score where higher = better matchup.
+# Used to decide "should I stay or switch?" in neutral situations.
+# =============================================================================
+
+def evaluate_matchup(our_species, opp_species, our_moves=None,
+                     our_hp_pct=1.0, opp_hp_pct=1.0,
+                     our_status=None, opp_status=None):
+    """
+    Score how well our_species matches up against opp_species.
+    Higher score = better matchup. Negative = bad matchup.
+
+    Args:
+        our_species:  our Pokemon's species name
+        opp_species:  opponent's species name
+        our_moves:    list of move IDs we have (if None, estimates from type)
+        our_hp_pct:   our current HP fraction
+        opp_hp_pct:   opponent's current HP fraction
+        our_status:   our status string ('PAR', 'SLP', etc) or None
+        opp_status:   opponent's status string or None
+
+    Returns:
+        float score (typically -100 to +100)
+    """
+    if our_species not in STATS or opp_species not in STATS:
+        return 0.0
+
+    our_types = POKEMON_TYPES.get(our_species, ('normal',))
+    opp_types = list(POKEMON_TYPES.get(opp_species, ('normal',)))
+
+    score = 0.0
+
+    # 1. Offensive pressure: best damage % we can do
+    if our_moves:
+        best_dmg_pct = 0.0
+        for move_id in our_moves:
+            if move_id in MOVES and MOVES[move_id][2] not in ('status',):
+                lo, hi = calc_damage_pct(our_species, move_id, opp_species)
+                avg = (lo + hi) / 2
+                if avg > best_dmg_pct:
+                    best_dmg_pct = avg
+        score += best_dmg_pct * 200  # scale: 50% damage/turn = +100 points
+
+    # 2. Defensive typing: how effective are opponent's STAB moves against us?
+    from gen1_engine import type_effectiveness
+    worst_incoming = 1.0
+    for opp_type in opp_types:
+        eff = type_effectiveness(opp_type, list(our_types))
+        if eff > worst_incoming:
+            worst_incoming = eff
+
+    if worst_incoming >= 2:
+        score -= 40  # we're weak to their STAB
+    elif worst_incoming <= 0.5:
+        score += 30  # we resist their STAB
+    elif worst_incoming == 0:
+        score += 50  # we're immune to their STAB
+
+    # 3. Speed advantage
+    our_par = our_status == 'PAR'
+    opp_par = opp_status == 'PAR'
+    if outspeeds(our_species, opp_species, a_par=our_par, b_par=opp_par):
+        score += 10
+    else:
+        score -= 5
+
+    # 4. HP penalty — low HP means we might not survive to attack
+    if our_hp_pct < 0.30:
+        score -= 30
+    elif our_hp_pct < 0.50:
+        score -= 10
+
+    # 5. Status penalties
+    if our_status == 'SLP':
+        score -= 40  # asleep = can't act
+    elif our_status == 'PAR':
+        score -= 10  # paralysis = 25% full para + speed loss
+    elif our_status == 'FRZ':
+        score -= 50  # frozen = can't act (rare in Gen 1 to thaw)
+
+    return score
+
+
+def find_best_matchup_switch(our_active_species, our_active_moves,
+                              opp_species, switches,
+                              our_active_hp=1.0, our_active_status=None,
+                              opp_hp=1.0, opp_status=None):
+    """
+    Given the current active Pokemon and available switches, find if
+    any switch-in has a significantly better matchup than staying in.
+
+    Args:
+        our_active_species: current active Pokemon species
+        our_active_moves:   list of current move IDs
+        opp_species:        opponent's species
+        switches:           list of poke-env Pokemon objects available to switch to
+        ... (HP and status for both sides)
+
+    Returns:
+        (switch_pokemon, score_diff) if a switch is recommended,
+        (None, 0) if staying in is better.
+    """
+    # Score our current matchup
+    current_score = evaluate_matchup(
+        our_active_species, opp_species,
+        our_moves=our_active_moves,
+        our_hp_pct=our_active_hp,
+        opp_hp_pct=opp_hp,
+        our_status=our_active_status,
+        opp_status=opp_status,
+    )
+
+    best_switch = None
+    best_switch_score = current_score
+    SWITCH_THRESHOLD = 40  # need to be significantly better to justify a switch
+
+    for sw in switches:
+        sw_species = sw.species.lower()
+        sw_hp = sw.current_hp_fraction or 0
+        sw_status_str = sw.status.name if sw.status else None
+
+        # Estimate switch-in's moves from their known moveset
+        sw_moves = [m.id for m in sw.moves.values()] if sw.moves else []
+
+        sw_score = evaluate_matchup(
+            sw_species, opp_species,
+            our_moves=sw_moves if sw_moves else None,
+            our_hp_pct=sw_hp,
+            opp_hp_pct=opp_hp,
+            our_status=sw_status_str,
+            opp_status=opp_status,
+        )
+
+        if sw_score > best_switch_score + SWITCH_THRESHOLD:
+            best_switch_score = sw_score
+            best_switch = sw
+
+    if best_switch:
+        return (best_switch, best_switch_score - current_score)
+    return (None, 0)
 
 
 # =============================================================================

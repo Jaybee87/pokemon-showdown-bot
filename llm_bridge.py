@@ -20,7 +20,7 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-from config import LLM_MODEL, LLM_TIMEOUT_SECONDS
+from config import LLM_MODEL, LLM_TIMEOUT_SECONDS, LLM_CONTEXT_LENGTH
 
 # Thread pool for running blocking LLM calls
 _executor = ThreadPoolExecutor(max_workers=2)
@@ -38,7 +38,22 @@ def _raw_llm_call(prompt, model=None):
     import ollama
     response = ollama.chat(
         model=model or LLM_MODEL,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a Gen 1 Pokemon battle AI. "
+                    "Do NOT use <think> tags or chain-of-thought reasoning. "
+                    "Respond IMMEDIATELY with your decision. "
+                    "No preamble, no explanation, no thinking out loud. "
+                    "Just the DECISION line."
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
+        options={
+            "num_ctx": LLM_CONTEXT_LENGTH,
+        },
     )
     return response['message']['content'].strip()
 

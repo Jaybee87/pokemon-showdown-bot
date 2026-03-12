@@ -287,7 +287,7 @@ OHKO_MOVES = {'guillotine', 'horndrill', 'fissure'}
 SLEEP_MOVES = {'hypnosis', 'sleeppowder', 'spore', 'lovelykiss', 'sing'}
 
 # Moves that should never be auto-picked by Python (always defer to LLM)
-LLM_ONLY_MOVES = {'explosion', 'selfdestruct'}
+LLM_ONLY_MOVES = {'explosion', 'selfdestruct', 'counter'}
 
 # Protocol artifacts — not real moveset choices
 IGNORE_MOVES = {'recharge', 'struggle', 'splash'}

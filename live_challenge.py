@@ -339,6 +339,7 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
                 start_timer_on_battle_start=True,
                 verbose=False,
                 live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
+                total_games=n_battles,
                 ping_interval=30.0,
                 ping_timeout=30.0,
             )
@@ -438,6 +439,7 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
                 start_timer_on_battle_start=True,
                 verbose=False,
                 live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
+                total_games=n_games,
                 ping_interval=30.0,
                 ping_timeout=30.0,
             )

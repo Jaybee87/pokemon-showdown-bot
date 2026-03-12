@@ -42,6 +42,7 @@ from gen1_engine import (
 )
 from gen1_calc import (
     calc_damage_pct, can_ko, find_ko_move, outspeeds, get_speed,
+    evaluate_matchup, find_best_matchup_switch,
 )
 from llm_bridge import (
     call_llm, call_llm_async, strip_think_tags,
@@ -245,7 +246,8 @@ class CompetitivePlayer(Player):
     Full reasoning is printed to console for observation.
     """
 
-    def __init__(self, *args, verbose=True, live_timeout=None, **kwargs):
+    def __init__(self, *args, verbose=True, live_timeout=None,
+                 total_games=None, **kwargs):
         super().__init__(*args, **kwargs)
         # {species: [move_type_strings]} — stores TYPES not names
         self._opponent_move_types = {}
@@ -257,6 +259,10 @@ class CompetitivePlayer(Player):
         self._current_battle_tag = None
         # Live play uses a shorter timeout so the event loop stays responsive
         self._llm_timeout = live_timeout
+        # Battle counter for progress tracking
+        self._total_games = total_games
+        self._games_finished = 0
+        self._wins = 0
 
     def _log(self, msg):
         """Always print — captured by Tee into the log file."""
@@ -469,6 +475,9 @@ LEAD: <species>"""
         my_types = get_pokemon_types(my_poke)
         opp_types = get_pokemon_types(opp_poke)
         my_hp_frac = my_poke.current_hp_fraction
+        my_species = my_poke.species.lower()
+        opp_species = opp_poke.species.lower()
+        opp_hp_frac = opp_poke.current_hp_fraction or 1.0
 
         # Register types of our own moves into the cache (for opponent tracking)
         for m in battle.available_moves:
@@ -527,7 +536,6 @@ LEAD: <species>"""
         my_is_asleep = my_status_now and my_status_now.name == 'SLP'
 
         # ── Turn header ──────────────────────────────────────────────────
-        opp_hp_frac = opp_poke.current_hp_fraction or 1.0
 
         def status_str(poke):
             parts = []
@@ -561,21 +569,31 @@ LEAD: <species>"""
             print(f"  Switches: {[p.species for p in switches]}")
 
         # If WE are asleep — switch out if possible, otherwise queue best move
+        # Anti-loop: don't switch if the only switch target is nearly dead
+        # (it'll just danger-switch right back, creating an infinite loop)
         if my_is_asleep:
+            should_switch = False
+            best_sw = None
             if switches:
-                # Switch out instead of sitting asleep taking damage.
-                # Pick the best switch-in based on type matchup.
                 best_sw = find_best_switch(battle)
                 if best_sw:
-                    print(f"  💤 PYTHON: WE ARE ASLEEP — switching to {best_sw.species}")
-                    self._python_call_count += 1
-                    return self.create_order(best_sw)
-            if real_moves:
+                    sw_hp = best_sw.current_hp_fraction or 0
+                    if len(switches) == 1 and sw_hp < 0.30:
+                        # Only 1 switch and it's nearly dead — stay in
+                        should_switch = False
+                    else:
+                        should_switch = True
+
+            if should_switch and best_sw:
+                print(f"  💤 PYTHON: WE ARE ASLEEP — switching to {best_sw.species}")
+                self._python_call_count += 1
+                return self.create_order(best_sw)
+            elif real_moves:
                 best_asleep, _ = best_move_effectiveness(
                     real_moves, opp_types, attacker_types=my_types
                 )
                 fallback = best_asleep or real_moves[0]
-                print(f"  💤 PYTHON: WE ARE ASLEEP (no switches) — queuing {fallback.id}")
+                print(f"  💤 PYTHON: WE ARE ASLEEP (staying in) — queuing {fallback.id}")
                 self._python_call_count += 1
                 return self.create_order(fallback)
 
@@ -702,12 +720,62 @@ LEAD: <species>"""
                 incoming_eff = type_effectiveness(
                     threat_type or 'normal', switch_types
                 )
-                if incoming_eff < 1:
+                # Anti-loop: if only 1 switch, check it won't just swap back
+                sw_hp = best_switch.current_hp_fraction or 0
+                sw_status = best_switch.status
+                sw_asleep = sw_status and sw_status.name == 'SLP'
+                only_one = len(switches) == 1
+
+                # Don't switch if the target is asleep (it'll switch right back)
+                # or nearly dead (it'll danger-switch right back)
+                loop_risk = only_one and (sw_asleep or sw_hp < 0.25)
+
+                if incoming_eff < 1 and not loop_risk:
                     print(f"  🔀 PYTHON DANGER SWITCH: {my_poke.species} at "
                           f"{int(my_hp_frac*100)}% threatened by {threat_type} "
                           f"— switching to {best_switch.species}")
                     self._python_call_count += 1
                     return self.create_order(best_switch)
+
+        # ------------------------------------------------------------------
+        # STEP 5b — Matchup-based switching: is a teammate significantly
+        # better suited to face this opponent?
+        #
+        # Only triggers ONCE per opponent switch-in (first turn we see them).
+        # This prevents the bot from switching every single turn in neutral
+        # matchups. If we chose to stay in, we commit to attacking.
+        # ------------------------------------------------------------------
+        if switches and not in_danger:
+            # Track which opponent we last evaluated to avoid re-triggering
+            opp_key = f"{opp_species}_{battle.turn}"
+            last_matchup_opp = getattr(self, '_last_matchup_opp', None)
+            last_matchup_turn = getattr(self, '_last_matchup_turn', 0)
+
+            # Only evaluate if the opponent changed since our last check
+            # (i.e. they switched in, or we just entered this matchup)
+            opp_changed = (opp_species != last_matchup_opp)
+            first_turn_vs_opp = (battle.turn - last_matchup_turn) > 1
+
+            if opp_changed or first_turn_vs_opp:
+                self._last_matchup_opp = opp_species
+                self._last_matchup_turn = battle.turn
+
+                my_move_ids = [m.id for m in real_moves]
+                my_status_str = my_status_now.name if my_status_now else None
+                opp_status_str = opp_status_now.name if opp_status_now else None
+
+                matchup_sw, score_diff = find_best_matchup_switch(
+                    my_species, my_move_ids, opp_species, switches,
+                    our_active_hp=my_hp_frac,
+                    our_active_status=my_status_str,
+                    opp_hp=opp_hp_frac,
+                    opp_status=opp_status_str,
+                )
+                if matchup_sw:
+                    print(f"  🔄 PYTHON MATCHUP SWITCH: {matchup_sw.species} is a better "
+                          f"matchup vs {opp_poke.species} (+{score_diff:.0f} points)")
+                    self._python_call_count += 1
+                    return self.create_order(matchup_sw)
 
         # ------------------------------------------------------------------
         # STEP 6 — Dominant type advantage (2x+ on opponent)
@@ -726,20 +794,62 @@ LEAD: <species>"""
         # ------------------------------------------------------------------
         # STEP 6b — KO check: can we finish the opponent this turn?
         # Uses the damage calculator for concrete maths, not guessing.
+        # Includes stat stages (e.g. Psychic lowering Special) and screens.
         # Fires BEFORE healing — don't Soft-Boiled when you can KO.
         # ------------------------------------------------------------------
-        opp_hp_pct = opp_poke.current_hp_fraction or 1.0
-        my_species = my_poke.species.lower()
-        opp_species = opp_poke.species.lower()
+
+        # Extract stat boosts from poke-env
+        # poke-env uses 'spa'/'spd' but Gen 1 has unified Special
+        my_boosts = dict(my_poke.boosts) if my_poke.boosts else {}
+        opp_boosts = dict(opp_poke.boosts) if opp_poke.boosts else {}
+
+        # Detect Reflect/Light Screen on opponent's side
+        opp_has_reflect = False
+        opp_has_lightscreen = False
+        try:
+            try:
+                from poke_env.battle.side_condition import SideCondition
+            except ImportError:
+                from poke_env.environment.side_condition import SideCondition
+            opp_has_reflect = SideCondition.REFLECT in battle.opponent_side_conditions
+            opp_has_lightscreen = SideCondition.LIGHT_SCREEN in battle.opponent_side_conditions
+        except (ImportError, AttributeError):
+            # If SideCondition isn't available, check by string matching
+            for sc in battle.opponent_side_conditions:
+                sc_name = sc.name if hasattr(sc, 'name') else str(sc)
+                if 'REFLECT' in sc_name.upper():
+                    opp_has_reflect = True
+                if 'LIGHT' in sc_name.upper():
+                    opp_has_lightscreen = True
+
+        calc_kwargs = {
+            'atk_boosts': my_boosts,
+            'def_boosts': opp_boosts,
+            'reflect': opp_has_reflect,
+            'light_screen': opp_has_lightscreen,
+        }
 
         ko_move_ids = [m.id for m in real_moves if m.id not in ('explosion', 'selfdestruct')]
-        ko_result, ko_guaranteed = find_ko_move(my_species, ko_move_ids, opp_species, opp_hp_pct)
+        ko_result, ko_guaranteed = find_ko_move(
+            my_species, ko_move_ids, opp_species, opp_hp_frac, **calc_kwargs
+        )
         if ko_result:
             ko_move_obj = next((m for m in real_moves if m.id == ko_result), None)
             if ko_move_obj:
                 label = "guaranteed KO" if ko_guaranteed else "likely KO"
+                # Show boost/screen info if relevant
+                extras = []
+                if any(v != 0 for v in my_boosts.values()):
+                    extras.append(f"our boosts: {my_boosts}")
+                if any(v != 0 for v in opp_boosts.values()):
+                    extras.append(f"opp boosts: {opp_boosts}")
+                if opp_has_reflect:
+                    extras.append("Reflect up")
+                if opp_has_lightscreen:
+                    extras.append("Light Screen up")
+                extra_str = f" ({', '.join(extras)})" if extras else ""
                 print(f"  🎯 PYTHON {label.upper()}: {ko_result} finishes "
-                      f"{opp_poke.species} at {int(opp_hp_pct*100)}%")
+                      f"{opp_poke.species} at {int(opp_hp_frac*100)}%{extra_str}")
                 self._python_call_count += 1
                 return self.create_order(ko_move_obj)
 
@@ -929,7 +1039,20 @@ LEAD: <species>"""
         if total > 0:
             pct = int(self._llm_call_count / total * 100)
             print(f"  LLM involvement:  {pct}% of turns")
-        print(f"{'='*60}\n")
+        print(f"{'='*60}")
+
+        # Progress tracking
+        super()._battle_finished_callback(battle)
+        self._games_finished += 1
+        if battle.won:
+            self._wins += 1
+        losses = self._games_finished - self._wins
+        if self._total_games:
+            print(f"📈 Progress: {self._games_finished}/{self._total_games} "
+                  f"({self._wins}W / {losses}L)\n")
+        else:
+            print(f"📈 Record: {self._wins}W / {losses}L "
+                  f"({self._games_finished} games)\n")
 
 
 # =============================================================================

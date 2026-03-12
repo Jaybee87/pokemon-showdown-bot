@@ -14,8 +14,14 @@ import os
 # =============================================================================
 
 # Ollama model used for all LLM calls (battle decisions, team building, lead pick)
-# Override with env var: LLM_MODEL=deepseek-r1:14b python3 competitive_player.py
-LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-r1:7b")
+# Override with env var: LLM_MODEL=deepseek-r1:7b python3 competitive_player.py
+LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-r1:14b")
+
+# Context length for LLM calls. Default models allocate 128K which wastes
+# compute and VRAM on empty context. Battle prompts are ~500 tokens, so
+# 2048 is more than enough. This is passed via options.num_ctx at runtime
+# so it works with any Ollama model — no custom Modelfile needed.
+LLM_CONTEXT_LENGTH = int(os.environ.get("LLM_CONTEXT", "2048"))
 
 # Hard timeout (seconds) for LLM calls during live battles.
 # If the model doesn't respond in time, Python fallback kicks in.
@@ -28,7 +34,7 @@ LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT", "30"))
 # With the damage calc handling KOs, Thunder Wave, and healing,
 # LLM calls are now rare (~3-5 per game). At 20s per call that's
 # 60-100 seconds max, well within the 210-second limit.
-LLM_LIVE_TIMEOUT_SECONDS = int(os.environ.get("LLM_LIVE_TIMEOUT", "20"))
+LLM_LIVE_TIMEOUT_SECONDS = int(os.environ.get("LLM_LIVE_TIMEOUT", "25"))
 
 # =============================================================================
 # POKEMON SHOWDOWN SERVER
