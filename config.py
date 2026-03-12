@@ -21,6 +21,12 @@ LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-r1:7b")
 # If the model doesn't respond in time, Python fallback kicks in.
 LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT", "30"))
 
+# Shorter timeout for live play — the event loop must stay responsive
+# for websocket pings and Showdown's battle timer.
+# 8 seconds is enough for a warmed-up 7b model; if it hasn't responded
+# by then, it's stuck and the Python fallback is better than timing out.
+LLM_LIVE_TIMEOUT_SECONDS = int(os.environ.get("LLM_LIVE_TIMEOUT", "8"))
+
 # =============================================================================
 # POKEMON SHOWDOWN SERVER
 # =============================================================================

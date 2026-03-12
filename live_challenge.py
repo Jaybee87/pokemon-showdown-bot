@@ -32,7 +32,7 @@ import sys
 from poke_env import AccountConfiguration, ShowdownServerConfiguration
 from poke_env.player import Player
 
-from config import LLM_MODEL, POKE_ENV_LOG_LEVEL
+from config import LLM_MODEL, POKE_ENV_LOG_LEVEL, LLM_LIVE_TIMEOUT_SECONDS
 from competitive_player import (
     CompetitivePlayer, load_latest_team, random_suffix, Tee,
 )
@@ -94,7 +94,18 @@ class ShowdownLogFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
 
-        # Always show warnings and errors
+        # Block known-harmless warnings before the general pass-through
+        HARMLESS_WARNINGS = [
+            'Unmanaged move message',   # Gen 1 Wrap/Bind/Clamp continuation turns
+            'not in that room',          # Move sent to battle that already ended (forfeit race)
+            'nothing to choose',         # Same race condition from poke-env side
+        ]
+        if record.levelno == logging.WARNING:
+            for pattern in HARMLESS_WARNINGS:
+                if pattern in msg:
+                    return False
+
+        # Always show genuine warnings and errors
         if record.levelno >= logging.WARNING:
             return True
 
@@ -261,6 +272,7 @@ async def run_challenge(opponent_name, team, n_battles=1, format_name="gen1ou"):
         start_listening=True,
         start_timer_on_battle_start=True,
         verbose=False,
+        live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
     )
 
     # Wait for connection + auth
@@ -316,6 +328,7 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
         start_listening=True,
         start_timer_on_battle_start=True,
         verbose=False,
+        live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
     )
 
     # Wait for connection + auth
@@ -371,6 +384,7 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
         start_listening=True,
         start_timer_on_battle_start=True,
         verbose=False,
+        live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
     )
 
     # Wait for connection + auth

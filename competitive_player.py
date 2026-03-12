@@ -242,7 +242,7 @@ class CompetitivePlayer(Player):
     Full reasoning is printed to console for observation.
     """
 
-    def __init__(self, *args, verbose=True, **kwargs):
+    def __init__(self, *args, verbose=True, live_timeout=None, **kwargs):
         super().__init__(*args, **kwargs)
         # {species: [move_type_strings]} — stores TYPES not names
         self._opponent_move_types = {}
@@ -252,6 +252,8 @@ class CompetitivePlayer(Player):
         self._python_call_count = 0
         self._verbose = verbose
         self._current_battle_tag = None
+        # Live play uses a shorter timeout so the event loop stays responsive
+        self._llm_timeout = live_timeout
 
     def _log(self, msg):
         """Always print — captured by Tee into the log file."""
@@ -275,7 +277,7 @@ class CompetitivePlayer(Player):
     # Team preview — LLM picks the lead
     # -------------------------------------------------------------------------
 
-    def teampreview(self, battle):
+    async def teampreview(self, battle):
         """Ask the LLM to pick our lead based on both teams being visible."""
         my_team = list(battle.team.values())
         opp_team = list(battle.opponent_team.values())
@@ -317,7 +319,7 @@ LEAD: <species>"""
         print(f"  Opp team: {', '.join(p.species for p in opp_team)}")
 
         try:
-            raw, err = call_llm(prompt)
+            raw, err = await call_llm_async(prompt, timeout=self._llm_timeout)
             if err:
                 print(f"  LLM error: {err}")
             elif raw:
@@ -419,12 +421,14 @@ LEAD: <species>"""
     # Core decision engine
     # -------------------------------------------------------------------------
 
-    def choose_move(self, battle):
+    async def choose_move(self, battle):
         """
-        Dispatch to the real decision engine, then emit compact output
-        and unsuppress console if we're in compact mode.
+        Async dispatch to the decision engine.
+        poke-env supports choose_move returning an Awaitable[BattleOrder].
+        This keeps the event loop alive during LLM calls so websocket
+        pings and Showdown timer messages can be processed.
         """
-        order = self._choose_move_inner(battle)
+        order = await self._choose_move_inner(battle)
 
         # Emit compact one-liner and restore console
         if not self._verbose:
@@ -456,7 +460,7 @@ LEAD: <species>"""
 
         return order
 
-    def _choose_move_inner(self, battle):
+    async def _choose_move_inner(self, battle):
         my_poke = battle.active_pokemon
         opp_poke = battle.opponent_active_pokemon
         my_types = get_pokemon_types(my_poke)
@@ -592,7 +596,7 @@ LEAD: <species>"""
             prompt, valid_moves, valid_switches = build_battle_prompt(
                 battle, [], switches, self._opponent_move_types, reason_faint
             )
-            raw, err = call_llm(prompt)
+            raw, err = await call_llm_async(prompt, timeout=self._llm_timeout)
             if err:
                 print(f"  LLM error: {err}")
             elif raw:
@@ -708,7 +712,22 @@ LEAD: <species>"""
                     return self.create_order(best_move)
 
         # ------------------------------------------------------------------
-        # STEP 7a — Rest at low HP
+        # STEP 7a — Recover / Soft-Boiled at ~50% HP
+        # These heal 50% HP instantly with no downside (no sleep).
+        # Use them proactively — Chansey and Starmie should heal often.
+        # ------------------------------------------------------------------
+        if my_hp_frac < 0.55:
+            heal_move = next(
+                (m for m in real_moves if m.id in ('recover', 'softboiled')),
+                None
+            )
+            if heal_move:
+                print(f"  💚 PYTHON: healing at {int(my_hp_frac*100)}% — using {heal_move.id}")
+                self._python_call_count += 1
+                return self.create_order(heal_move)
+
+        # ------------------------------------------------------------------
+        # STEP 7b — Rest at low HP (puts us to sleep — last resort)
         # ------------------------------------------------------------------
         if my_hp_frac < 0.40:
             rest_move = next((m for m in real_moves if m.id == 'rest'), None)
@@ -718,7 +737,7 @@ LEAD: <species>"""
                 return self.create_order(rest_move)
 
         # ------------------------------------------------------------------
-        # STEP 7b — Sleep follow-up: Dream Eater on sleeping opponent
+        # STEP 7c — Sleep follow-up: Dream Eater on sleeping opponent
         # ------------------------------------------------------------------
         opp_status = opp_poke.status
         if opp_status and opp_status.name.lower() == 'slp':
@@ -799,7 +818,7 @@ LEAD: <species>"""
             battle, real_moves, switches,
             self._opponent_move_types, reason_str
         )
-        raw, err = call_llm(prompt)
+        raw, err = await call_llm_async(prompt, timeout=self._llm_timeout)
 
         if err:
             print(f"  LLM error: {err}")
