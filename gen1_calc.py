@@ -638,7 +638,7 @@ def find_best_matchup_switch(our_active_species, our_active_moves,
 
     best_switch = None
     best_switch_score = current_score
-    SWITCH_THRESHOLD = 40  # need to be significantly better to justify a switch
+    SWITCH_THRESHOLD = 80  # must be significantly better to justify losing a turn
 
     for sw in switches:
         sw_species = sw.species.lower()

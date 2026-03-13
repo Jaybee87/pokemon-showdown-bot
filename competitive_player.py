@@ -879,9 +879,11 @@ LEAD: <species>"""
                     opp_status=opp_status_str,
                 )
                 if matchup_sw:
-                    # We're switching — reset tracker so we re-evaluate
-                    # from the new Pokemon's perspective next turn
-                    self._matchup_evaluated_vs = None
+                    # DON'T reset the tracker here. The old code reset it,
+                    # which caused the new Pokemon to immediately re-evaluate
+                    # and switch right back (Exeg→Chansey→Exeg→Chansey loop).
+                    # The tracker naturally re-evaluates when the OPPONENT
+                    # switches to a different species.
                     print(f"  🔄 PYTHON MATCHUP SWITCH: {matchup_sw.species} is a better "
                           f"matchup vs {opp_poke.species} (+{score_diff:.0f} points)")
                     self._python_call_count += 1
@@ -932,6 +934,11 @@ LEAD: <species>"""
                     opp_has_reflect = True
                 if 'LIGHT' in sc_name.upper():
                     opp_has_lightscreen = True
+
+        if opp_has_reflect:
+            print(f"  🪞 DETECTED: Reflect active on opponent's side (physical damage halved)")
+        if opp_has_lightscreen:
+            print(f"  🪞 DETECTED: Light Screen active on opponent's side (special damage halved)")
 
         # Detect Substitute on opponent
         opp_has_sub = False
