@@ -3,7 +3,6 @@
 ## Requirements
 
 - Python 3.12+
-- Node.js 18+ (for local Pokemon Showdown server)
 - [Ollama](https://ollama.com) with a downloaded model
 - GPU recommended (12GB+ VRAM for deepseek-r1:14b)
 
@@ -29,25 +28,7 @@ pip install poke-env ollama --break-system-packages
 
 ---
 
-## 3. Local Pokemon Showdown server
-
-Required for team building (`main.py`) and local testing.
-Not needed for live play (`live_challenge.py`) — that connects directly to Showdown's servers.
-
-```bash
-git clone https://github.com/smogon/pokemon-showdown.git ~/pokemon-showdown
-cd ~/pokemon-showdown
-npm install
-
-# Start the server (leave running in a separate terminal)
-node pokemon-showdown start --no-security
-```
-
-Server runs on `localhost:8000` by default.
-
----
-
-## 4. Ollama setup
+## 3. Ollama setup
 
 ### Install
 
@@ -74,7 +55,7 @@ ollama pull mistral:7b          # fast, good at structured output
 Override the model with an environment variable:
 
 ```bash
-LLM_MODEL=deepseek-r1:7b python3 live_challenge.py --ladder 20
+LLM_MODEL=deepseek-r1:7b python3 main.py --ladder 20
 ```
 
 Other configurable options:
@@ -92,7 +73,7 @@ ollama run deepseek-r1:14b "say hello"
 
 ---
 
-## 5. Credentials (for live play only)
+## 4. Credentials
 
 Create `credentials.py` in the project root:
 
@@ -107,41 +88,38 @@ The bot account must be registered at [play.pokemonshowdown.com](https://play.po
 
 ---
 
-## 6. Build a team
+## 5. Add a team
 
-```bash
-python3 main.py
+Place a team file in `teams/` with the naming convention:
+
+```
+teams/team_ou_iteration_1.txt
 ```
 
-This runs preflight checks, fetches Gen 1 data (first run only), then walks you through:
+The bot uses the highest-numbered iteration. Format: one Pokemon per block, moves prefixed with `- `, blocks separated by blank lines.
 
-1. **Anchor selection** — pick your lead Pokemon from the OU roster or type any name
-2. **Team composition** — Python analyses type coverage and selects complementary teammates
-3. **Move selection** — LLM picks 4 moves per Pokemon from their legal move pool
-4. **Stress testing** — runs battles vs random opponents locally
-5. **Iteration** — feeds battle results back into the next team generation
-
-Teams are saved to `teams/team_ou_iteration_N.txt`.
-
-Options:
-
-```bash
-python3 main.py --anchor gengar        # skip interactive prompt
-python3 main.py --iterations 10        # more improvement cycles
-python3 main.py --battles 20           # more battles per test
-python3 main.py --rebuild-data         # force refresh Pokemon data from pokered
 ```
+Tauros
+- bodyslam
+- hyperbeam
+- earthquake
+- blizzard
 
-Or create a team file manually in `teams/` — the bot uses the highest-numbered iteration.
+Snorlax
+- bodyslam
+- earthquake
+- hyperbeam
+- rest
+```
 
 ---
 
-## 7. Go live
+## 6. Go live
 
 ### Ladder mode
 
 ```bash
-python3 live_challenge.py --ladder 50
+python3 main.py --ladder 50
 ```
 
 The bot queues for ranked matchmaking and plays 50 games. Progress is shown after each battle. Reconnects automatically on network drops.
@@ -149,7 +127,7 @@ The bot queues for ranked matchmaking and plays 50 games. Progress is shown afte
 ### Accept mode (recommended for new accounts)
 
 ```bash
-python3 live_challenge.py --accept
+python3 main.py --accept
 ```
 
 The bot logs into Showdown and waits. From your personal account in the browser, type:
@@ -163,7 +141,7 @@ This bypasses Showdown's IP-based restrictions on new accounts.
 ### Challenge mode
 
 ```bash
-python3 live_challenge.py --opponent YourPersonalAccount
+python3 main.py --opponent YourPersonalAccount
 ```
 
 The bot sends the challenge. May be blocked for new bot accounts — use accept mode instead.
@@ -171,35 +149,10 @@ The bot sends the challenge. May be blocked for new bot accounts — use accept 
 ### Options
 
 ```bash
-python3 live_challenge.py --ladder 100              # 100 ranked games
-python3 live_challenge.py --accept --battles 5      # accept 5 consecutive challenges
-python3 live_challenge.py --accept --format gen1uu   # different format
+python3 main.py --ladder 100                   # 100 ranked games
+python3 main.py --accept --battles 5           # accept 5 consecutive challenges
+python3 main.py --accept --format gen1uu       # different format
 ```
-
-### What you'll see
-
-```
-⚡ T01 tauros(100%) vs starmie(100%) → bodyslam [py]
-🎯 PYTHON GUARANTEED KO: surf finishes rhydon at 28%
-🔄 PYTHON MATCHUP SWITCH: snorlax is a better matchup vs chansey (+96 points)
-🤖 T08 alakazam(72%) vs exeggutor(50%) → seismictoss [llm]
-
-============================================================
-BATTLE OVER — WON ✓ in 25 turns
-  Python decisions: 18
-  LLM decisions:    7
-  LLM involvement:  28% of turns
-============================================================
-📈 Progress: 14/50 (8W / 6L)
-  Python decisions: 312
-  LLM decisions:    89
-  LLM involvement:  22% of turns
-============================================================
-```
-
-`⚡` = Python fast-path, `🤖` = LLM decision, `🎯` = damage calc KO, `🔄` = matchup switch.
-
-Full verbose reasoning is saved to `live_logs/live_log_NNN.txt`.
 
 ---
 
@@ -209,9 +162,9 @@ Full verbose reasoning is saved to `live_logs/live_log_NNN.txt`.
 
 **"spam from your internet provider"** — Showdown blocks challenges from new accounts on flagged IPs. Use `--accept` mode (you challenge the bot from your browser).
 
-**LLM timeout errors** — increase the timeout: `LLM_LIVE_TIMEOUT=30 python3 live_challenge.py --ladder 20`. Or use a faster/smaller model.
+**LLM timeout errors** — increase the timeout: `LLM_LIVE_TIMEOUT=30 python3 main.py --ladder 20`. Or use a faster/smaller model.
 
-**"gen1_data.json not found"** — run `python3 main.py` first. It auto-builds from pokered on first run. Needs a local Showdown install.
+**No team found** — place a team file in `teams/team_ou_iteration_1.txt`. See section 5 above.
 
 **Websocket disconnects** — the bot reconnects automatically (up to 5 retries). If it persists, check your internet connection or increase ping tolerance in `live_challenge.py`.
 

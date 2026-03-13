@@ -13,8 +13,8 @@ import os
 # LLM CONFIGURATION
 # =============================================================================
 
-# Ollama model used for all LLM calls (battle decisions, team building, lead pick)
-# Override with env var: LLM_MODEL=deepseek-r1:7b python3 competitive_player.py
+# Ollama model used for all LLM calls (battle decisions, lead pick)
+# Override with env var: LLM_MODEL=deepseek-r1:7b python3 main.py --ladder 50
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-r1:14b")
 
 # Context length for LLM calls. Default models allocate 128K which wastes
@@ -37,28 +37,17 @@ LLM_TIMEOUT_SECONDS = int(os.environ.get("LLM_TIMEOUT", "30"))
 LLM_LIVE_TIMEOUT_SECONDS = int(os.environ.get("LLM_LIVE_TIMEOUT", "25"))
 
 # =============================================================================
-# POKEMON SHOWDOWN SERVER
+# POKEMON SHOWDOWN SERVER (LIVE)
 # =============================================================================
 
-# Local server (for training / stress testing)
-LOCAL_SHOWDOWN_HOST = "localhost"
-LOCAL_SHOWDOWN_PORT = 8000
-
-# Live server (for ladder / challenges)
 LIVE_SHOWDOWN_URI = "sim3.psim.us"
 LIVE_SHOWDOWN_PORT = 443
-
-# Path to local Showdown install (for tier data in gen1_data.py)
-SHOWDOWN_INSTALL_PATH = os.path.expanduser(
-    os.environ.get("SHOWDOWN_PATH", "~/pokemon-showdown")
-)
 
 # =============================================================================
 # BATTLE FORMAT
 # =============================================================================
 
 DEFAULT_FORMAT = "gen1ou"
-DEFAULT_TIER = "OU"
 
 # =============================================================================
 # LOGGING

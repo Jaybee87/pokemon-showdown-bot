@@ -1,44 +1,62 @@
 # Pokemon Showdown Bot — CDMG_217
 
-A competitive Pokemon battle bot that builds its own team, tests it, and takes it to the live Showdown ladder — starting from nothing.
+A competitive Gen 1 OU battle bot powered by a hybrid Python/LLM decision engine. Connects to the live Pokemon Showdown ladder and plays ranked games against real humans.
 
 ## What does this project do?
 
-This project automates the full competitive Pokemon pipeline:
+The bot connects to Pokemon Showdown and plays Gen 1 OU battles autonomously. A Python fast-path handles the majority of decisions — damage calculations, type matchups, speed checks, KO detection, switching logic — and hands off only genuinely ambiguous situations to a local LLM (via Ollama). It runs unattended and reconnects automatically on network drops.
 
-1. **Team Building** — An LLM generates a competitive team from scratch, picking Pokemon, moves, and synergies based on the metagame. You choose an anchor Pokemon and the system builds around it. For Gen 1 OU the meta is solved enough that hand-crafted teams now outperform generated ones, but the builder remains the starting point for experimenting with new formats or unconventional strategies.
-
-2. **Team Testing** — The bot stress-tests its team locally against a random opponent across dozens of battles, collecting win rates, move usage, and matchup data. After each iteration it feeds the results back to the LLM to refine the team — swap weak links, adjust movesets, cover bad matchups.
-
-3. **Showdown Battling** — The bot connects to the live Pokemon Showdown server and plays ranked ladder games against real humans. A hybrid decision engine combines a Python fast-path (pre-computed damage calculator, type matchups, speed checks) with an LLM for genuinely ambiguous decisions. It runs unattended and reconnects automatically on network drops.
-
-The goal isn't to build the strongest possible bot — it's to build a system that can start from zero, learn, and compete. Every generation of Pokemon has different mechanics, and the architecture is designed to expand.
+You provide a team file. The bot plays it.
 
 ---
 
 ## Quick Start
 
-See [INSTALL.md](INSTALL.md) for full setup (Python, Showdown server, Ollama, credentials).
+See [INSTALL.md](INSTALL.md) for full setup (Python, Ollama, credentials).
 
 ```bash
-# Build and test a team locally
+# Play 20 ranked ladder games
+python3 main.py --ladder 20
+
+# Wait for challenges (recommended for new accounts)
+python3 main.py --accept
+
+# Or use the interactive menu
 python3 main.py
-
-# Go live on the ladder
-python3 live_challenge.py --ladder 20
-
-# Or wait for challenges (recommended for new accounts)
-python3 live_challenge.py --accept
 ```
 
 ### Live Play Modes
 
 ```bash
-python3 live_challenge.py --accept              # Wait for challenge (you challenge from browser)
-python3 live_challenge.py --opponent <username>  # Send challenge to a specific user
-python3 live_challenge.py --ladder N             # Play N ranked ladder games
-python3 live_challenge.py --battles N            # N battles for accept/opponent modes
-python3 live_challenge.py --format gen1ou        # Format (default: gen1ou)
+python3 main.py --accept                     # Wait for challenge (you challenge from browser)
+python3 main.py --opponent <username>         # Send challenge to a specific user
+python3 main.py --ladder N                    # Play N ranked ladder games
+python3 main.py --battles N                   # N battles for accept/opponent modes
+python3 main.py --format gen1ou              # Format (default: gen1ou)
+```
+
+You can also use `live_challenge.py` directly with the same flags.
+
+---
+
+## Team Files
+
+Place your team in `teams/` with the naming convention `team_ou_iteration_N.txt`. The bot uses the highest-numbered iteration.
+
+Format: one Pokemon per block, moves prefixed with `- `, blocks separated by blank lines.
+
+```
+Tauros
+- bodyslam
+- hyperbeam
+- earthquake
+- blizzard
+
+Snorlax
+- bodyslam
+- earthquake
+- hyperbeam
+- rest
 ```
 
 ---
@@ -52,11 +70,11 @@ All settings in `config.py`, overridable with env vars:
 | `LLM_MODEL` | `deepseek-r1:14b` | `LLM_MODEL` | Ollama model for battle decisions |
 | `LLM_CONTEXT_LENGTH` | `2048` | `LLM_CONTEXT` | Context window (128K default wastes VRAM) |
 | `LLM_LIVE_TIMEOUT_SECONDS` | `25` | `LLM_LIVE_TIMEOUT` | Max seconds to wait for LLM response |
-| `LLM_TIMEOUT_SECONDS` | `30` | `LLM_TIMEOUT` | Timeout for local/team building |
+| `LLM_TIMEOUT_SECONDS` | `30` | `LLM_TIMEOUT` | Timeout for local testing |
 
 ```bash
 # Example: use 7b model with 12-second timeout
-LLM_MODEL=deepseek-r1:7b LLM_LIVE_TIMEOUT=12 python3 live_challenge.py --ladder 50
+LLM_MODEL=deepseek-r1:7b LLM_LIVE_TIMEOUT=12 python3 main.py --ladder 50
 ```
 
 ---
@@ -65,21 +83,20 @@ LLM_MODEL=deepseek-r1:7b LLM_LIVE_TIMEOUT=12 python3 live_challenge.py --ladder 
 
 ```
 pokemon-showdown-bot/
-├── main.py                # Entry point — build team, stress test, iterate
+├── main.py                # Entry point — battle menu, preflight, logging
 ├── live_challenge.py      # Live Showdown connection (accept/challenge/ladder)
 ├── competitive_player.py  # Hybrid Python/LLM decision engine
 ├── gen1_engine.py         # Gen 1 type chart + effectiveness (single source of truth)
 ├── gen1_calc.py           # Damage calculator, speed table, matchup evaluator
-├── gen1_data.py           # Pokemon/move data from pokered ASM + Showdown tiers
-├── team_generator.py      # LLM-driven team builder with battle feedback loop
-├── battle_runner.py       # Local stress tester (StatTrackingPlayer vs RandomPlayer)
 ├── llm_bridge.py          # All LLM interaction — async, thread-safe, system prompt
 ├── config.py              # Central config — model, timeouts, server URLs
 ├── credentials.py         # Bot's Showdown login (gitignored)
-├── teams/                 # Team iterations (gitignored)
+├── teams/                 # Team files (gitignored)
 ├── live_logs/             # Battle logs (gitignored)
-└── archive/
-    └── showdown.py        # Retired raw websocket client (reference only)
+└── archive/               # Retired modules (team builder, local test runner)
+    ├── team_generator.py  # LLM-driven team builder with battle feedback loop
+    ├── battle_runner.py   # Local stress tester (StatTrackingPlayer vs RandomPlayer)
+    └── gen1_data.py       # Pokemon/move data from pokered ASM + Showdown tiers
 ```
 
 ---
@@ -188,6 +205,33 @@ All stats pre-computed for L100, max DVs (15), max Stat EXP. Gen 1 has no variat
 - Critical hits ignore stat stages and screens
 - Paralysis quarters speed (not halves)
 - Stat stages cap at 999
+
+---
+
+## What you'll see
+
+```
+⚡ T01 tauros(100%) vs starmie(100%) → bodyslam [py]
+🎯 PYTHON GUARANTEED KO: surf finishes rhydon at 28%
+🔄 PYTHON MATCHUP SWITCH: snorlax is a better matchup vs chansey (+96 points)
+🤖 T08 alakazam(72%) vs exeggutor(50%) → seismictoss [llm]
+
+============================================================
+BATTLE OVER — WON ✓ in 25 turns
+  Python decisions: 18
+  LLM decisions:    7
+  LLM involvement:  28% of turns
+============================================================
+📈 Progress: 14/50 (8W / 6L)
+  Python decisions: 312
+  LLM decisions:    89
+  LLM involvement:  22% of turns
+============================================================
+```
+
+`⚡` = Python fast-path, `🤖` = LLM decision, `🎯` = damage calc KO, `🔄` = matchup switch.
+
+Full verbose reasoning is saved to `live_logs/live_log_NNN.txt`.
 
 ---
 
