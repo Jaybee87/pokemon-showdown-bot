@@ -95,8 +95,11 @@ def best_move_effectiveness(moves, defender_types, attacker_types=None):
     best_score = -1
     best_eff = 1.0
 
+    # Moves that should never be auto-picked: forced turns + LLM-only decisions
+    _skip_auto = {'struggle', 'recharge'} | LLM_ONLY_MOVES
+
     for move in moves:
-        if move.id in ('struggle', 'recharge', 'explosion', 'selfdestruct'):
+        if move.id in _skip_auto:
             continue
         move_type = move.type.name.lower() if move.type else 'normal'
         eff = type_effectiveness(move_type, defender_types)

@@ -173,11 +173,11 @@ def parse_battle_decision(raw, valid_move_ids, valid_switch_ids):
         if not line.upper().startswith('DECISION:'):
             continue
 
-        # Try "DECISION: move/switch X"
-        m = re.search(r'DECISION:\s*(move|switch)\s+<?([\w]+)>?', line, re.IGNORECASE)
+        # Try "DECISION: move/switch X" (normalize spaces in move names)
+        m = re.search(r'DECISION:\s*(move|switch)\s+<?>?([\w\s]+?)<?>?\s*$', line, re.IGNORECASE)
         if m:
             at = m.group(1).lower()
-            ai = m.group(2).lower()
+            ai = re.sub(r'[^a-z0-9]', '', m.group(2).lower())  # "body slam" → "bodyslam"
             if at == 'move' and ai in move_set:
                 return 'move', ai
             if at == 'switch' and ai in switch_set:
@@ -191,6 +191,29 @@ def parse_battle_decision(raw, valid_move_ids, valid_switch_ids):
                 return 'move', candidate
             if candidate in switch_set:
                 return 'switch', candidate
+
+    # ── Fallback parsers for non-standard LLM output formats ────────────
+    norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
+    norm_move_set = {norm(m): m for m in move_set}
+    norm_switch_set = {norm(s): s for s in switch_set}
+
+    # Try \boxed{...} or \boxed{\text{...}}
+    boxed = re.search(r'\\boxed\{(?:\\text\{)?([^}]+)', raw)
+    if boxed:
+        candidate = norm(boxed.group(1))
+        if candidate in norm_move_set:
+            return 'move', norm_move_set[candidate]
+        if candidate in norm_switch_set:
+            return 'switch', norm_switch_set[candidate]
+
+    # Try "Answer: [use/move] X"
+    answer = re.search(r'Answer:\s*(?:Use\s+)?(?:move\s+)?(\w+)', raw, re.IGNORECASE)
+    if answer:
+        candidate = norm(answer.group(1))
+        if candidate in norm_move_set:
+            return 'move', norm_move_set[candidate]
+        if candidate in norm_switch_set:
+            return 'switch', norm_switch_set[candidate]
 
     return None, None
 

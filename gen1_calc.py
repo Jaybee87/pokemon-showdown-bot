@@ -645,6 +645,12 @@ def find_best_matchup_switch(our_active_species, our_active_moves,
         sw_hp = sw.current_hp_fraction or 0
         sw_status_str = sw.status.name if sw.status else None
 
+        # PATCH: Skip sleeping/frozen Pokémon — they can't act on switch-in
+        # and will immediately trigger the sleep-switch-out handler, creating
+        # a devastating loop that wastes turns and shreds the team.
+        if sw_status_str in ('SLP', 'FRZ'):
+            continue
+
         # Estimate switch-in's moves from their known moveset
         sw_moves = [m.id for m in sw.moves.values()] if sw.moves else []
 
