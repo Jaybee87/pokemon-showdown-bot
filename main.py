@@ -2,42 +2,30 @@
 """
 main.py
 =======
-Single entry point for the Pokemon Showdown Bot.
+Entry point for the Pokemon Showdown Bot.
 
-Run this file and it handles everything:
-  1. Preflight checks (Showdown server, Ollama, gen1_data.json)
-  2. Build gen1_data.json from pokered if it doesn't exist
-  3. Run the team generation + battle iteration loop
-  4. Output a ready-to-use team file for competitive play
+Two functions:
+  1. Build a team  → generates a competitive team via LLM iteration
+  2. Battle        → takes a team to the live Showdown ladder
 
-Usage:
-    python3 main.py                        # defaults: OU format, gengar anchor, 5 iterations
-    python3 main.py --format OU            # explicit format
-    python3 main.py --anchor alakazam      # different anchor Pokemon
-    python3 main.py --iterations 3         # fewer iteration cycles
-    python3 main.py --battles 20           # more battles per iteration
-    python3 main.py --rebuild-data         # force rebuild gen1_data.json
-
-Prerequisites:
-    1. Local Pokemon Showdown server running:
-       cd ~/pokemon-showdown && node pokemon-showdown start --no-security
-
-    2. Ollama running with a model loaded:
-       ollama pull deepseek-r1:7b
-       ollama serve
-
-    See INSTALL.md for full setup instructions.
+Run with no arguments for the interactive menu, or jump straight to a mode:
+    python3 main.py                          # interactive menu
+    python3 main.py --build                  # jump to team builder
+    python3 main.py --battle                 # jump to battle (uses latest team)
+    python3 main.py --battle --ladder 50     # 50 ladder games
 """
 
-import asyncio
 import argparse
+import asyncio
 import os
 import re
-import sys
 import socket
+import sys
+import glob
 
 from config import (
-    LLM_MODEL, DEFAULT_TIER, SHOWDOWN_INSTALL_PATH,
+    LLM_MODEL, LLM_CONTEXT_LENGTH, LLM_LIVE_TIMEOUT_SECONDS,
+    DEFAULT_FORMAT, DEFAULT_TIER, SHOWDOWN_INSTALL_PATH,
     LOCAL_SHOWDOWN_HOST, LOCAL_SHOWDOWN_PORT,
 )
 
@@ -45,6 +33,18 @@ from config import (
 # =============================================================================
 # PREFLIGHT CHECKS
 # =============================================================================
+
+def check_ollama():
+    """Check if Ollama is running and the configured model is available."""
+    try:
+        from llm_bridge import ensure_ollama_running
+        return ensure_ollama_running()
+    except Exception:
+        print(f"  ❌ Ollama not running or model '{LLM_MODEL}' not found")
+        print(f"     Install: curl -fsSL https://ollama.com/install.sh | sh")
+        print(f"     Pull:    ollama pull {LLM_MODEL}")
+        return False
+
 
 def check_showdown_server():
     """Check if local Pokemon Showdown server is reachable."""
@@ -58,176 +58,143 @@ def check_showdown_server():
             return True
     except Exception:
         pass
-
-    print(f"  ❌ Showdown server not found on {LOCAL_SHOWDOWN_HOST}:{LOCAL_SHOWDOWN_PORT}")
-    print(f"     Start it with:")
-    print(f"       cd {SHOWDOWN_INSTALL_PATH}")
-    print(f"       node pokemon-showdown start --no-security")
+    print(f"  ⚠️  Local Showdown server not running (needed for team building)")
+    print(f"     cd ~/pokemon-showdown && node pokemon-showdown start --no-security")
     return False
 
 
 def check_showdown_install():
-    """Check if Pokemon Showdown is installed locally (needed for tier data)."""
-    formats_path = os.path.join(SHOWDOWN_INSTALL_PATH, "data/mods/gen1/formats-data.ts")
-    if os.path.exists(formats_path):
-        print(f"  ✅ Showdown install found at {SHOWDOWN_INSTALL_PATH}")
+    """Check if Pokemon Showdown source is installed (for gen1_data)."""
+    path = SHOWDOWN_INSTALL_PATH
+    if os.path.isdir(path) and os.path.exists(os.path.join(path, "data")):
+        print(f"  ✅ Showdown install found at {path}")
         return True
-
-    print(f"  ❌ Showdown install not found at {SHOWDOWN_INSTALL_PATH}")
-    print(f"     Install it with:")
-    print(f"       git clone https://github.com/smogon/pokemon-showdown.git {SHOWDOWN_INSTALL_PATH}")
-    print(f"       cd {SHOWDOWN_INSTALL_PATH} && npm install")
+    print(f"  ⚠️  Showdown install not found at {path} (needed for gen1_data)")
+    print(f"     git clone https://github.com/smogon/pokemon-showdown.git {path}")
     return False
 
 
-def check_ollama():
-    """Check if Ollama is running and the configured model is available."""
-    from llm_bridge import ensure_ollama_running
-    return ensure_ollama_running()
-
-
-def check_gen1_data(force_rebuild=False):
-    """Check if gen1_data.json exists, build it if not."""
-    path = "gen1_data.json"
-
-    if force_rebuild and os.path.exists(path):
-        os.remove(path)
-        print(f"  🔄 Removed existing {path} (--rebuild-data)")
-
-    if os.path.exists(path):
+def check_gen1_data():
+    """Check if gen1_data.json exists."""
+    if os.path.exists("gen1_data.json"):
         import json
-        with open(path) as f:
+        with open("gen1_data.json") as f:
             data = json.load(f)
         print(f"  ✅ gen1_data.json exists ({len(data)} Pokemon)")
         return True
+    print(f"  ⚠️  gen1_data.json not found (will be built on first team generation)")
+    return False
 
-    print(f"  📦 gen1_data.json not found — will build on first load")
-    return True  # load_format_data handles the build automatically
+
+def check_credentials():
+    """Check if credentials.py exists for live play."""
+    if os.path.exists("credentials.py"):
+        try:
+            import credentials
+            if hasattr(credentials, 'username') and hasattr(credentials, 'password'):
+                print(f"  ✅ Credentials found (account: {credentials.username})")
+                return True
+            else:
+                print(f"  ❌ credentials.py exists but missing username/password")
+                print(f"     Use lowercase: username = 'Bot' / password = 'pass'")
+                return False
+        except Exception as e:
+            print(f"  ❌ credentials.py error: {e}")
+            return False
+    print(f"  ⚠️  credentials.py not found (needed for live play)")
+    print(f"     Create it: username = 'YourBot' / password = 'YourPass'")
+    return False
 
 
-def run_preflight(force_rebuild=False):
-    """Run all preflight checks. Returns True if everything is ready."""
-    print("\n🔧 Preflight checks\n")
-
-    ok = True
-
-    if not check_showdown_install():
-        ok = False
-
-    if not check_showdown_server():
-        ok = False
-
-    if not check_ollama():
-        ok = False
-
-    check_gen1_data(force_rebuild)
-
-    if not ok:
-        print("\n❌ Preflight failed — fix the issues above and try again.")
-        print("   See INSTALL.md for full setup instructions.\n")
+def check_poke_env():
+    """Check if poke-env is installed."""
+    try:
+        import poke_env
+        print(f"  ✅ poke-env installed")
+        return True
+    except ImportError:
+        print(f"  ❌ poke-env not installed")
+        print(f"     pip install poke-env --break-system-packages")
         return False
 
-    print("\n✅ All checks passed\n")
-    return True
+
+def run_preflight(mode="all"):
+    """
+    Run preflight checks. Returns True if the requested mode can proceed.
+    mode: 'build' (team building), 'battle' (live play), 'all' (both)
+    """
+    print(f"\n🔧 Preflight checks")
+
+    poke_env_ok = check_poke_env()
+    ollama_ok = check_ollama()
+
+    if mode in ('build', 'all'):
+        showdown_install = check_showdown_install()
+        showdown_server = check_showdown_server()
+        gen1_data = check_gen1_data()
+
+    if mode in ('battle', 'all'):
+        credentials_ok = check_credentials()
+
+    print()
+
+    if mode == 'build':
+        if not poke_env_ok or not ollama_ok:
+            print("❌ Missing dependencies for team building")
+            return False
+        return True
+
+    if mode == 'battle':
+        if not poke_env_ok or not ollama_ok:
+            print("❌ Missing dependencies for battling")
+            return False
+        if not credentials_ok:
+            print("❌ Credentials required for live play")
+            return False
+        return True
+
+    return poke_env_ok and ollama_ok
 
 
 # =============================================================================
-# INTERACTIVE ANCHOR SELECTION
+# TEAM DISCOVERY
 # =============================================================================
 
-# Gen 1 OU staples — shown as numbered options with brief descriptions.
-# Order is roughly by competitive viability / popularity.
-OU_ANCHOR_OPTIONS = [
-    ("tauros",    "Tauros",    "The king of Gen 1 — Body Slam + Hyper Beam + unmatched speed"),
-    ("alakazam",  "Alakazam",  "Fastest Psychic — Psychic + Recover + Thunder Wave"),
-    ("starmie",   "Starmie",   "Versatile Water/Psychic — Surf + Thunderbolt + Recover"),
-    ("snorlax",   "Snorlax",   "Bulky physical tank — Body Slam + Earthquake + Amnesia"),
-    ("gengar",    "Gengar",    "Ghost/Poison — immune to Normal, Hypnosis + Dream Eater"),
-    ("exeggutor", "Exeggutor", "Grass/Psychic — Sleep Powder + Psychic + Explosion"),
-    ("chansey",   "Chansey",   "Special wall — Soft-Boiled + Thunder Wave + Seismic Toss"),
-    ("zapdos",    "Zapdos",    "Electric/Flying — Thunderbolt + Drill Peck + Thunder Wave"),
-    ("cloyster",  "Cloyster",  "Ice/Water — Blizzard + Explosion, massive Defence"),
-    ("jynx",      "Jynx",      "Ice/Psychic — Lovely Kiss (sleep) + Blizzard + Psychic"),
-    ("rhydon",    "Rhydon",    "Ground/Rock — Earthquake + Rock Slide, hits everything"),
-    ("jolteon",   "Jolteon",   "Fastest Electric — Thunderbolt + Thunder Wave + Pin Missile"),
-]
+def find_latest_team():
+    """Find the latest team file in teams/ directory."""
+    os.makedirs("teams", exist_ok=True)
+    team_files = glob.glob("teams/team_*_iteration_*.txt")
+    if not team_files:
+        return None
+
+    def extract_num(path):
+        m = re.search(r'_(\d+)\.txt$', path)
+        return int(m.group(1)) if m else 0
+
+    team_files.sort(key=extract_num)
+    return team_files[-1]
 
 
-def select_anchor_interactive(format_data):
-    """
-    Interactive anchor selection. Shows numbered OU staples and allows
-    free text input for any Pokemon in the pool.
+def load_team(path):
+    """Load a team file and return (team_string, pokemon_names)."""
+    with open(path) as f:
+        team_str = f.read()
 
-    Returns the chosen anchor name (lowercase internal name).
-    """
-    print(f"\n{'='*60}")
-    print("CHOOSE YOUR ANCHOR POKEMON")
-    print(f"{'='*60}")
-    print("Your team will be built around this Pokemon.\n")
+    pokemon = []
+    for line in team_str.strip().split('\n'):
+        line = line.strip()
+        if line and not line.startswith('-'):
+            pokemon.append(line)
 
-    # Filter options to only those actually in the format pool
-    available_options = [
-        (internal, display, desc)
-        for internal, display, desc in OU_ANCHOR_OPTIONS
-        if internal in format_data
-    ]
-
-    for i, (internal, display, desc) in enumerate(available_options, 1):
-        print(f"  {i:2d}. {display:12s} — {desc}")
-
-    print(f"\n   Or type any Pokemon name from the {len(format_data)}-mon pool.")
-    print(f"   Full pool: {', '.join(sorted(format_data.keys()))}\n")
-
-    while True:
-        try:
-            choice = input("Select (number or name): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n")
-            return None
-
-        if not choice:
-            continue
-
-        # Try as a number
-        if choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(available_options):
-                picked = available_options[idx]
-                print(f"\n  ✅ Anchor: {picked[1]}\n")
-                return picked[0]
-            else:
-                print(f"  Enter 1-{len(available_options)} or a Pokemon name.")
-                continue
-
-        # Try as a name
-        name = choice.lower().replace(' ', '').replace('-', '').replace('.', '').replace("'", '')
-        # Match against internal names
-        match = next(
-            (k for k in format_data
-             if k.lower().replace('-', '') == name),
-            None
-        )
-        if match:
-            display = format_data[match]['name']
-            print(f"\n  ✅ Anchor: {display}\n")
-            return match
-        else:
-            print(f"  '{choice}' not found in the pool. Try again.")
+    return team_str, pokemon
 
 
 # =============================================================================
-# MAIN LOOP
+# BUILD MODE
 # =============================================================================
 
-async def run_iterations(format_name, anchor, n_iterations, n_battles):
-    """
-    Core iteration loop:
-      1. Load/build Pokemon data
-      2. Generate team (LLM picks moves, Python picks composition)
-      3. Stress test team vs random + self-play
-      4. Feed results back into next iteration
-      5. Repeat
-    """
+async def run_build(format_name, anchor, n_iterations, n_battles):
+    """Team building: generate → test → improve → repeat."""
     from gen1_data import load_format_data
     from team_generator import generate_team
     from battle_runner import run_all_battles
@@ -236,59 +203,7 @@ async def run_iterations(format_name, anchor, n_iterations, n_battles):
     format_data = load_format_data(format_name)
     print(f"Pool: {len(format_data)} Pokemon")
 
-    # ── Check for existing teams ─────────────────────────────────────────
-    import glob as _glob
-    existing_teams = sorted(
-        _glob.glob(f"teams/team_{format_name.lower()}_iteration_*.txt"),
-        key=lambda p: int(re.search(r'_(\d+)\.txt$', p).group(1))
-            if re.search(r'_(\d+)\.txt$', p) else 0
-    )
-
-    if existing_teams and not anchor:
-        latest = existing_teams[-1]
-        n_existing = len(existing_teams)
-
-        # Read team names from the latest file
-        team_pokemon = []
-        with open(latest) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('-'):
-                    team_pokemon.append(line)
-
-        print(f"\n{'='*60}")
-        print(f"EXISTING TEAM FOUND")
-        print(f"   File:       {latest} ({n_existing} iteration{'s' if n_existing != 1 else ''})")
-        print(f"   Team:       {' / '.join(team_pokemon[:6])}")
-        print(f"{'='*60}")
-        print(f"\n   1. Use existing team — skip to battle")
-        print(f"   2. Build a new team — pick a new anchor and start fresh")
-
-        while True:
-            try:
-                choice = input("\nSelect (1 or 2): ").strip()
-            except (EOFError, KeyboardInterrupt):
-                print("\n")
-                return
-
-            if choice == '1':
-                print(f"\n   Using existing team: {latest}")
-                print(f"\n{'='*60}")
-                print(f"   Next steps:")
-                print(f"     python3 competitive_player.py --battles 5          # test locally")
-                print(f"     python3 live_challenge.py --accept                 # wait for challenge (recommended)")
-                print(f"     python3 live_challenge.py --opponent <username>    # challenge a player")
-                print(f"     python3 live_challenge.py --ladder 5               # play 5 ladder games")
-                print(f"{'='*60}")
-                return
-            elif choice == '2':
-                print()
-                break
-            else:
-                print("  Enter 1 or 2.")
-
-    # ── Anchor selection ─────────────────────────────────────────────────
-    # Interactive anchor selection if none provided via --anchor
+    # Anchor selection
     if not anchor:
         anchor = select_anchor_interactive(format_data)
         if not anchor:
@@ -301,17 +216,14 @@ async def run_iterations(format_name, anchor, n_iterations, n_battles):
         print(f"   Available: {available}")
         anchor = select_anchor_interactive(format_data)
         if not anchor:
-            print("No anchor selected, exiting.")
             return
 
     feedback = None
-
     for iteration in range(n_iterations):
         print(f"\n{'='*60}")
         print(f"ITERATION {iteration + 1} of {n_iterations}")
         print(f"{'='*60}")
 
-        # Generate team
         team = generate_team(
             format_data,
             format_name=format_name,
@@ -322,18 +234,15 @@ async def run_iterations(format_name, anchor, n_iterations, n_battles):
             print("❌ Failed to generate valid team, stopping")
             break
 
-        # Save current team
         os.makedirs("teams", exist_ok=True)
         team_file = f"teams/team_{format_name.lower()}_iteration_{iteration+1}.txt"
         with open(team_file, "w") as f:
             f.write(team)
         print(f"💾 Saved team to {team_file}")
 
-        # Run battles and collect feedback
         print(f"\n⚔️  Running {n_battles} battles per test...")
         feedback = await run_all_battles(team, n_battles=n_battles)
 
-        # Save feedback
         feedback_file = f"teams/feedback_{format_name.lower()}_iteration_{iteration+1}.txt"
         with open(feedback_file, "w") as f:
             f.write(feedback)
@@ -341,18 +250,125 @@ async def run_iterations(format_name, anchor, n_iterations, n_battles):
         print(f"\n📋 Feedback for next iteration:")
         print(feedback)
 
-    # Summary
     final_team = f"teams/team_{format_name.lower()}_iteration_{n_iterations}.txt"
     if os.path.exists(final_team):
         print(f"\n{'='*60}")
         print(f"✅ DONE — {n_iterations} iterations complete")
         print(f"   Final team: {final_team}")
-        print(f"\n   Next steps:")
-        print(f"     python3 competitive_player.py --battles 5          # test locally")
-        print(f"     python3 live_challenge.py --accept                 # wait for challenge (recommended)")
-        print(f"     python3 live_challenge.py --opponent <username>    # challenge a player")
-        print(f"     python3 live_challenge.py --ladder 5               # play 5 ladder games")
+        print(f"   Run: python3 main.py --battle")
         print(f"{'='*60}")
+
+
+def select_anchor_interactive(format_data):
+    """Interactive anchor Pokemon selection."""
+    top_12 = [
+        'tauros', 'snorlax', 'chansey', 'exeggutor', 'alakazam', 'starmie',
+        'zapdos', 'rhydon', 'jynx', 'gengar', 'cloyster', 'jolteon',
+    ]
+    available_top = [p for p in top_12 if p in format_data]
+
+    print(f"\n{'='*60}")
+    print(f"SELECT YOUR ANCHOR POKEMON")
+    print(f"{'='*60}")
+    for i, p in enumerate(available_top, 1):
+        data = format_data[p]
+        types = '/'.join(t for t in [data.get('type1'), data.get('type2')] if t)
+        print(f"  {i:>2}. {data['name']:<12s} ({types})")
+    print(f"\n  Or type any Pokemon name from the pool.")
+    print(f"{'='*60}")
+
+    while True:
+        try:
+            choice = input("\nSelect (number or name): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+
+        if not choice:
+            continue
+
+        if choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(available_top):
+                selected = available_top[idx]
+                display = format_data[selected]['name']
+                print(f"\n  ✅ Anchor: {display}\n")
+                return selected
+            else:
+                print(f"  Enter 1-{len(available_top)} or a Pokemon name.")
+                continue
+
+        name = choice.lower().replace(' ', '').replace('-', '').replace('.', '').replace("'", '')
+        match = next(
+            (k for k in format_data if k.lower().replace('-', '') == name),
+            None
+        )
+        if match:
+            display = format_data[match]['name']
+            print(f"\n  ✅ Anchor: {display}\n")
+            return match
+        else:
+            print(f"  '{choice}' not found in the pool. Try again.")
+
+
+# =============================================================================
+# BATTLE MODE
+# =============================================================================
+
+async def run_battle(team_path, mode, n_battles, format_name, opponent=None):
+    """Launch live battles with the given team."""
+    team_str, pokemon = load_team(team_path)
+
+    print(f"\n📂 Using team: {team_path}")
+    print(f"   {' / '.join(pokemon[:6])}")
+
+    if mode == 'ladder':
+        from live_challenge import run_ladder
+        await run_ladder(team_str, n_games=n_battles, format_name=format_name)
+    elif mode == 'accept':
+        from live_challenge import run_accept
+        await run_accept(team_str, n_battles=n_battles, format_name=format_name)
+    elif mode == 'challenge' and opponent:
+        from live_challenge import run_challenge
+        await run_challenge(opponent, team_str, n_battles=n_battles, format_name=format_name)
+
+
+# =============================================================================
+# INTERACTIVE MENU
+# =============================================================================
+
+def show_menu():
+    """Show the main menu and return the user's choice."""
+    latest = find_latest_team()
+
+    print(f"\n{'='*60}")
+    print(f"Pokemon Showdown Bot")
+    print(f"   LLM:     {LLM_MODEL} (ctx: {LLM_CONTEXT_LENGTH})")
+    print(f"   Timeout: {LLM_LIVE_TIMEOUT_SECONDS}s")
+    if latest:
+        _, pokemon = load_team(latest)
+        print(f"   Team:    {latest}")
+        print(f"            {' / '.join(pokemon[:6])}")
+    else:
+        print(f"   Team:    (none — build one first)")
+    print(f"{'='*60}")
+    print()
+    print(f"  1. Build a team     — generate a new team with LLM assistance")
+    print(f"  2. Battle (ladder)  — play ranked games on Showdown")
+    print(f"  3. Battle (accept)  — wait for challenges from your browser")
+    if latest:
+        print(f"  4. Import a team    — place your own team file in teams/")
+    print()
+
+    while True:
+        try:
+            choice = input("Select: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return None
+        if choice in ('1', '2', '3', '4'):
+            return choice
+        print("  Enter 1, 2, 3, or 4.")
 
 
 # =============================================================================
@@ -361,66 +377,156 @@ async def run_iterations(format_name, anchor, n_iterations, n_battles):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Pokemon Showdown Bot — build and test competitive Gen 1 teams",
+        description="Pokemon Showdown Bot — build teams and battle on the ladder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python3 main.py                          # interactive anchor selection
-  python3 main.py --anchor gengar          # skip prompt, use Gengar
-  python3 main.py --anchor starmie         # skip prompt, use Starmie
-  python3 main.py --iterations 3           # quick 3-cycle test
-  python3 main.py --rebuild-data           # force refresh Pokemon data
-
-After main.py finishes, use the generated team:
-  python3 competitive_player.py --battles 5    # test locally with smart AI
-  python3 live_challenge.py --opponent Rival   # challenge a real player
-        """
     )
-    parser.add_argument(
-        "--format", default=DEFAULT_TIER,
-        help=f"Format tier (default: {DEFAULT_TIER})"
-    )
-    parser.add_argument(
-        "--anchor", default=None,
-        help="Anchor Pokemon to build around (interactive prompt if omitted)"
-    )
-    parser.add_argument(
-        "--iterations", type=int, default=5,
-        help="Number of generate-test-improve cycles (default: 5)"
-    )
-    parser.add_argument(
-        "--battles", type=int, default=10,
-        help="Battles per test in each iteration (default: 10)"
-    )
-    parser.add_argument(
-        "--rebuild-data", action="store_true",
-        help="Force rebuild gen1_data.json from pokered source"
-    )
+    parser.add_argument("--build", action="store_true", help="Jump to team builder")
+    parser.add_argument("--battle", action="store_true", help="Jump to battle mode")
+    parser.add_argument("--ladder", type=int, default=None, help="Number of ladder games")
+    parser.add_argument("--accept", action="store_true", help="Accept mode (wait for challenges)")
+    parser.add_argument("--opponent", default=None, help="Challenge a specific user")
+    parser.add_argument("--format", default=DEFAULT_FORMAT, help=f"Format (default: {DEFAULT_FORMAT})")
+    parser.add_argument("--anchor", default=None, help="Anchor Pokemon for team building")
+    parser.add_argument("--iterations", type=int, default=5, help="Build iterations (default: 5)")
+    parser.add_argument("--battles", type=int, default=10, help="Battles per test (default: 10)")
+    parser.add_argument("--rebuild-data", action="store_true", help="Force rebuild gen1_data.json")
 
     args = parser.parse_args()
 
-    print("=" * 60)
-    print("Pokemon Showdown Bot")
-    print(f"   Format:     Gen 1 {args.format}")
-    print(f"   Anchor:     {args.anchor or '(interactive)'}")
-    print(f"   Iterations: {args.iterations}")
-    print(f"   Battles:    {args.battles} per iteration")
-    print(f"   LLM:        {LLM_MODEL}")
-    print("=" * 60)
-
-    if not run_preflight(force_rebuild=args.rebuild_data):
-        sys.exit(1)
-
-    try:
-        asyncio.run(run_iterations(
-            format_name=args.format,
-            anchor=args.anchor,
-            n_iterations=args.iterations,
-            n_battles=args.battles,
-        ))
-    except KeyboardInterrupt:
-        print("\n\n⏹️  Interrupted by user")
+    # Direct mode via flags
+    if args.build:
+        if not run_preflight("build"):
+            sys.exit(1)
+        try:
+            asyncio.run(run_build(args.format, args.anchor, args.iterations, args.battles))
+        except KeyboardInterrupt:
+            print("\n\nInterrupted")
         sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        raise
+
+    if args.battle or args.ladder or args.accept or args.opponent:
+        if not run_preflight("battle"):
+            sys.exit(1)
+
+        latest = find_latest_team()
+        if not latest:
+            print("❌ No team found. Run: python3 main.py --build")
+            sys.exit(1)
+
+        # Determine battle mode
+        if args.ladder:
+            mode = 'ladder'
+            n = args.ladder
+        elif args.opponent:
+            mode = 'challenge'
+            n = args.battles
+        else:
+            mode = 'accept'
+            n = args.battles
+
+        # Set up logging
+        from competitive_player import Tee
+        os.makedirs("live_logs", exist_ok=True)
+        existing_logs = glob.glob("live_logs/live_log_*.txt")
+        def _num(p):
+            m = re.search(r'_(\d+)\.txt$', p)
+            return int(m.group(1)) if m else 0
+        next_num = max((_num(p) for p in existing_logs), default=0) + 1
+        log_path = f"live_logs/live_log_{next_num:03d}.txt"
+        tee = Tee(log_path)
+        print(f"Logging to: {log_path}")
+
+        try:
+            asyncio.run(run_battle(latest, mode, n, args.format, args.opponent))
+        except KeyboardInterrupt:
+            print("\n\nInterrupted")
+        finally:
+            tee.close()
+            print(f"\nLog saved to: {log_path}")
+        sys.exit(0)
+
+    # Interactive menu
+    if args.rebuild_data:
+        from gen1_data import build_gen1_data
+        build_gen1_data()
+
+    choice = show_menu()
+
+    if choice == '1':
+        if not run_preflight("build"):
+            sys.exit(1)
+        try:
+            asyncio.run(run_build(args.format, args.anchor, args.iterations, args.battles))
+        except KeyboardInterrupt:
+            print("\n\nInterrupted")
+
+    elif choice == '2':
+        if not run_preflight("battle"):
+            sys.exit(1)
+        latest = find_latest_team()
+        if not latest:
+            print("❌ No team found. Build one first (option 1).")
+            sys.exit(1)
+
+        try:
+            n = int(input("How many ladder games? [20]: ").strip() or "20")
+        except (ValueError, EOFError, KeyboardInterrupt):
+            n = 20
+
+        from competitive_player import Tee
+        os.makedirs("live_logs", exist_ok=True)
+        existing_logs = glob.glob("live_logs/live_log_*.txt")
+        def _num(p):
+            m = re.search(r'_(\d+)\.txt$', p)
+            return int(m.group(1)) if m else 0
+        next_num = max((_num(p) for p in existing_logs), default=0) + 1
+        log_path = f"live_logs/live_log_{next_num:03d}.txt"
+        tee = Tee(log_path)
+        print(f"Logging to: {log_path}")
+
+        try:
+            asyncio.run(run_battle(latest, 'ladder', n, args.format))
+        except KeyboardInterrupt:
+            print("\n\nInterrupted")
+        finally:
+            tee.close()
+            print(f"\nLog saved to: {log_path}")
+
+    elif choice == '3':
+        if not run_preflight("battle"):
+            sys.exit(1)
+        latest = find_latest_team()
+        if not latest:
+            print("❌ No team found. Build one first (option 1).")
+            sys.exit(1)
+
+        from competitive_player import Tee
+        os.makedirs("live_logs", exist_ok=True)
+        existing_logs = glob.glob("live_logs/live_log_*.txt")
+        def _num(p):
+            m = re.search(r'_(\d+)\.txt$', p)
+            return int(m.group(1)) if m else 0
+        next_num = max((_num(p) for p in existing_logs), default=0) + 1
+        log_path = f"live_logs/live_log_{next_num:03d}.txt"
+        tee = Tee(log_path)
+        print(f"Logging to: {log_path}")
+
+        try:
+            asyncio.run(run_battle(latest, 'accept', 1, args.format))
+        except KeyboardInterrupt:
+            print("\n\nInterrupted")
+        finally:
+            tee.close()
+            print(f"\nLog saved to: {log_path}")
+
+    elif choice == '4':
+        print(f"\n  Place your team file in teams/ with the format:")
+        print(f"    teams/team_ou_iteration_N.txt")
+        print(f"\n  The bot uses the highest-numbered iteration.")
+        print(f"  Format: one Pokemon per block, moves prefixed with '- '")
+        print(f"\n  Example:")
+        print(f"    Tauros")
+        print(f"    - bodyslam")
+        print(f"    - hyperbeam")
+        print(f"    - earthquake")
+        print(f"    - blizzard")
+        print(f"\n  Separate Pokemon with a blank line.")

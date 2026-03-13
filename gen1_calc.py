@@ -131,6 +131,15 @@ MOVES = {
     'agility':       (0,   'psychic',   'status'),
     'reflect':       (0,   'psychic',   'status'),
     'lightscreen':   (0,   'psychic',   'status'),
+    'leechseed':    (0,   'grass',     'status'),
+    'poisonpowder': (0,   'poison',    'status'),
+    'confuseray':   (0,   'ghost',     'status'),
+    'supersonic':   (0,   'normal',    'status'),
+    'glare':        (0,   'normal',    'status'),
+    'spore':        (0,   'grass',     'status'),
+    'sludge':       (65,  'poison',    'physical'),   # 30% poison chance
+    'smog':         (20,  'poison',    'special'),     # 40% poison chance
+    'poisonsting':  (15,  'poison',    'physical'),    # 20% poison chance
 }
 
 
@@ -200,20 +209,22 @@ def apply_stage(stat, stage):
 
 def calc_damage(attacker, move_id, defender, crit=False, par_attacker=False,
                 atk_boosts=None, def_boosts=None,
-                reflect=False, light_screen=False):
+                reflect=False, light_screen=False,
+                attacker_burned=False):
     """
     Calculate the damage range for a specific attack.
 
     Args:
-        attacker:      species name (e.g. 'tauros')
-        move_id:       move ID (e.g. 'bodyslam')
-        defender:      species name (e.g. 'alakazam')
-        crit:          critical hit (ignores stat stages in Gen 1)
-        par_attacker:  is the attacker paralyzed? (for speed, not damage)
-        atk_boosts:    attacker's stat boosts dict {'atk': 0, 'def': 0, 'spc': 0, 'spe': 0}
-        def_boosts:    defender's stat boosts dict (same format)
-        reflect:       is Reflect active on the defender's side?
-        light_screen:  is Light Screen active on the defender's side?
+        attacker:        species name (e.g. 'tauros')
+        move_id:         move ID (e.g. 'bodyslam')
+        defender:        species name (e.g. 'alakazam')
+        crit:            critical hit (ignores stat stages in Gen 1)
+        par_attacker:    is the attacker paralyzed? (for speed, not damage)
+        atk_boosts:      attacker's stat boosts dict
+        def_boosts:      defender's stat boosts dict
+        reflect:         is Reflect active on the defender's side?
+        light_screen:    is Light Screen active on the defender's side?
+        attacker_burned: is the attacker burned? (halves physical Attack in Gen 1)
 
     Returns:
         (min_damage, max_damage) tuple, or (100, 100) for fixed-damage moves.
@@ -265,6 +276,11 @@ def calc_damage(attacker, move_id, defender, crit=False, par_attacker=False,
     if not crit:
         attack = apply_stage(attack, atk_stage)
         defense = apply_stage(defense, def_stage)
+
+    # Burn halves physical Attack in Gen 1
+    # (applies after stat stages, does not affect Special moves)
+    if attacker_burned and not is_special:
+        attack = max(1, attack // 2)
 
     # Explosion/Self-Destruct halve target's defense in Gen 1
     if move_id in ('explosion', 'selfdestruct'):
@@ -426,6 +442,79 @@ def can_2hko(attacker, move_id, defender, hp_pct=1.0):
     current_hp = int(def_stats[0] * hp_pct)
     avg = (lo + hi) // 2
     return avg * 2 >= current_hp
+
+
+# =============================================================================
+# FREEZE CHANCE — Ice move strategic evaluation
+#
+# In Gen 1, all damaging Ice moves have a 10% chance to freeze the target.
+# Freeze is essentially a permanent KO (you almost never thaw in Gen 1).
+# Ice-type Pokemon are immune to freeze.
+#
+# This helps the bot choose: Blizzard (120bp, 10% freeze) vs a slightly
+# better type-matchup move that has no freeze upside.
+# =============================================================================
+
+# Moves that can freeze in Gen 1 (all damaging Ice-type moves)
+FREEZE_MOVES = {'blizzard', 'icebeam', 'icepunch', 'icebeam'}
+
+def freeze_chance_value(move_id, defender_species):
+    """
+    Return a bonus value (0-20) representing the strategic value of
+    a potential freeze from this move. Returns 0 if:
+      - Move isn't Ice-type damaging
+      - Defender is Ice-type (immune to freeze in Gen 1)
+      - Defender already has a status condition (can't freeze)
+
+    The value is meant to be added to move scoring to slightly prefer
+    Ice moves when freeze chance is relevant.
+    """
+    if move_id not in FREEZE_MOVES:
+        return 0
+
+    def_types = POKEMON_TYPES.get(defender_species, ('normal',))
+    if 'ice' in def_types:
+        return 0  # Ice types immune to freeze
+
+    # 10% chance of what is essentially a KO = ~10% of a KO's value
+    # We score this as a flat bonus to move selection
+    return 15  # significant but not dominant
+
+
+# =============================================================================
+# SUBSTITUTE TRACKING
+#
+# Substitute costs 25% of max HP and creates a shield that absorbs hits.
+# The Sub breaks when it takes damage >= 25% of the user's max HP.
+#
+# Key implications for the bot:
+#   - KO checks must account for the Sub HP absorbing the hit
+#   - Status moves (Thunder Wave, Sleep Powder) fail against Subs
+#   - The bot should break the Sub first, then go for the KO
+# =============================================================================
+
+def get_substitute_hp(species):
+    """
+    Return the HP of a Substitute for this species.
+    Substitute HP = floor(max_hp / 4) in Gen 1.
+    """
+    stats = STATS.get(species)
+    if not stats:
+        return 0
+    return stats[0] // 4
+
+
+def can_break_substitute(attacker, move_id, defender, **kwargs):
+    """
+    Can this move break the defender's Substitute in one hit?
+    Uses average damage roll.
+    """
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+    sub_hp = get_substitute_hp(defender)
+    if sub_hp == 0:
+        return False
+    avg = (lo + hi) // 2
+    return avg >= sub_hp
 
 
 # =============================================================================

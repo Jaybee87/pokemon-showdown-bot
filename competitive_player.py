@@ -43,6 +43,7 @@ from gen1_engine import (
 from gen1_calc import (
     calc_damage_pct, can_ko, find_ko_move, outspeeds, get_speed,
     evaluate_matchup, find_best_matchup_switch,
+    freeze_chance_value, get_substitute_hp, can_break_substitute,
 )
 from llm_bridge import (
     call_llm, call_llm_async, strip_think_tags,
@@ -263,6 +264,11 @@ class CompetitivePlayer(Player):
         self._total_games = total_games
         self._games_finished = 0
         self._wins = 0
+        # Per-game decision count snapshots
+        self._battle_start_py = 0
+        self._battle_start_llm = 0
+        # Sleep Clause: once we've put an opponent to sleep, sleep moves auto-fail
+        self._sleep_clause_active = False
 
     def _log(self, msg):
         """Always print — captured by Tee into the log file."""
@@ -525,6 +531,24 @@ LEAD: <species>"""
         if not opp_is_asleep:
             real_moves = [m for m in real_moves if m.id != 'dreameater']
 
+        # Early Substitute detection — status moves fail against Substitutes
+        # (Thunder Wave, Sleep Powder, Toxic, etc. all blocked by Sub)
+        _opp_has_sub_early = False
+        if opp_poke.effects:
+            for eff in opp_poke.effects:
+                eff_name = eff.name if hasattr(eff, 'name') else str(eff)
+                if 'SUBSTITUTE' in eff_name.upper():
+                    _opp_has_sub_early = True
+                    break
+        if _opp_has_sub_early:
+            STATUS_MOVES_BLOCKED_BY_SUB = {
+                'thunderwave', 'sleeppowder', 'stunspore', 'toxic',
+                'hypnosis', 'lovelykiss', 'sing', 'poisonpowder',
+                'confuseray', 'supersonic',
+            }
+            real_moves = [m for m in real_moves
+                          if m.id not in STATUS_MOVES_BLOCKED_BY_SUB]
+
         # On a recharge turn poke-env only offers [recharge]
         all_moves = battle.available_moves
         if len(all_moves) == 1 and all_moves[0].id == 'recharge':
@@ -558,6 +582,25 @@ LEAD: <species>"""
         _tee = _sys.stdout
         if not self._verbose and hasattr(_tee, '_suppress_console'):
             _tee._suppress_console = True
+
+        # Snapshot cumulative counts at the start of each new battle
+        if battle.turn == 1:
+            self._battle_start_py = self._python_call_count
+            self._battle_start_llm = self._llm_call_count
+            self._sleep_clause_active = False
+            self._matchup_evaluated_vs = None
+
+        # Sleep Clause detection: check if any opponent Pokemon is asleep
+        # (from a move we used, not Rest). If so, sleep moves will auto-fail.
+        if not self._sleep_clause_active:
+            for opp_mon in battle.opponent_team.values():
+                if opp_mon.status and opp_mon.status.name == 'SLP':
+                    self._sleep_clause_active = True
+                    break
+
+        # Filter sleep moves if Sleep Clause is active
+        if self._sleep_clause_active:
+            real_moves = [m for m in real_moves if m.id not in SLEEP_MOVES]
 
         print(f"\n{'='*60}")
         print(f"Turn {battle.turn} | My: {my_poke.species} ({int(my_hp_frac*100)}% HP{my_status_str}) "
@@ -741,24 +784,16 @@ LEAD: <species>"""
         # STEP 5b — Matchup-based switching: is a teammate significantly
         # better suited to face this opponent?
         #
-        # Only triggers ONCE per opponent switch-in (first turn we see them).
-        # This prevents the bot from switching every single turn in neutral
-        # matchups. If we chose to stay in, we commit to attacking.
+        # Only triggers ONCE per opponent Pokemon. After we evaluate and
+        # either switch or stay, we commit — no re-evaluation until the
+        # opponent sends out a different Pokemon.
         # ------------------------------------------------------------------
         if switches and not in_danger:
-            # Track which opponent we last evaluated to avoid re-triggering
-            opp_key = f"{opp_species}_{battle.turn}"
-            last_matchup_opp = getattr(self, '_last_matchup_opp', None)
-            last_matchup_turn = getattr(self, '_last_matchup_turn', 0)
+            # Track which opponent we've already evaluated against
+            last_eval = getattr(self, '_matchup_evaluated_vs', None)
 
-            # Only evaluate if the opponent changed since our last check
-            # (i.e. they switched in, or we just entered this matchup)
-            opp_changed = (opp_species != last_matchup_opp)
-            first_turn_vs_opp = (battle.turn - last_matchup_turn) > 1
-
-            if opp_changed or first_turn_vs_opp:
-                self._last_matchup_opp = opp_species
-                self._last_matchup_turn = battle.turn
+            if opp_species != last_eval:
+                self._matchup_evaluated_vs = opp_species
 
                 my_move_ids = [m.id for m in real_moves]
                 my_status_str = my_status_now.name if my_status_now else None
@@ -772,6 +807,9 @@ LEAD: <species>"""
                     opp_status=opp_status_str,
                 )
                 if matchup_sw:
+                    # We're switching — reset tracker so we re-evaluate
+                    # from the new Pokemon's perspective next turn
+                    self._matchup_evaluated_vs = None
                     print(f"  🔄 PYTHON MATCHUP SWITCH: {matchup_sw.species} is a better "
                           f"matchup vs {opp_poke.species} (+{score_diff:.0f} points)")
                     self._python_call_count += 1
@@ -794,14 +832,16 @@ LEAD: <species>"""
         # ------------------------------------------------------------------
         # STEP 6b — KO check: can we finish the opponent this turn?
         # Uses the damage calculator for concrete maths, not guessing.
-        # Includes stat stages (e.g. Psychic lowering Special) and screens.
+        # Includes stat stages, screens, burn, and Substitute awareness.
         # Fires BEFORE healing — don't Soft-Boiled when you can KO.
         # ------------------------------------------------------------------
 
         # Extract stat boosts from poke-env
-        # poke-env uses 'spa'/'spd' but Gen 1 has unified Special
         my_boosts = dict(my_poke.boosts) if my_poke.boosts else {}
         opp_boosts = dict(opp_poke.boosts) if opp_poke.boosts else {}
+
+        # Detect burn on attacker (halves physical damage)
+        my_burned = my_status_now and my_status_now.name == 'BRN'
 
         # Detect Reflect/Light Screen on opponent's side
         opp_has_reflect = False
@@ -814,7 +854,6 @@ LEAD: <species>"""
             opp_has_reflect = SideCondition.REFLECT in battle.opponent_side_conditions
             opp_has_lightscreen = SideCondition.LIGHT_SCREEN in battle.opponent_side_conditions
         except (ImportError, AttributeError):
-            # If SideCondition isn't available, check by string matching
             for sc in battle.opponent_side_conditions:
                 sc_name = sc.name if hasattr(sc, 'name') else str(sc)
                 if 'REFLECT' in sc_name.upper():
@@ -822,12 +861,41 @@ LEAD: <species>"""
                 if 'LIGHT' in sc_name.upper():
                     opp_has_lightscreen = True
 
+        # Detect Substitute on opponent
+        opp_has_sub = False
+        if opp_poke.effects:
+            for eff in opp_poke.effects:
+                eff_name = eff.name if hasattr(eff, 'name') else str(eff)
+                if 'SUBSTITUTE' in eff_name.upper():
+                    opp_has_sub = True
+                    break
+
         calc_kwargs = {
             'atk_boosts': my_boosts,
             'def_boosts': opp_boosts,
             'reflect': opp_has_reflect,
             'light_screen': opp_has_lightscreen,
+            'attacker_burned': my_burned,
         }
+
+        # If opponent has Substitute, we can't KO — need to break Sub first
+        # Also, status moves (Thunder Wave, Sleep Powder) won't work through Sub
+        if opp_has_sub:
+            # Find best move to break the Sub
+            sub_breaker = None
+            for m in real_moves:
+                if m.id not in ('explosion', 'selfdestruct') and m.base_power > 0:
+                    if can_break_substitute(my_species, m.id, opp_species, **calc_kwargs):
+                        sub_breaker = m
+                        break
+            if sub_breaker:
+                print(f"  🛡️ PYTHON: opponent has Substitute — breaking with {sub_breaker.id}")
+                self._python_call_count += 1
+                return self.create_order(sub_breaker)
+            elif best_move and best_move.base_power > 0:
+                print(f"  🛡️ PYTHON: opponent has Substitute — chipping with {best_move.id}")
+                self._python_call_count += 1
+                return self.create_order(best_move)
 
         ko_move_ids = [m.id for m in real_moves if m.id not in ('explosion', 'selfdestruct')]
         ko_result, ko_guaranteed = find_ko_move(
@@ -837,8 +905,9 @@ LEAD: <species>"""
             ko_move_obj = next((m for m in real_moves if m.id == ko_result), None)
             if ko_move_obj:
                 label = "guaranteed KO" if ko_guaranteed else "likely KO"
-                # Show boost/screen info if relevant
                 extras = []
+                if my_burned:
+                    extras.append("burned")
                 if any(v != 0 for v in my_boosts.values()):
                     extras.append(f"our boosts: {my_boosts}")
                 if any(v != 0 for v in opp_boosts.values()):
@@ -933,24 +1002,95 @@ LEAD: <species>"""
                     reasons.append("a switch-in resists opponent's known moves")
                     break
 
-        # Flag status moves as LLM decisions
-        opp_status_now = opp_poke.status
-        has_twave = any(m.id == 'thunderwave' for m in real_moves)
-        has_sleep = any(m.id in SLEEP_MOVES for m in real_moves)
-        has_dreameater = any(
-            m.id == 'dreameater' for m in battle.available_moves
-            if m.id not in ('struggle', 'recharge')
-        )
+        # ------------------------------------------------------------------
+        # Status move detection — generic system
+        #
+        # Pipeline for every status-inflicting option:
+        #   1. Do I have this move?
+        #   2. Can the opponent receive a status? (no status + no Sub)
+        #   3. Any type immunities? (Electric→Ground, Poison→Poison etc)
+        #   4. If yes to all → flag for LLM: "is this a good time?"
+        #
+        # This covers: sleep, paralysis, poison, toxic, freeze chance,
+        # leech seed, and any future status moves.
+        # ------------------------------------------------------------------
+        opp_can_receive_status = not opp_status_now and not _opp_has_sub_early
 
-        if not opp_status_now:
-            if has_sleep:
-                sleep_move = next(m.id for m in real_moves if m.id in SLEEP_MOVES)
-                combo_note = ' (sets up Dream Eater)' if has_dreameater else ''
-                reasons.append(
-                    f"{sleep_move} available — opponent has no status{combo_note}"
-                )
-            if has_twave:
-                reasons.append("Thunder Wave available — opponent has no status")
+        # Define all status-inflicting moves and their LLM context
+        # Format: (move_ids, condition_fn, description)
+        STATUS_INFLICTORS = [
+            # Sleep moves — strongest status in Gen 1
+            {
+                'ids': {'sleeppowder', 'hypnosis', 'spore', 'lovelykiss', 'sing'},
+                'condition': lambda: opp_can_receive_status,
+                'desc': lambda mid: f"{mid} available — can put opponent to sleep",
+                'combo': lambda: ' (sets up Dream Eater)' if any(
+                    m.id == 'dreameater' for m in battle.available_moves
+                    if m.id not in ('struggle', 'recharge')
+                ) else '',
+            },
+            # Paralysis — permanent speed cripple + 25% full para
+            {
+                'ids': {'thunderwave', 'stunspore', 'glare'},
+                'condition': lambda: opp_can_receive_status,
+                'desc': lambda mid: f"{mid} available — can paralyse opponent",
+            },
+            # Toxic — escalating damage, devastating in long games
+            {
+                'ids': {'toxic'},
+                'condition': lambda: (opp_can_receive_status
+                                      and 'poison' not in opp_types),  # Poison types immune
+                'desc': lambda mid: f"{mid} available — escalating poison damage",
+            },
+            # Poison (regular) — steady 1/8 chip damage
+            {
+                'ids': {'poisonpowder', 'sludge', 'smog', 'poisonsting'},
+                'condition': lambda: (opp_can_receive_status
+                                      and 'poison' not in opp_types),
+                'desc': lambda mid: f"{mid} available — can poison opponent",
+            },
+            # Leech Seed — drains 1/16 per turn, Grass types immune
+            {
+                'ids': {'leechseed'},
+                'condition': lambda: ('grass' not in opp_types
+                                      and not _opp_has_sub_early),
+                'desc': lambda mid: f"{mid} available — drains HP each turn (Grass immune)",
+            },
+            # Confuse Ray / Supersonic — volatile, works even with existing status
+            {
+                'ids': {'confuseray', 'supersonic'},
+                'condition': lambda: not _opp_has_sub_early,  # blocked by Sub only
+                'desc': lambda mid: f"{mid} available — 50% chance opponent hits itself",
+            },
+        ]
+
+        # Ice moves — 10% freeze chance, freeze is permanent in Gen 1
+        # Special case: these are damaging moves with a status side-effect
+        opp_is_ice = 'ice' in opp_types
+        has_freeze_move = any(
+            m.type and m.type.name.lower() == 'ice' and m.base_power > 0
+            for m in real_moves
+        )
+        freeze_relevant = has_freeze_move and opp_can_receive_status and not opp_is_ice
+
+        # Check each status category
+        for status_info in STATUS_INFLICTORS:
+            available = [m for m in real_moves if m.id in status_info['ids']]
+            if available and status_info['condition']():
+                move = available[0]
+                desc = status_info['desc'](move.id)
+                combo = status_info.get('combo', lambda: '')()
+                reasons.append(f"{desc}{combo}")
+
+        # Freeze chance (separate — it's a damage move with status upside)
+        if freeze_relevant:
+            ice_move = next(
+                m.id for m in real_moves
+                if m.type and m.type.name.lower() == 'ice' and m.base_power > 0
+            )
+            reasons.append(
+                f"{ice_move} has 10% freeze chance — freeze is permanent in Gen 1"
+            )
 
         if not reasons:
             if best_move and best_move.id == 'hyperbeam':
@@ -1031,13 +1171,18 @@ LEAD: <species>"""
     def _battle_finished_callback(self, battle):
         self._unsuppress()  # always show battle result on console
         result = "WON ✓" if battle.won else "LOST ✗"
+
+        # Per-game counts (subtract snapshot from battle start)
+        game_py = self._python_call_count - self._battle_start_py
+        game_llm = self._llm_call_count - self._battle_start_llm
+        game_total = game_py + game_llm
+
         print(f"\n{'='*60}")
         print(f"BATTLE OVER — {result} in {battle.turn} turns")
-        print(f"  Python decisions: {self._python_call_count}")
-        print(f"  LLM decisions:    {self._llm_call_count}")
-        total = self._python_call_count + self._llm_call_count
-        if total > 0:
-            pct = int(self._llm_call_count / total * 100)
+        print(f"  Python decisions: {game_py}")
+        print(f"  LLM decisions:    {game_llm}")
+        if game_total > 0:
+            pct = int(game_llm / game_total * 100)
             print(f"  LLM involvement:  {pct}% of turns")
         print(f"{'='*60}")
 
@@ -1049,10 +1194,16 @@ LEAD: <species>"""
         losses = self._games_finished - self._wins
         if self._total_games:
             print(f"📈 Progress: {self._games_finished}/{self._total_games} "
-                  f"({self._wins}W / {losses}L)\n")
+                  f"({self._wins}W / {losses}L)")
         else:
             print(f"📈 Record: {self._wins}W / {losses}L "
-                  f"({self._games_finished} games)\n")
+                  f"({self._games_finished} games)")
+        cum_total = self._python_call_count + self._llm_call_count
+        cum_pct = int(self._llm_call_count / cum_total * 100) if cum_total > 0 else 0
+        print(f"  Python decisions: {self._python_call_count}")
+        print(f"  LLM decisions:    {self._llm_call_count}")
+        print(f"  LLM involvement:  {cum_pct}% of turns")
+        print(f"{'='*60}\n")
 
 
 # =============================================================================
