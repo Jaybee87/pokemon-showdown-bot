@@ -221,6 +221,20 @@ def parse_battle_decision(raw, valid_move_ids, valid_switch_ids):
         if candidate in norm_switch_set:
             return 'switch', norm_switch_set[candidate]
 
+    # Try "switch in X" / "switch to X" / "send in X" anywhere in text
+    sw_match = re.search(r'(?:switch|send)\s+(?:in|to)\s+(\w+)', raw, re.IGNORECASE)
+    if sw_match:
+        candidate = norm(sw_match.group(1))
+        if candidate in norm_switch_set:
+            return 'switch', norm_switch_set[candidate]
+
+    # Try "use X" anywhere in text (last resort)
+    use_match = re.search(r'\buse\s+(\w+)', raw, re.IGNORECASE)
+    if use_match:
+        candidate = norm(use_match.group(1))
+        if candidate in norm_move_set:
+            return 'move', norm_move_set[candidate]
+
     return None, None
 
 

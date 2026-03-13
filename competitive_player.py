@@ -269,6 +269,16 @@ class CompetitivePlayer(Player):
         self._battle_start_llm = 0
         # Sleep Clause: once we've put an opponent to sleep, sleep moves auto-fail
         self._sleep_clause_active = False
+        # Hyper Beam repeat guard: track last HB target and their HP
+        self._last_hyper_beam_target = None
+        self._last_hyper_beam_target_hp = None
+        # Futile heal detector: track if we healed last turn and HP before heal
+        self._healed_last_turn = False
+        self._hp_before_heal = 0
+        # Thunder Wave / status move tracking: don't re-fire at same species
+        self._status_attempted_vs = {}  # {species: move_id}
+        # Matchup switch cooldown: prevent ping-pong switching
+        self._switch_cooldown = 0
 
     def _log(self, msg):
         """Always print — captured by Tee into the log file."""
@@ -494,11 +504,33 @@ LEAD: <species>"""
         real_moves = [m for m in battle.available_moves
                       if m.id not in ('struggle', 'recharge')]
 
-        # Filter Thunder Wave if opponent already has a status condition
+        # ══════════════════════════════════════════════════════════════
+        # MASTER STATUS FILTER — one gate, no exceptions
+        #
+        # Core rule: if the opponent already has ANY non-volatile status
+        # (PAR, SLP, PSN, TOX, BRN, FRZ), no status-only move can apply
+        # a new one. Strip them ALL from the move list immediately.
+        #
+        # Volatile statuses (Confusion, Leech Seed) CAN stack on top of
+        # a non-volatile status, so those are NOT filtered here.
+        # ══════════════════════════════════════════════════════════════
         opp_status_now = battle.opponent_active_pokemon.status
         my_status_now = battle.active_pokemon.status
+
+        # Every move whose sole purpose is inflicting a non-volatile status.
+        # If the opponent already has one, these moves are guaranteed to fail.
+        NON_VOLATILE_STATUS_MOVES = {
+            # Sleep
+            'sleeppowder', 'hypnosis', 'spore', 'lovelykiss', 'sing',
+            # Paralysis
+            'thunderwave', 'stunspore', 'glare',
+            # Poison
+            'toxic', 'poisonpowder',
+            # (poisonsting/sludge/smog deal damage AND may poison — keep those)
+        }
+
         if opp_status_now:
-            real_moves = [m for m in real_moves if m.id != 'thunderwave']
+            real_moves = [m for m in real_moves if m.id not in NON_VOLATILE_STATUS_MOVES]
 
         # Filter ALL moves that are immune (0x) against the opponent's types.
         # This catches every type immunity in one pass:
@@ -655,6 +687,12 @@ LEAD: <species>"""
             self._battle_start_llm = self._llm_call_count
             self._sleep_clause_active = False
             self._matchup_evaluated_vs = None
+            self._last_hyper_beam_target = None
+            self._last_hyper_beam_target_hp = None
+            self._healed_last_turn = False
+            self._hp_before_heal = 0
+            self._status_attempted_vs = {}
+            self._switch_cooldown = 0
 
         # Sleep Clause detection: check if any opponent Pokemon is asleep
         # (from a move we used, not Rest). If so, sleep moves will auto-fail.
@@ -853,8 +891,14 @@ LEAD: <species>"""
         # Only triggers ONCE per opponent Pokemon. After we evaluate and
         # either switch or stay, we commit — no re-evaluation until the
         # opponent sends out a different Pokemon.
+        #
+        # Switch cooldown: after a matchup switch, wait 3 turns before
+        # allowing another one to prevent rapid re-switching.
         # ------------------------------------------------------------------
-        if switches and not in_danger:
+        if self._switch_cooldown > 0:
+            self._switch_cooldown -= 1
+
+        if switches and not in_danger and self._switch_cooldown == 0:
             # Track which opponent we've already evaluated against
             last_eval = getattr(self, '_matchup_evaluated_vs', None)
 
@@ -884,6 +928,7 @@ LEAD: <species>"""
                     # and switch right back (Exeg→Chansey→Exeg→Chansey loop).
                     # The tracker naturally re-evaluates when the OPPONENT
                     # switches to a different species.
+                    self._switch_cooldown = 3  # prevent re-switching for 3 turns
                     print(f"  🔄 PYTHON MATCHUP SWITCH: {matchup_sw.species} is a better "
                           f"matchup vs {opp_poke.species} (+{score_diff:.0f} points)")
                     self._python_call_count += 1
@@ -983,23 +1028,44 @@ LEAD: <species>"""
         if ko_result:
             ko_move_obj = next((m for m in real_moves if m.id == ko_result), None)
             if ko_move_obj:
-                label = "guaranteed KO" if ko_guaranteed else "likely KO"
-                extras = []
-                if my_burned:
-                    extras.append("burned")
-                if any(v != 0 for v in my_boosts.values()):
-                    extras.append(f"our boosts: {my_boosts}")
-                if any(v != 0 for v in opp_boosts.values()):
-                    extras.append(f"opp boosts: {opp_boosts}")
-                if opp_has_reflect:
-                    extras.append("Reflect up")
-                if opp_has_lightscreen:
-                    extras.append("Light Screen up")
-                extra_str = f" ({', '.join(extras)})" if extras else ""
-                print(f"  🎯 PYTHON {label.upper()}: {ko_result} finishes "
-                      f"{opp_poke.species} at {int(opp_hp_frac*100)}%{extra_str}")
-                self._python_call_count += 1
-                return self.create_order(ko_move_obj)
+                # Hyper Beam repeat guard: if we Hyper Beamed this same target
+                # last turn and they're at the same or higher HP, they Recovered.
+                # Don't commit to Hyper Beam again — use a non-recharge move.
+                if ko_result == 'hyperbeam' \
+                   and self._last_hyper_beam_target == opp_species \
+                   and self._last_hyper_beam_target_hp is not None \
+                   and opp_hp_frac >= self._last_hyper_beam_target_hp:
+                    print(f"  🚫 PYTHON: Hyper Beam failed to KO last turn "
+                          f"({opp_poke.species} recovered) — skipping HB")
+                    self._last_hyper_beam_target = None
+                    self._last_hyper_beam_target_hp = None
+                    # Fall through to T-Wave / heal / LLM logic
+                else:
+                    # Track Hyper Beam usage for repeat detection
+                    if ko_result == 'hyperbeam':
+                        self._last_hyper_beam_target = opp_species
+                        self._last_hyper_beam_target_hp = opp_hp_frac
+                    else:
+                        self._last_hyper_beam_target = None
+                        self._last_hyper_beam_target_hp = None
+
+                    label = "guaranteed KO" if ko_guaranteed else "likely KO"
+                    extras = []
+                    if my_burned:
+                        extras.append("burned")
+                    if any(v != 0 for v in my_boosts.values()):
+                        extras.append(f"our boosts: {my_boosts}")
+                    if any(v != 0 for v in opp_boosts.values()):
+                        extras.append(f"opp boosts: {opp_boosts}")
+                    if opp_has_reflect:
+                        extras.append("Reflect up")
+                    if opp_has_lightscreen:
+                        extras.append("Light Screen up")
+                    extra_str = f" ({', '.join(extras)})" if extras else ""
+                    print(f"  🎯 PYTHON {label.upper()}: {ko_result} finishes "
+                          f"{opp_poke.species} at {int(opp_hp_frac*100)}%{extra_str}")
+                    self._python_call_count += 1
+                    return self.create_order(ko_move_obj)
 
         # ------------------------------------------------------------------
         # STEP 6c — Thunder Wave fast-path: paralyse unstatused opponents
@@ -1012,11 +1078,13 @@ LEAD: <species>"""
         #   - Opponent is faster than us (paralysis matters most here)
         # ------------------------------------------------------------------
         if not opp_status_now:
+            already_status = self._status_attempted_vs.get(opp_species)
             twave = next((m for m in real_moves if m.id == 'thunderwave'), None)
-            if twave:
+            if twave and already_status != 'thunderwave':
                 my_par = my_status_now and my_status_now.name == 'PAR'
                 they_faster = outspeeds(opp_species, my_species, b_par=my_par)
                 if they_faster:
+                    self._status_attempted_vs[opp_species] = 'thunderwave'
                     print(f"  ⚡ PYTHON: Thunder Wave — {opp_poke.species} is faster, paralysing")
                     self._python_call_count += 1
                     return self.create_order(twave)
@@ -1025,6 +1093,10 @@ LEAD: <species>"""
         # STEP 7a — Recover / Soft-Boiled at ~50% HP
         # These heal 50% HP instantly with no downside (no sleep).
         # Use them proactively — Chansey and Starmie should heal often.
+        #
+        # Futile heal guard: if we healed last turn and are now at the
+        # same or lower HP, the opponent out-damages our recovery.
+        # Stop healing and attack or switch instead.
         # ------------------------------------------------------------------
         if my_hp_frac < 0.55:
             heal_move = next(
@@ -1032,9 +1104,18 @@ LEAD: <species>"""
                 None
             )
             if heal_move:
-                print(f"  💚 PYTHON: healing at {int(my_hp_frac*100)}% — using {heal_move.id}")
-                self._python_call_count += 1
-                return self.create_order(heal_move)
+                if self._healed_last_turn and my_hp_frac <= self._hp_before_heal:
+                    print(f"  🚫 PYTHON: heal is futile (HP {int(self._hp_before_heal*100)}% → "
+                          f"{int(my_hp_frac*100)}% after heal) — skipping {heal_move.id}")
+                    self._healed_last_turn = False
+                else:
+                    self._healed_last_turn = True
+                    self._hp_before_heal = my_hp_frac
+                    print(f"  💚 PYTHON: healing at {int(my_hp_frac*100)}% — using {heal_move.id}")
+                    self._python_call_count += 1
+                    return self.create_order(heal_move)
+        else:
+            self._healed_last_turn = False
 
         # ------------------------------------------------------------------
         # STEP 7b — Rest at low HP (puts us to sleep — last resort)
@@ -1175,12 +1256,17 @@ LEAD: <species>"""
 
         # Ice moves — 10% freeze chance, freeze is permanent in Gen 1
         # Special case: these are damaging moves with a status side-effect
+        # Only flag for LLM when Ice is super-effective against the opponent,
+        # otherwise Body Slam para chance (30%) is almost always better than
+        # Blizzard freeze chance (10%) and doesn't need LLM deliberation.
         opp_is_ice = 'ice' in opp_types
+        ice_is_se = type_effectiveness('ice', opp_types) >= 2
         has_freeze_move = any(
             m.type and m.type.name.lower() == 'ice' and m.base_power > 0
             for m in real_moves
         )
-        freeze_relevant = has_freeze_move and opp_can_receive_status and not opp_is_ice
+        freeze_relevant = (has_freeze_move and opp_can_receive_status
+                           and not opp_is_ice and ice_is_se)
 
         # Check each status category
         for status_info in STATUS_INFLICTORS:
@@ -1225,6 +1311,23 @@ LEAD: <species>"""
                 print(f"  ⚔️  PYTHON: neutral matchup, attacking with {best_move.id}")
                 self._python_call_count += 1
                 return self.create_order(best_move)
+
+        # ------------------------------------------------------------------
+        # STEP 8b — Single viable attack fast-path
+        # If after all filtering we only have one damaging move and no
+        # useful status options, skip the LLM — the answer is obvious.
+        # ------------------------------------------------------------------
+        damaging_moves = [m for m in real_moves
+                          if m.base_power > 0 or m.id in FIXED_DAMAGE_MOVES]
+        status_useful = [m for m in real_moves
+                         if m.base_power == 0
+                         and m.id not in FIXED_DAMAGE_MOVES
+                         and m.id not in ('recover', 'softboiled', 'rest')]
+        if len(damaging_moves) == 1 and not status_useful:
+            only_move = damaging_moves[0]
+            print(f"  ⚔️  PYTHON: only viable attack → {only_move.id}")
+            self._python_call_count += 1
+            return self.create_order(only_move)
 
         reason_str = '; '.join(reasons)
         print(f"\n  🤖 LLM CALLED (call #{self._llm_call_count + 1}): {reason_str}")
