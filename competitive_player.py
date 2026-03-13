@@ -556,6 +556,72 @@ LEAD: <species>"""
             self._python_call_count += 1
             return self.create_order(all_moves[0])
 
+        # ------------------------------------------------------------------
+        # DETONATION GATE — Explosion / Self-Destruct eligibility
+        #
+        # These are the highest-damage moves in the game but cost your
+        # Pokémon's life. Strip them from the move list by default and
+        # only re-include them when detonation is competitively sound.
+        #
+        # Good times to detonate:
+        #   1. We're low HP (<30%) and would die to any hit anyway
+        #   2. The opponent is a high-value target we can KO or cripple
+        #      (NOT Chansey/Snorlax at high HP — they survive it)
+        #   3. We're the last Pokémon (nothing to lose)
+        #   4. The opponent is on their last Pokémon and we can end it
+        #
+        # Bad times to detonate:
+        #   - Turn 1-3 with a healthy team (trading early is terrible)
+        #   - Into Chansey/Snorlax above 40% (they survive, we don't)
+        #   - When we have 3+ healthy Pokémon and aren't in danger
+        #   - When paralysed (25% chance to waste the move entirely)
+        # ------------------------------------------------------------------
+        det_moves = [m for m in real_moves
+                     if m.id in ('explosion', 'selfdestruct')]
+        real_moves = [m for m in real_moves
+                      if m.id not in ('explosion', 'selfdestruct')]
+
+        if det_moves:
+            our_alive = sum(1 for p in battle.team.values() if not p.fainted)
+            opp_alive = sum(1 for p in battle.opponent_team.values()
+                           if not p.fainted)
+            we_are_paralysed = my_status_now and my_status_now.name == 'PAR'
+
+            # Targets that can survive Explosion due to massive bulk
+            bulk_walls = {'chansey', 'snorlax'}
+            target_is_wall = opp_species in bulk_walls and opp_hp_frac > 0.40
+
+            detonate_eligible = False
+
+            # Condition 1: We're about to die anyway (low HP)
+            if my_hp_frac < 0.30 and not we_are_paralysed:
+                if not target_is_wall:
+                    detonate_eligible = True
+
+            # Condition 2: We're the last Pokémon (nothing to preserve)
+            if our_alive == 1:
+                detonate_eligible = True
+
+            # Condition 3: Opponent is on their last Pokémon and we can
+            # potentially end the game (even into walls)
+            if opp_alive == 1:
+                detonate_eligible = True
+
+            # Condition 4: Late game (≤2 of our Pokémon left) and the
+            # trade is favourable (not into a wall)
+            if our_alive <= 2 and not target_is_wall and not we_are_paralysed:
+                detonate_eligible = True
+
+            # Hard block: never detonate in the first 3 turns with a
+            # full team — the information cost is too high
+            if battle.turn <= 3 and our_alive >= 5:
+                detonate_eligible = False
+
+            if detonate_eligible:
+                real_moves.extend(det_moves)
+                print(f"  💣 Detonation eligible: {[m.id for m in det_moves]} "
+                      f"included for LLM consideration")
+
         switches = battle.available_switches
         my_is_asleep = my_status_now and my_status_now.name == 'SLP'
 
@@ -792,7 +858,13 @@ LEAD: <species>"""
             # Track which opponent we've already evaluated against
             last_eval = getattr(self, '_matchup_evaluated_vs', None)
 
-            if opp_species != last_eval:
+            # Turn 1 lead preservation: Tauros is the best lead in Gen 1 OU.
+            # It threatens everything with Body Slam paralysis + raw power.
+            # Switching out on Turn 1 gives the opponent free initiative.
+            if battle.turn == 1 and my_species == 'tauros':
+                self._matchup_evaluated_vs = opp_species  # mark evaluated, skip
+
+            elif opp_species != last_eval:
                 self._matchup_evaluated_vs = opp_species
 
                 my_move_ids = [m.id for m in real_moves]
@@ -981,6 +1053,36 @@ LEAD: <species>"""
                 return self.create_order(dreameater)
 
         # ------------------------------------------------------------------
+        # STEP 7d — Sleep move fast-path: if we have a sleep move, the
+        # opponent has no status, and Sleep Clause is not active, just use it.
+        # The LLM picks sleeppowder 100% of the time in this situation —
+        # no need to burn 25s on an LLM call for a deterministic answer.
+        # ------------------------------------------------------------------
+        if not self._sleep_clause_active and not opp_status_now and not _opp_has_sub_early:
+            sleep_move = next(
+                (m for m in real_moves if m.id in SLEEP_MOVES), None
+            )
+            if sleep_move:
+                print(f"  😴 PYTHON: opponent has no status — using {sleep_move.id}")
+                self._python_call_count += 1
+                return self.create_order(sleep_move)
+
+        # ------------------------------------------------------------------
+        # STEP 7e — Opponent asleep + we only have attacking moves: just hit.
+        # No ambiguity — the opponent can't act, use our best damage move.
+        # Saves LLM calls + eliminates timeout risk on free turns.
+        # ------------------------------------------------------------------
+        if opp_is_asleep and best_move:
+            has_useful_status = any(
+                m.id in ('thunderwave', 'stunspore', 'toxic', 'confuseray')
+                for m in real_moves
+            )
+            if not has_useful_status:
+                print(f"  💤 PYTHON: opponent asleep, attacking with {best_move.id}")
+                self._python_call_count += 1
+                return self.create_order(best_move)
+
+        # ------------------------------------------------------------------
         # STEP 8 — AMBIGUOUS: call LLM
         # ------------------------------------------------------------------
         current_best_eff = 1.0
@@ -1094,6 +1196,23 @@ LEAD: <species>"""
 
         if not reasons:
             if best_move and best_move.id == 'hyperbeam':
+                # Rest-awareness: don't Hyper Beam if opponent carries Rest
+                # and isn't their last Pokémon (they'll heal to full + free recharge turn)
+                opp_names = self._opponent_move_names.get(opp_poke.species, [])
+                opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+                if 'rest' in opp_names and opp_alive > 1:
+                    alt = next(
+                        (m for m in real_moves
+                         if m.id not in ('hyperbeam', 'struggle', 'recharge')
+                         and m.id not in LLM_ONLY_MOVES
+                         and (m.base_power or 0) > 0),
+                        None
+                    )
+                    if alt:
+                        print(f"  🧠 PYTHON: opponent has Rest — using {alt.id} "
+                              f"instead of Hyper Beam (avoids recharge loop)")
+                        self._python_call_count += 1
+                        return self.create_order(alt)
                 reasons.append("considering Hyper Beam — need to weigh recharge risk vs KO")
             else:
                 print(f"  ⚔️  PYTHON: neutral matchup, attacking with {best_move.id}")

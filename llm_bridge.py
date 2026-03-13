@@ -206,8 +206,14 @@ def parse_battle_decision(raw, valid_move_ids, valid_switch_ids):
         if candidate in norm_switch_set:
             return 'switch', norm_switch_set[candidate]
 
-    # Try "Answer: [use/move] X"
-    answer = re.search(r'Answer:\s*(?:Use\s+)?(?:move\s+)?(\w+)', raw, re.IGNORECASE)
+    # Try "Answer:" or "Final Answer:" patterns — move/switch may be on same
+    # line or next line, possibly in **bold** markdown
+    # Strip markdown bold first for easier matching
+    clean_raw = re.sub(r'\*\*', '', raw)
+    answer = re.search(
+        r'(?:Final\s+)?Answer:\s*(?:Use\s+|Switch\s+(?:to\s+)?)?(\w+)',
+        clean_raw, re.IGNORECASE
+    )
     if answer:
         candidate = norm(answer.group(1))
         if candidate in norm_move_set:

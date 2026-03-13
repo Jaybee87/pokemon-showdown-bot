@@ -651,6 +651,12 @@ def find_best_matchup_switch(our_active_species, our_active_moves,
         if sw_status_str in ('SLP', 'FRZ'):
             continue
 
+        # PATCH: Skip critically low HP Pokémon — switching them in just
+        # feeds the opponent a free KO, or triggers an immediate danger
+        # switch right back out (matchup→danger→matchup loop).
+        if sw_hp < 0.15:
+            continue
+
         # Estimate switch-in's moves from their known moveset
         sw_moves = [m.id for m in sw.moves.values()] if sw.moves else []
 
