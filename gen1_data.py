@@ -1,12 +1,32 @@
 """
 gen1_data.py
 ============
-Single source of truth for all Gen 1 Pokémon and move data.
+Single source of truth for all Gen 1 data and calculations that operate
+purely on species names, move IDs, and type strings — no poke-env objects.
 
-Replaces the split STATS / POKEMON_TYPES tables in gen1_calc.py and
-the scattered move dicts across gen1_calc.py / gen1_engine.py.
+Layer contract
+--------------
+This file MUST NOT import from poke-env or gen1_engine.
+gen1_engine.py imports from here; the dependency arrow is one-way.
 
-gen1_calc.py can now be archived once callers are updated to import from here.
+Sections
+--------
+1. Pokémon table  — base stats + types for all 151 species
+2. Move table     — BP, type, hit counts for all Gen 1 moves
+3. Move category sets — FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, etc.
+4. Type system    — TYPES list, TYPE_CHART, type_effectiveness()
+5. Defensive analysis — get_weaknesses/strengths/immunities/resistances
+6. Pokémon accessors — get_stats(), get_types()
+7. Move accessors  — get_move(), get_move_category(), get_move_type(),
+                     is_damaging(), average_hits()
+8. Runtime move-type cache — register_move_type() for live battle data
+9. Stat-stage math — apply_stage()
+10. Damage calculator — calc_damage(), calc_damage_pct()
+11. KO checks     — can_ko(), find_ko_move(), can_2hko()
+12. Speed         — get_speed(), outspeeds()
+13. Freeze / Substitute helpers — freeze_chance_value(),
+                                  get_substitute_hp(), can_break_substitute()
+14. Matchup evaluator — evaluate_matchup()
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 POKEMON TABLE
@@ -258,6 +278,99 @@ def get_types(species: str):
 
 
 # =============================================================================
+# TYPE SYSTEM
+# No Dark, Steel, or Fairy in Gen 1 — 15 types total.
+# Ghost → Psychic = 0x (RBY bug: Ghost has NO effect on Psychic).
+# Poison is super-effective against Bug (and vice versa).
+# =============================================================================
+
+TYPES = [
+    'normal', 'fire', 'water', 'electric', 'grass', 'ice', 'fighting',
+    'poison', 'ground', 'flying', 'psychic', 'bug', 'rock', 'ghost', 'dragon'
+]
+
+# type_chart[attacking_type][defending_type] = multiplier
+TYPE_CHART = {
+    #              nor  fir  wat  ele  gra  ice  fig  poi  gro  fly  psy  bug  roc  gho  dra
+    'normal':   {'normal':1,'fire':1,'water':1,'electric':1,'grass':1,'ice':1,'fighting':1,'poison':1,'ground':1,'flying':1,'psychic':1,'bug':1,'rock':0.5,'ghost':0,'dragon':1},
+    'fire':     {'normal':1,'fire':0.5,'water':0.5,'electric':1,'grass':2,'ice':2,'fighting':1,'poison':1,'ground':1,'flying':1,'psychic':1,'bug':2,'rock':0.5,'ghost':1,'dragon':0.5},
+    'water':    {'normal':1,'fire':2,'water':0.5,'electric':1,'grass':0.5,'ice':1,'fighting':1,'poison':1,'ground':2,'flying':1,'psychic':1,'bug':1,'rock':2,'ghost':1,'dragon':0.5},
+    'electric': {'normal':1,'fire':1,'water':2,'electric':0.5,'grass':0.5,'ice':1,'fighting':1,'poison':1,'ground':0,'flying':2,'psychic':1,'bug':1,'rock':1,'ghost':1,'dragon':0.5},
+    'grass':    {'normal':1,'fire':0.5,'water':2,'electric':1,'grass':0.5,'ice':1,'fighting':1,'poison':0.5,'ground':2,'flying':0.5,'psychic':1,'bug':0.5,'rock':2,'ghost':1,'dragon':0.5},
+    'ice':      {'normal':1,'fire':1,'water':0.5,'electric':1,'grass':2,'ice':0.5,'fighting':1,'poison':1,'ground':2,'flying':2,'psychic':1,'bug':1,'rock':1,'ghost':1,'dragon':2},
+    'fighting': {'normal':2,'fire':1,'water':1,'electric':1,'grass':1,'ice':2,'fighting':1,'poison':0.5,'ground':1,'flying':0.5,'psychic':0.5,'bug':0.5,'rock':2,'ghost':0,'dragon':1},
+    'poison':   {'normal':1,'fire':1,'water':1,'electric':1,'grass':2,'ice':1,'fighting':1,'poison':0.5,'ground':0.5,'flying':1,'psychic':1,'bug':2,'rock':0.5,'ghost':0.5,'dragon':1},
+    'ground':   {'normal':1,'fire':2,'water':1,'electric':2,'grass':0.5,'ice':1,'fighting':1,'poison':2,'ground':1,'flying':0,'psychic':1,'bug':0.5,'rock':2,'ghost':1,'dragon':1},
+    'flying':   {'normal':1,'fire':1,'water':1,'electric':0.5,'grass':2,'ice':1,'fighting':2,'poison':1,'ground':1,'flying':1,'psychic':1,'bug':2,'rock':0.5,'ghost':1,'dragon':1},
+    'psychic':  {'normal':1,'fire':1,'water':1,'electric':1,'grass':1,'ice':1,'fighting':2,'poison':2,'ground':1,'flying':1,'psychic':0.5,'bug':1,'rock':1,'ghost':1,'dragon':1},
+    'bug':      {'normal':1,'fire':0.5,'water':1,'electric':1,'grass':2,'ice':1,'fighting':0.5,'poison':2,'ground':1,'flying':0.5,'psychic':2,'bug':1,'rock':1,'ghost':0.5,'dragon':1},
+    'rock':     {'normal':1,'fire':2,'water':1,'electric':1,'grass':1,'ice':2,'fighting':0.5,'poison':1,'ground':0.5,'flying':2,'psychic':1,'bug':2,'rock':1,'ghost':1,'dragon':1},
+    'ghost':    {'normal':0,'fire':1,'water':1,'electric':1,'grass':1,'ice':1,'fighting':0,'poison':1,'ground':1,'flying':1,'psychic':0,'bug':1,'rock':1,'ghost':2,'dragon':1},
+    'dragon':   {'normal':1,'fire':1,'water':1,'electric':1,'grass':1,'ice':1,'fighting':1,'poison':1,'ground':1,'flying':1,'psychic':1,'bug':1,'rock':1,'ghost':1,'dragon':2},
+}
+
+
+def type_effectiveness(move_type: str, defender_types: list) -> float:
+    """
+    Combined type effectiveness multiplier for a move against a defender.
+
+    Args:
+        move_type:      e.g. 'fire'
+        defender_types: 1–2 type strings, e.g. ['water', 'ice']
+
+    Returns float: 0, 0.25, 0.5, 1, 2, or 4
+    """
+    chart = TYPE_CHART.get(move_type.lower(), {})
+    mult = 1.0
+    for t in defender_types:
+        if t:
+            mult *= chart.get(t.lower(), 1.0)
+    return mult
+
+
+# =============================================================================
+# DEFENSIVE ANALYSIS
+# All functions operate on type strings — no poke-env objects.
+# Used by team_generator and matchup evaluator.
+# =============================================================================
+
+def get_weaknesses(type1: str, type2: str = None) -> list:
+    """15-element defensive multiplier array for a type combination."""
+    w1 = [TYPE_CHART[atk][type1] for atk in TYPES]
+    if type2:
+        w2 = [TYPE_CHART[atk][type2] for atk in TYPES]
+        return [a * b for a, b in zip(w1, w2)]
+    return w1
+
+
+def get_strengths(type1: str, type2: str = None) -> list:
+    """15-element offensive matchup array — best multiplier either type gets."""
+    e1 = [TYPE_CHART[type1][d] for d in TYPES]
+    if type2:
+        e2 = [TYPE_CHART[type2][d] for d in TYPES]
+        return [max(m1, m2) for m1, m2 in zip(e1, e2)]
+    return e1
+
+
+def get_weaknesses_summary(type1: str, type2: str = None) -> dict:
+    """Dict of attacking types that deal super-effective damage to this combination."""
+    w = get_weaknesses(type1, type2)
+    return {TYPES[i]: w[i] for i in range(len(TYPES)) if w[i] > 1}
+
+
+def get_immunities(type1: str, type2: str = None) -> list:
+    """List of attacking types this combination is immune to."""
+    w = get_weaknesses(type1, type2)
+    return [TYPES[i] for i in range(len(TYPES)) if w[i] == 0]
+
+
+def get_resistances(type1: str, type2: str = None) -> list:
+    """List of attacking types this combination resists."""
+    w = get_weaknesses(type1, type2)
+    return [TYPES[i] for i in range(len(TYPES)) if 0 < w[i] < 1]
+
+
+# =============================================================================
 # MOVE TABLE
 #
 # Format: 'move_id': (BP, type, (min_hits, max_hits))
@@ -274,74 +387,87 @@ def get_types(species: str):
 # Thrash/Petal Dance lock the user for 2-3 turns; also stored as (1,1).
 # =============================================================================
 
-MOVES = {
+MOVES = { # https://pokemondb.net/move/generation/1
     # ── Normal (physical) ────────────────────────────────────────────────────
-    'tackle':        (35,  'normal',   (1, 1)),
-    'scratch':       (40,  'normal',   (1, 1)),
+    'barrage':       (15,  'normal',   (2, 5)),   # Hits 2-5 times in one turn.
+    'bide':          (0,   'normal',   (1, 1)),   # User takes damage for two turns then strikes back double.
+    'bind':          (15,  'normal',   (1, 1)),   # Traps opponent, damaging them for 4-5 turns.
+    'bodyslam':      (85,  'normal',   (1, 1)),   # May paralyze opponent.
+    'cometpunch':    (18,  'normal',   (2, 5)),   # Hits 2-5 times in one turn.
+    'constrict':     (10,  'normal',   (1, 1)),   # May lower opponent's Speed by one stage.
+    'conversion':    (0,   'normal',   (1, 1)),   # Changes user's type to that of its first move.
     'cut':           (50,  'normal',   (1, 1)),
-    'pound':         (40,  'normal',   (1, 1)),
-    'headbutt':      (70,  'normal',   (1, 1)),
-    'strength':      (80,  'normal',   (1, 1)),
-    'bodyslam':      (85,  'normal',   (1, 1)),
-    'doubleedge':    (100, 'normal',   (1, 1)),
-    'hyperbeam':     (150, 'normal',   (1, 1)),
-    'megapunch':     (80,  'normal',   (1, 1)),
-    'megakick':      (120, 'normal',   (1, 1)),
-    'slash':         (70,  'normal',   (1, 1)),
-    'stomp':         (65,  'normal',   (1, 1)),
-    'hornattack':    (65,  'normal',   (1, 1)),
-    'furyattack':    (15,  'normal',   (2, 5)),   # multi-hit
-    'cometpunch':    (18,  'normal',   (2, 5)),   # multi-hit
-    'doubleslap':    (15,  'normal',   (2, 5)),   # multi-hit
-    'spikecannon':   (20,  'normal',   (2, 5)),   # multi-hit
-    'furyswipes':    (18,  'normal',   (2, 5)),   # multi-hit
-    'wrap':          (15,  'normal',   (1, 1)),   # trapping; single hit per turn
-    'bind':          (15,  'normal',   (1, 1)),   # trapping; single hit per turn
-    'rage':          (20,  'normal',   (1, 1)),
-    'swift':         (60,  'normal',   (1, 1)),
-    'bide':          (0,   'normal',   (1, 1)),   # returns 2x damage taken; BP=0, not status
-    'explosion':     (170, 'normal',   (1, 1)),   # raw .asm BP; engine halves target Def
-    'selfdestruct':  (130, 'normal',   (1, 1)),   # raw .asm BP; engine halves target Def
-    'takedown':      (90,  'normal',   (1, 1)),
-    'thrash':        (90,  'normal',   (1, 1)),   # locks 2-3 turns; single hit per turn
-    'skullbash':     (100, 'normal',   (1, 1)),   # charges then hits
+    'defensecurl':   (0,   'normal',   (1, 1)),   # Raises user's Defense.
+    'disable':       (0,   'normal',   (1, 1)),   # Opponent can't use its last attack for a few turns.
+    'dizzypunch':    (70,  'normal',   (1, 1)),   # May confuse opponent.
+    'doubleslap':    (15,  'normal',   (2, 5)),   # Hits 2-5 times in one turn.
+    'doubleteam':    (0,   'normal',   (1, 1)),   # Raises user's Evasiveness.
+    'doubleedge':    (100, 'normal',   (1, 1)),   # User receives recoil damage.
     'eggbomb':       (100, 'normal',   (1, 1)),
-    'quickattack':   (40,  'normal',   (1, 1)),
-    'triattack':     (80,  'normal',   (1, 1)),
-    'superfang':     (1,   'normal',   (1, 1)),   # halves target HP; fixed-style, engine handles
-    'softboiled':    (0,   'normal',   (1, 1)),
-    'recover':       (0,   'normal',   (1, 1)),
-    'substitute':    (0,   'normal',   (1, 1)),
-    'swordsdance':   (0,   'normal',   (1, 1)),
-    'growl':         (0,   'normal',   (1, 1)),
-    'tailwhip':      (0,   'normal',   (1, 1)),
-    'disable':       (0,   'normal',   (1, 1)),
-    'mimic':         (0,   'normal',   (1, 1)),
-    'screech':       (0,   'normal',   (1, 1)),
-    'leer':          (0,   'normal',   (1, 1)),
-    'sharpen':       (0,   'normal',   (1, 1)),
-    'conversion':    (0,   'normal',   (1, 1)),
-    'harden':        (0,   'normal',   (1, 1)),
-    'minimize':      (0,   'normal',   (1, 1)),
-    'metronome':     (0,   'normal',   (1, 1)),
-    'supersonic':    (0,   'normal',   (1, 1)),
-    'glare':         (0,   'normal',   (1, 1)),
-    'lovelykiss':    (0,   'normal',   (1, 1)),
-    'sing':          (0,   'normal',   (1, 1)),
-    'splash':        (0,   'normal',   (1, 1)),
-    'transform':     (0,   'normal',   (1, 1)),
-    'whirlwind':     (0,   'normal',   (1, 1)),
-    'smokescreen':   (0,   'normal',   (1, 1)),
-    'sandattack':    (0,   'normal',   (1, 1)),   # Normal type in Gen 1 (not Ground)
-    'focusenergy':   (0,   'normal',   (1, 1)),   # Normal type in Gen 1 (not Fighting)
-    'doubleteam':    (0,   'normal',   (1, 1)),
-    'defensecurl':   (0,   'normal',   (1, 1)),
-    'flash':         (0,   'normal',   (1, 1)),
-    'sonicboom':     (1,   'normal',   (1, 1)),   # fixed 20 damage; see FIXED_DAMAGE_MOVES
-    'guillotine':    (1,   'normal',   (1, 1)),   # OHKO; see OHKO_MOVES
-    'horndrill':     (1,   'normal',   (1, 1)),   # OHKO; see OHKO_MOVES
-    'razorwind':     (80,  'normal',   (1, 1)),   # charges then hits
-    'struggle':      (50,  'normal',   (1, 1)),   # recoil; used when no PP
+    'explosion':     (170, 'normal',   (1, 1)),   # User faints.
+    'flash':         (0,   'normal',   (1, 1)),   # Lowers opponent's Accuracy.
+    'focusenergy':   (0,   'normal',   (1, 1)),   # Increases critical hit ratio.
+    'furyswipes':    (18,  'normal',   (2, 5)),   # Hits 2-5 times in one turn.
+    'furyattack':    (15,  'normal',   (2, 5)),   # Hits 2-5 times in one turn.
+    'glare':         (0,   'normal',   (1, 1)),   # Paralyzes opponent.
+    'growl':         (0,   'normal',   (1, 1)),   # Lowers opponent's Attack.
+    'growth':        (0,   'normal',   (1, 1)),   # Raises user's Attack and Special Attack.
+    'guillotine':    (1,   'normal',   (1, 1)),   # One-Hit-KO, if it hits.
+    'gust':          (40,  'normal',   (1, 1)),   # Hits Pokémon using Fly/Bounce/Sky Drop with double power.
+    'harden':        (0,   'normal',   (1, 1)),   # Raises user's Defense.
+    'headbutt':      (70,  'normal',   (1, 1)),   # May cause flinching.
+    'hornattack':    (65,  'normal',   (1, 1)),
+    'horndrill':     (1,   'normal',   (1, 1)),   # One-Hit-KO, if it hits.
+    'hyperbeam':     (150, 'normal',   (1, 1)),   # User must recharge next turn.
+    'hyperfang':     (80,  'normal',   (1, 1)),   # May cause flinching.
+    'leer':          (0,   'normal',   (1, 1)),   # Lowers opponent's Defense.
+    'lovelykiss':    (0,   'normal',   (1, 1)),   # Puts opponent to sleep.
+    'megakick':      (120, 'normal',   (1, 1)),
+    'megapunch':     (80,  'normal',   (1, 1)),
+    'metronome':     (0,   'normal',   (1, 1)),   # User performs almost any move in the game at random.
+    'mimic':         (0,   'normal',   (1, 1)),   # Copies the opponent's last move.
+    'minimize':      (0,   'normal',   (1, 1)),   # Sharply raises user's Evasiveness.
+    'payday':        (40,  'normal',   (1, 1)),   # Money is earned after the battle.
+    'pound':         (40,  'normal',   (1, 1)),
+    'quickattack':   (40,  'normal',   (1, 1)),   # User attacks first.
+    'rage':          (20,  'normal',   (1, 1)),   # Raises user's Attack when hit.
+    'razorwind':     (80,  'normal',   (1, 1)),   # Charges on first turn, attacks on second. High critical hit ratio.
+    'recover':       (0,   'normal',   (1, 1)),   # User recovers half its max HP.
+    'roar':          (0,   'normal',   (1, 1)),   # In battles, the opponent switches. In the wild, the Pokémon runs.
+    'sandattack':    (0,   'normal',   (1, 1)),   # Lowers opponent's Accuracy.
+    'scratch':       (40,  'normal',   (1, 1)),
+    'screech':       (0,   'normal',   (1, 1)),   # Sharply lowers opponent's Defense.
+    'selfdestruct':  (130, 'normal',   (1, 1)),   # User faints.
+    'sharpen':       (0,   'normal',   (1, 1)),   # Raises user's Attack.
+    'sing':          (0,   'normal',   (1, 1)),   # Puts opponent to sleep.
+    'skullbash':     (100, 'normal',   (1, 1)),   # Raises Defense on first turn, attacks on second.
+    'slam':          (80,  'normal',   (1, 1)),
+    'slash':         (70,  'normal',   (1, 1)),   # High critical hit ratio.
+    'smokescreen':   (0,   'normal',   (1, 1)),   # Lowers opponent's Accuracy.
+    'softboiled':    (0,   'normal',   (1, 1)),   # User recovers half its max HP.
+    'sonicboom':     (1,   'normal',   (1, 1)),   # Always inflicts 20 HP.
+    'spikecannon':   (20,  'normal',   (2, 5)),   # Hits 2-5 times in one turn.
+    'splash':        (0,   'normal',   (1, 1)),   # Doesn't do ANYTHING.
+    'stomp':         (65,  'normal',   (1, 1)),   # May cause flinching.
+    'strength':      (80,  'normal',   (1, 1)),
+    'struggle':      (50,  'normal',   (1, 1)),   # Only usable when all PP are gone. Hurts the user.
+    'substitute':    (0,   'normal',   (1, 1)),   # Uses HP to creates a decoy that takes hits.
+    'superfang':     (1,   'normal',   (1, 1)),   # Always takes off half of the opponent's HP.
+    'supersonic':    (0,   'normal',   (1, 1)),   # Confuses opponent.
+    'swift':         (60,  'normal',   (1, 1)),   # Ignores Accuracy and Evasiveness.
+    'swordsdance':   (0,   'normal',   (1, 1)),   # Sharply raises user's Attack.
+    'tackle':        (35,  'normal',   (1, 1)),
+    'tailwhip':      (0,   'normal',   (1, 1)),   # Lowers opponent's Defense.
+    'takedown':      (90,  'normal',   (1, 1)),   # User receives recoil damage.
+    'thrash':        (90,  'normal',   (1, 1)),   # User attacks for 2-3 turns but then becomes confused.
+    'transform':     (0,   'normal',   (1, 1)),   # User takes on the form and attacks of the opponent.
+    'triattack':     (80,  'normal',   (1, 1)),   # May paralyze, burn or freeze opponent.
+    'visegrip':      (55,  'normal',   (1, 1)),
+    'whirlwind':     (0,   'normal',   (1, 1)),   # In battles, the opponent switches. In the wild, the Pokémon runs.
+    'wrap':          (15,  'normal',   (1, 1)),   # Traps opponent, damaging them for 4-5 turns.
+    
+    # ── Normal (physical) — protocol / engine-only ───────────────────────────
+    'recharge':      (0,   'normal',   (1, 1)),   # forced recharge turn (Hyper Beam)
 
     # ── Fire (special) ───────────────────────────────────────────────────────
     'ember':         (40,  'fire',     (1, 1)),
@@ -369,17 +495,16 @@ MOVES = {
     'thunderpunch':  (75,  'electric', (1, 1)),
 
     # ── Grass (special) ──────────────────────────────────────────────────────
-    'vinewhip':      (35,  'grass',    (1, 1)),
-    'razorleaf':     (55,  'grass',    (1, 1)),
-    'solarbeam':     (120, 'grass',    (1, 1)),   # charges then hits
-    'megadrain':     (40,  'grass',    (1, 1)),
     'absorb':        (20,  'grass',    (1, 1)),
-    'petaldance':    (70,  'grass',    (1, 1)),   # locks 2-3 turns; Grass type (not Normal)
-    'sleeppowder':   (0,   'grass',    (1, 1)),
-    'stunspore':     (0,   'grass',    (1, 1)),
     'leechseed':     (0,   'grass',    (1, 1)),
+    'megadrain':     (40,  'grass',    (1, 1)),
+    'petaldance':    (70,  'grass',    (1, 1)),   # locks 2-3 turns; Grass type (not Normal)
+    'razorleaf':     (55,  'grass',    (1, 1)),
+    'sleeppowder':   (0,   'grass',    (1, 1)),
+    'solarbeam':     (120, 'grass',    (1, 1)),   # charges then hits
     'spore':         (0,   'grass',    (1, 1)),
-    'growth':        (0,   'grass',    (1, 1)),
+    'stunspore':     (0,   'grass',    (1, 1)),    
+    'vinewhip':      (35,  'grass',    (1, 1)),
 
     # ── Ice (special) ────────────────────────────────────────────────────────
     'icebeam':       (95,  'ice',      (1, 1)),
@@ -411,13 +536,13 @@ MOVES = {
     'acidarmor':     (0,   'poison',   (1, 1)),
 
     # ── Ground (physical) ────────────────────────────────────────────────────
-    'earthquake':    (100, 'ground',   (1, 1)),
-    'fissure':       (1,   'ground',   (1, 1)),   # OHKO; see OHKO_MOVES
-    'dig':           (100, 'ground',   (1, 1)),   # charges then hits
-    'bonemerang':    (50,  'ground',   (2, 2)),   # always 2 hits
+    'boneclub':      (65,  'ground',   (1, 1)),   # May cause flinching.
+    'bonemerang':    (50,  'ground',   (2, 2)),   # Hits twice in one turn.
+    'dig':           (100, 'ground',   (1, 1)),   # Digs underground on first turn, attacks on second. Can also escape from caves.
+    'earthquake':    (100, 'ground',   (1, 1)),   # Power is doubled if opponent is underground from using Dig.
+    'fissure':       (1,   'ground',   (1, 1)),   # One-Hit-KO, if it hits.
 
     # ── Flying (physical) ────────────────────────────────────────────────────
-    'gust':          (40,  'flying',   (1, 1)),
     'wingattack':    (35,  'flying',   (1, 1)),
     'drillpeck':     (80,  'flying',   (1, 1)),
     'peck':          (35,  'flying',   (1, 1)),
@@ -460,10 +585,6 @@ MOVES = {
     # ── Dragon (special) ─────────────────────────────────────────────────────
     'dragonrage':    (1,   'dragon',   (1, 1)),   # fixed 40 damage; see FIXED_DAMAGE_MOVES
 
-    # ── Normal (physical) — protocol / engine-only ───────────────────────────
-    'barrage':       (15,  'normal',   (2, 5)),   # multi-hit
-    'payday':        (40,  'normal',   (1, 1)),
-    'recharge':      (0,   'normal',   (1, 1)),   # forced recharge turn (Hyper Beam)
 }
 
 
@@ -546,9 +667,35 @@ def get_move(move_id: str):
     return (bp, move_type, get_move_category(key), hits)
 
 
+
+# =============================================================================
+# RUNTIME MOVE-TYPE CACHE
+# Populated during battles from live poke-env Move objects so that moves not
+# in the static MOVES table (e.g. obscure event moves) can still be resolved.
+# gen1_engine.register_move_type / get_move_type delegate here — there is
+# exactly ONE cache and ONE get_move_type in the whole codebase.
+# =============================================================================
+
+_move_type_cache: dict[str, str] = {}
+
+
+def register_move_type(move_id: str, move_type: str) -> None:
+    """Cache a move's type seen from a live poke-env Move object."""
+    _move_type_cache[move_id.lower()] = move_type.lower()
+
+
 def get_move_type(move_id: str) -> str | None:
-    """Return just the type string for a move, or None."""
+    """
+    Return the type string for a move, or None if unknown.
+
+    Resolution order:
+      1. Runtime cache (populated from live battle data via register_move_type)
+      2. Static MOVES table in this file
+    """
     key = move_id.lower().replace(' ', '').replace('-', '')
+    cached = _move_type_cache.get(key)
+    if cached:
+        return cached
     m = MOVES.get(key)
     return m[1] if m else None
 
@@ -574,22 +721,409 @@ def average_hits(move_id: str) -> float:
 
 
 # =============================================================================
+# STAT STAGE MULTIPLIERS
+# Gen 1 formula: multiplier = max(2, 2+s) / max(2, 2-s)
+# =============================================================================
+
+_STAGE_MULT = {
+    -6: (2, 8), -5: (2, 7), -4: (2, 6), -3: (2, 5),
+    -2: (2, 4), -1: (2, 3),  0: (2, 2),  1: (3, 2),
+     2: (4, 2),  3: (5, 2),  4: (6, 2),  5: (7, 2),
+     6: (8, 2),
+}
+
+
+def apply_stage(stat: int, stage: int) -> int:
+    """Apply a stat-stage modifier; result capped at 999 in Gen 1."""
+    stage = max(-6, min(6, stage))
+    num, den = _STAGE_MULT[stage]
+    return min(999, max(1, stat * num // den))
+
+
+# =============================================================================
+# DAMAGE CALCULATOR
+# All inputs are species-name strings and move IDs.
+# Standard assumptions: Level 100, 15 DVs, max Stat EXP.
+# =============================================================================
+
+def calc_damage(attacker: str, move_id: str, defender: str,
+                crit: bool = False,
+                atk_boosts: dict = None, def_boosts: dict = None,
+                reflect: bool = False, light_screen: bool = False,
+                attacker_burned: bool = False) -> tuple:
+    """
+    Damage range for a specific attack at L100, 15 DVs, max Stat EXP.
+
+    Args:
+        attacker, defender: species name strings (e.g. 'tauros')
+        move_id:            move ID (e.g. 'bodyslam')
+        crit:               critical hit — ignores stat stages in Gen 1
+        atk_boosts:         attacker's stat boost dict
+        def_boosts:         defender's stat boost dict
+        reflect:            Reflect active on defender's side
+        light_screen:       Light Screen active on defender's side
+        attacker_burned:    attacker burned (halves physical Attack)
+
+    Returns:
+        (min_damage, max_damage) — (0, 0) for immune/status, (100, 100) for fixed.
+    """
+    move = get_move(move_id)
+    if move is None:
+        return (0, 0)
+
+    bp, move_type, category, _hits = move
+    atk_boosts = atk_boosts or {}
+    def_boosts = def_boosts or {}
+
+    if category == 'status':
+        return (0, 0)
+
+    # Fixed-damage moves (Seismic Toss, Night Shade, etc.)
+    if category in ('fixed', 'ohko') or move_id in FIXED_DAMAGE_MOVES:
+        def_types = get_types(defender)
+        return (0, 0) if type_effectiveness(move_type, def_types) == 0 else (100, 100)
+
+    atk_stats = get_stats(attacker)
+    def_stats = get_stats(defender)
+    if not atk_stats or not def_stats:
+        return (0, 0)
+
+    atk_types = get_types(attacker)
+    def_types = get_types(defender)
+
+    # Physical/Special split is TYPE-based in Gen 1
+    is_special = move_type in SPECIAL_TYPES
+    if is_special:
+        attack  = atk_stats[3]   # Special (offense)
+        defense = def_stats[3]   # Special (defense)
+        atk_stage = atk_boosts.get('spc', atk_boosts.get('spa', 0))
+        def_stage = def_boosts.get('spc', def_boosts.get('spd', 0))
+    else:
+        attack  = atk_stats[1]   # Attack
+        defense = def_stats[2]   # Defense
+        atk_stage = atk_boosts.get('atk', 0)
+        def_stage = def_boosts.get('def', 0)
+
+    # Crits ignore stat stages in Gen 1
+    if not crit:
+        attack  = apply_stage(attack,  atk_stage)
+        defense = apply_stage(defense, def_stage)
+
+    # Burn halves physical Attack (applied after stages)
+    if attacker_burned and not is_special:
+        attack = max(1, attack // 2)
+
+    # Explosion/Self-Destruct halve target's Defense in Gen 1
+    if move_id in ('explosion', 'selfdestruct'):
+        defense = max(1, defense // 2)
+
+    # Screens double the relevant defense (crits ignore screens)
+    if not crit:
+        if not is_special and reflect:
+            defense = min(999, defense * 2)
+        elif is_special and light_screen:
+            defense = min(999, defense * 2)
+
+    eff = type_effectiveness(move_type, def_types)
+    if eff == 0:
+        return (0, 0)
+
+    stab = 1.5 if move_type in atk_types else 1.0
+
+    # Gen 1 damage formula: ((2*Level/5 + 2) * Power * Atk / Def) / 50 + 2
+    base = ((2 * 100 / 5 + 2) * bp * attack / defense) / 50 + 2
+    base = int(base * stab)
+    base = int(base * eff)
+
+    # Random factor: 217/255 – 255/255
+    min_dmg = max(1, int(base * 217 / 255))
+    max_dmg = base
+
+    return (min_dmg, max_dmg)
+
+
+def calc_damage_pct(attacker: str, move_id: str, defender: str, **kwargs) -> tuple:
+    """Damage as a fraction of defender's max HP. Returns (min_pct, max_pct)."""
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+    def_stats = get_stats(defender)
+    if not def_stats:
+        return (0.0, 0.0)
+    return (lo / def_stats[0], hi / def_stats[0])
+
+
+# =============================================================================
+# KO CHECKS
+# =============================================================================
+
+def can_ko(attacker: str, move_id: str, defender: str,
+           hp_pct: float = 1.0, use_avg: bool = True, **kwargs) -> bool:
+    """
+    Can this move KO the defender at the given HP fraction?
+
+    Args:
+        hp_pct:  defender's current HP as 0.0–1.0
+        use_avg: True → use average roll; False → minimum (guaranteed KO only)
+    """
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+    def_stats = get_stats(defender)
+    if not def_stats:
+        return False
+    current_hp = int(def_stats[0] * hp_pct)
+    return ((lo + hi) // 2 >= current_hp) if use_avg else (lo >= current_hp)
+
+
+def find_ko_move(attacker: str, moves: list, defender: str,
+                 hp_pct: float = 1.0, **kwargs) -> tuple:
+    """
+    From a list of move IDs, find the best one that KOs the defender.
+    Prefers guaranteed KOs (min roll) over average KOs.
+
+    Returns (move_id, guaranteed) or (None, False).
+    """
+    best_guaranteed = None
+    best_avg = None
+
+    for move_id in moves:
+        lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+        def_stats = get_stats(defender)
+        if not def_stats:
+            continue
+        current_hp = int(def_stats[0] * hp_pct)
+
+        if lo >= current_hp:
+            if best_guaranteed is None or lo > best_guaranteed[1]:
+                best_guaranteed = (move_id, lo)
+        elif (lo + hi) // 2 >= current_hp:
+            if best_avg is None or (lo + hi) > best_avg[1]:
+                best_avg = (move_id, lo + hi)
+
+    if best_guaranteed:
+        return (best_guaranteed[0], True)
+    if best_avg:
+        return (best_avg[0], False)
+    return (None, False)
+
+
+def can_2hko(attacker: str, move_id: str, defender: str, hp_pct: float = 1.0) -> bool:
+    """Can two hits KO the defender at current HP? Uses average roll."""
+    lo, hi = calc_damage(attacker, move_id, defender)
+    def_stats = get_stats(defender)
+    if not def_stats:
+        return False
+    return ((lo + hi) // 2) * 2 >= int(def_stats[0] * hp_pct)
+
+
+# =============================================================================
+# SPEED
+# In Gen 1 there is no Speed variance at max DVs/StatEXP — every species has
+# exactly one speed value (quartered by paralysis). get_speed() derives it
+# from the stats formula; outspeeds() is the only comparison needed.
+# =============================================================================
+
+def get_speed(species: str, paralyzed: bool = False) -> int:
+    """Calculated speed at L100/15DVs/maxStatEXP. Paralysis quarters it."""
+    stats = get_stats(species)
+    if not stats:
+        return 0
+    return stats[4] // 4 if paralyzed else stats[4]
+
+
+def outspeeds(species_a: str, species_b: str,
+              a_par: bool = False, b_par: bool = False) -> bool:
+    """
+    Does species_a outspeed species_b?
+    Speed ties are broken randomly in Gen 1 — returns False (conservative).
+    """
+    return get_speed(species_a, a_par) > get_speed(species_b, b_par)
+
+
+# =============================================================================
+# FREEZE CHANCE VALUE
+# All damaging Ice-type moves have a 10% freeze chance in Gen 1.
+# Freeze is essentially permanent — significant strategic value.
+# =============================================================================
+
+def freeze_chance_value(move_id: str, defender_species: str) -> int:
+    """
+    Bonus score (0–15) for freeze potential.
+    Returns 0 if the move can't freeze or the defender is already Ice-type.
+    """
+    if move_id not in FREEZE_MOVES:
+        return 0
+    if 'ice' in get_types(defender_species):
+        return 0
+    return 15  # 10% of a KO ≈ significant but not dominant
+
+
+# =============================================================================
+# SUBSTITUTE HELPERS
+# Sub HP = floor(max_hp / 4). Status moves fail against Subs.
+# =============================================================================
+
+def get_substitute_hp(species: str) -> int:
+    """HP of a Substitute for this species (floor(max_hp / 4))."""
+    stats = get_stats(species)
+    return stats[0] // 4 if stats else 0
+
+
+def can_break_substitute(attacker: str, move_id: str, defender: str, **kwargs) -> bool:
+    """Can this move break the defender's Substitute in one hit? Uses average roll."""
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+    sub_hp = get_substitute_hp(defender)
+    return sub_hp > 0 and (lo + hi) // 2 >= sub_hp
+
+
+# =============================================================================
+# MATCHUP EVALUATOR
+# Scores how well our_species matches up against opp_species.
+# All inputs are species strings and move-ID lists — no poke-env objects.
+# find_best_matchup_switch() lives in gen1_engine because it iterates
+# poke-env switch objects to read .species / .current_hp_fraction / .status.
+# =============================================================================
+
+def evaluate_matchup(our_species: str, opp_species: str,
+                     our_moves: list = None,
+                     our_hp_pct: float = 1.0, opp_hp_pct: float = 1.0,
+                     our_status: str = None, opp_status: str = None) -> float:
+    """
+    Score how well our_species matches up against opp_species.
+    Higher = better matchup. Negative = bad matchup (roughly –100 to +100).
+
+    Considers: offensive damage output, defensive typing, speed, HP, status.
+    """
+    if not get_stats(our_species) or not get_stats(opp_species):
+        return 0.0
+
+    our_types = get_types(our_species)
+    opp_types = get_types(opp_species)
+    score = 0.0
+
+    # 1. Offensive pressure — best average damage we can deal
+    if our_moves:
+        best_dmg_pct = 0.0
+        for move_id in our_moves:
+            m = get_move(move_id)
+            if m and m[2] != 'status':
+                lo, hi = calc_damage_pct(our_species, move_id, opp_species)
+                avg = (lo + hi) / 2
+                if avg > best_dmg_pct:
+                    best_dmg_pct = avg
+        score += best_dmg_pct * 200  # 50% damage/turn ≈ +100 points
+
+    # 2. Defensive typing vs opponent's STAB
+    worst_incoming = max(
+        (type_effectiveness(t, our_types) for t in opp_types),
+        default=1.0
+    )
+    if worst_incoming >= 2:
+        score -= 40
+    elif worst_incoming == 0:
+        score += 50
+    elif worst_incoming <= 0.5:
+        score += 30
+
+    # 3. Speed advantage
+    our_par = our_status == 'PAR'
+    opp_par = opp_status == 'PAR'
+    score += 10 if outspeeds(our_species, opp_species, a_par=our_par, b_par=opp_par) else -5
+
+    # 4. HP penalty
+    if our_hp_pct < 0.30:
+        score -= 30
+    elif our_hp_pct < 0.50:
+        score -= 10
+
+    # 5. Status penalties
+    if our_status == 'SLP':   score -= 40
+    elif our_status == 'FRZ': score -= 50
+    elif our_status == 'PAR': score -= 10
+
+    return score
+
+
+# =============================================================================
 # SELF-TEST
 # =============================================================================
 
 if __name__ == '__main__':
     print(f"Pokémon loaded: {len(POKEMON)}")
-    print("All 151 Pokémon present?", len(POKEMON) == 151)
+    print("All 151 present =", len(POKEMON) == 151)
+    print()
     print(f"Moves loaded:   {len(MOVES)}")
-    print()
-
-    # Spot-check a few Pokémon
-    for species in ['tauros', 'alakazam', 'exeggutor', 'chansey', 'starmie', 'snorlax']:
-        stats = get_stats(species)
-        types = get_types(species)
-        print(f"  {species:12s}: stats={stats}  types={types}")
-
-    print()
     
-    for move_id in ['flash', 'kinesis', 'sandattack', 'smokescreen']:
-            print(move_id, get_move_category(move_id), get_move(move_id), get_move_type(move_id), is_damaging(move_id), average_hits(move_id))
+    move_counts = {}
+    for move_id in MOVES:
+        m_type = get_move_type(move_id)
+        move_counts[m_type] = move_counts.get(m_type,0) + 1
+
+    expected_counts = {
+        'normal': 77,
+        'fire': 5,
+        'water': 9,
+        'electric': 5,
+        'grass': 10,
+        'ice': 6,
+        'fighting': 9,
+        'poison': 8,
+        'ground': 5,
+        'flying': 6,
+        'psychic': 15,
+        'bug': 4,
+        'rock': 2,
+        'ghost': 3,
+        'dragon': 1,
+        }
+
+    for m_type, target in expected_counts.items():
+        actual = move_counts.get(m_type, 0)
+    
+        if actual == target:
+            print(f"{m_type} correct")
+        else:
+            # Calculate the difference to show exactly how far off it is
+            diff = actual - target
+            print(f"{m_type} is off by {diff} (Got {actual}, expected {target})")
+
+
+    print()
+    # Pokémon accessors
+    for species in ['tauros', 'alakazam', 'chansey', 'starmie', 'snorlax']:
+        print(f"  {species:12s}: stats={get_stats(species)}  types={get_types(species)}")
+    print()
+
+    # Type chart sanity
+    print("Ghost → Psychic (Gen 1 bug, should be 0x):",
+          type_effectiveness('ghost', ['psychic']),
+          '✓' if type_effectiveness('ghost', ['psychic']) == 0 else '✗')
+    print("Psychic → Gengar Ghost/Poison (should be 2x):",
+          type_effectiveness('psychic', ['ghost', 'poison']),
+          '✓' if type_effectiveness('psychic', ['ghost', 'poison']) == 2 else '✗')
+    print("Bug → Psychic (should be 2x):",
+          type_effectiveness('bug', ['psychic']),
+          '✓' if type_effectiveness('bug', ['psychic']) == 2 else '✗')
+    print()
+
+    # Move accessors
+    for move_id in ['bodyslam', 'thunderwave', 'seismictoss', 'pinmissile']:
+        print(f"  {move_id:14s}: {get_move(move_id)}  type={get_move_type(move_id)}"
+              f"  damaging={is_damaging(move_id)}  avg_hits={average_hits(move_id)}")
+    print()
+
+    # Damage calc
+    lo, hi = calc_damage('tauros', 'bodyslam', 'alakazam')
+    plo, phi = calc_damage_pct('tauros', 'bodyslam', 'alakazam')
+    print(f"Tauros Body Slam vs Alakazam:      {lo}-{hi}  ({plo*100:.0f}%-{phi*100:.0f}%)")
+    lo, hi = calc_damage('chansey', 'seismictoss', 'snorlax')
+    print(f"Chansey Seismic Toss vs Snorlax:   {lo}-{hi}  (should be 100-100)")
+    print()
+
+    # KO checks
+    print(f"Tauros Body Slam KOs Alakazam at 45%: {can_ko('tauros','bodyslam','alakazam',0.45)}")
+    ko_m, ko_g = find_ko_move('starmie', ['surf','thunderbolt','psychic'], 'snorlax', 0.20)
+    print(f"Best KO move — Starmie vs Snorlax 20%: {ko_m} (guaranteed={ko_g})")
+    print()
+
+    # Speed
+    for mon in ['tauros', 'alakazam', 'chansey', 'starmie', 'snorlax']:
+        s = get_speed(mon)
+        print(f"  {mon:12s}: {s:3d}  paralyzed: {get_speed(mon, True)}")
