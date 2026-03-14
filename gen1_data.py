@@ -14,8 +14,8 @@ POKEMON TABLE
 Format:
     'species': [HP, Atk, Def, Spc, Spe, type1, type2_or_None]
 
-Stats are the actual in-battle values at Level 100, DVs 15/15/15/15,
-max Stat EXP (65535) — the Gen 1 OU standard.
+Stats are BASE stats (the values printed in the Pokédex / data tables).
+Use get_stats() to derive in-battle values at any level/DV/StatExp.
 
 Formula (non-HP):  ((Base + DV)*2 + ceil(sqrt(StatExp))/4) * Lvl/100 + 5
 Formula (HP):       same but  + Lvl + 10  instead of + 5
@@ -47,304 +47,277 @@ Categories:
 # =============================================================================
 
 POKEMON = {
-    # --- Bulbasaur line ---
-    'bulbasaur':    [203, 108, 108, 138, 108, 'grass',    'poison'],
-    'ivysaur':      [243, 128, 128, 158, 128, 'grass',    'poison'],
-    'venusaur':     [363, 262, 264, 298, 258, 'grass',    'poison'],
-
-    # --- Charmander line ---
-    'charmander':   [198, 112, 98,  118, 118, 'fire',     None],
-    'charmeleon':   [238, 142, 128, 148, 148, 'fire',     None],
-    'charizard':    [358, 268, 248, 268, 288, 'fire',     'flying'],
-
-    # --- Squirtle line ---
-    'squirtle':     [208, 108, 128, 118, 108, 'water',    None],
-    'wartortle':    [248, 128, 158, 138, 128, 'water',    None],
-    'blastoise':    [358, 248, 298, 268, 248, 'water',    None],
-
-    # --- Caterpie line ---
-    'caterpie':     [233, 70,  70,  70,  105, 'bug',      None],
-    'metapod':      [243, 60,  120, 70,  80,  'bug',      None],
-    'butterfree':   [323, 148, 148, 258, 228, 'bug',      'flying'],
-
-    # --- Weedle line ---
-    'weedle':       [223, 75,  65,  60,  105, 'bug',      'poison'],
-    'kakuna':       [233, 60,  110, 70,  80,  'bug',      'poison'],
-    'beedrill':     [303, 178, 138, 138, 218, 'bug',      'poison'],
-
-    # --- Pidgey line ---
-    'pidgey':       [198, 95,  85,  90,  115, 'normal',   'flying'],
-    'pidgeotto':    [263, 130, 120, 120, 160, 'normal',   'flying'],
-    'pidgeot':      [333, 178, 168, 168, 218, 'normal',   'flying'],
-
-    # --- Rattata line ---
-    'rattata':      [183, 106, 85,  80,  132, 'normal',   None],
-    'raticate':     [263, 178, 138, 138, 238, 'normal',   None],
-
-    # --- Spearow line ---
-    'spearow':      [203, 120, 80,  80,  130, 'normal',   'flying'],
-    'fearow':       [293, 198, 148, 148, 228, 'normal',   'flying'],
-
-    # --- Ekans line ---
-    'ekans':        [198, 110, 98,  98,  115, 'poison',   None],
-    'arbok':        [283, 178, 158, 158, 188, 'poison',   None],
-
-    # --- Pikachu line ---
-    'pikachu':      [233, 138, 98,  118, 198, 'electric', None],
-    'raichu':       [323, 218, 178, 218, 278, 'electric', None],
-
-    # --- Sandshrew line ---
-    'sandshrew':    [228, 125, 155, 80,  95,  'ground',   None],
-    'sandslash':    [333, 215, 245, 148, 178, 'ground',   None],
-
-    # --- Nidoran line ---
-    'nidoranf':     [233, 107, 115, 108, 113, 'poison',   None],
-    'nidorina':     [283, 137, 145, 138, 143, 'poison',   None],
-    'nidoqueen':    [373, 232, 242, 228, 238, 'poison',   'ground'],
-    'nidoranm':     [213, 117, 105, 98,  115, 'poison',   None],
-    'nidorino':     [263, 157, 137, 128, 145, 'poison',   None],
-    'nidoking':     [365, 282, 247, 268, 268, 'poison',   'ground'],
-
-    # --- Clefairy line ---
-    'clefairy':     [283, 118, 118, 148, 118, 'normal',   None],
-    'clefable':     [393, 238, 234, 268, 218, 'normal',   None],
-
-    # --- Vulpix line ---
-    'vulpix':       [198, 108, 108, 128, 148, 'fire',     None],
-    'ninetales':    [323, 218, 218, 248, 288, 'fire',     None],
+    'bulbasaur':    [45,  49,  49,  65,  45,  'grass',    'poison'],
+    'ivysaur':      [60,  62,  63,  80,  60,  'grass',    'poison'],
+    'venusaur':     [80,  82,  83,  100, 80,  'grass',    'poison'],
+    'charmander':   [39,  52,  43,  60,  65,  'fire',     None],
+    'charmeleon':   [58,  64,  58,  80,  80,  'fire',     None],
+    'charizard':    [78,  84,  78,  85,  100, 'fire',     'flying'],
+    'squirtle':     [44,  48,  65,  50,  43,  'water',    None],
+    'wartortle':    [59,  63,  80,  65,  58,  'water',    None],
+    'blastoise':    [79,  83,  100, 85,  78,  'water',    None],
+    'caterpie':     [45,  30,  35,  20,  45,  'bug',      None],
+    'metapod':      [50,  20,  55,  25,  30,  'bug',      None],
+    'butterfree':   [60,  45,  50,  90,  70,  'bug',      'flying'],
+    'weedle':       [40,  35,  30,  20,  50,  'bug',      'poison'],
+    'kakuna':       [45,  25,  50,  25,  35,  'bug',      'poison'],
+    'beedrill':     [65,  90,  40,  45,  75,  'bug',      'poison'],
+    'pidgey':       [40,  45,  40,  35,  56,  'normal',   'flying'],
+    'pidgeotto':    [63,  60,  55,  50,  71,  'normal',   'flying'],
+    'pidgeot':      [83,  80,  75,  70,  91,  'normal',   'flying'],
+    'rattata':      [30,  56,  35,  25,  72,  'normal',   None],
+    'raticate':     [55,  81,  60,  50,  97,  'normal',   None],
+    'spearow':      [40,  60,  30,  31,  70,  'normal',   'flying'],
+    'fearow':       [65,  90,  65,  61,  100, 'normal',   'flying'],
+    'ekans':        [35,  60,  44,  40,  55,  'poison',   None],
+    'arbok':        [60,  95,  69,  65,  80,  'poison',   None],
+    'pikachu':      [35,  55,  30,  50,  90,  'electric', None],
+    'raichu':       [60,  90,  55,  90,  110, 'electric', None],
+    'sandshrew':    [50,  75,  85,  30,  40,  'ground',   None],
+    'sandslash':    [75,  100, 110, 45,  65,  'ground',   None],
+    'nidoranf':     [55,  47,  52,  40,  41,  'poison',   None],
+    'nidorina':     [70,  62,  67,  55,  56,  'poison',   None],
+    'nidoqueen':    [90,  92,  87,  75,  76,  'poison',   'ground'],
+    'nidoranm':     [46,  57,  40,  40,  50,  'poison',   None],
+    'nidorino':     [61,  72,  57,  55,  65,  'poison',   None],
+    'nidoking':     [81,  102, 77,  85,  85,  'poison',   'ground'],
+    'clefairy':     [70,  45,  48,  60,  35,  'normal',   None],
+    'clefable':     [95,  70,  73,  85,  60,  'normal',   None],
+    'vulpix':       [38,  41,  40,  65,  65,  'fire',     None],
+    'ninetales':    [73,  76,  75,  100, 100, 'fire',     None],
 
     # --- Jigglypuff line ---
-    'jigglypuff':   [383, 118, 98,  98,  88,  'normal',   None],
-    'wigglytuff':   [493, 198, 178, 178, 148, 'normal',   None],
+    'jigglypuff':   [115, 45,  20,  25,  20,  'normal',   None],
+    'wigglytuff':   [140, 70,  45,  50,  45,  'normal',   None],
 
     # --- Zubat line ---
-    'zubat':        [193, 115, 105, 90,  115, 'poison',   'flying'],
-    'golbat':       [313, 195, 175, 160, 195, 'poison',   'flying'],
+    'zubat':        [40,  45,  35,  40,  55,  'poison',   'flying'],
+    'golbat':       [75,  80,  70,  75,  90,  'poison',   'flying'],
 
     # --- Oddish line ---
-    'oddish':       [233, 118, 118, 148, 98,  'grass',    'poison'],
-    'gloom':        [263, 138, 138, 168, 108, 'grass',    'poison'],
-    'vileplume':    [343, 208, 208, 268, 178, 'grass',    'poison'],
+    'oddish':       [45,  50,  55,  75,  30,  'grass',    'poison'],
+    'gloom':        [60,  65,  70,  85,  40,  'grass',    'poison'],
+    'vileplume':    [75,  80,  85,  100, 50,  'grass',    'poison'],
 
     # --- Paras line ---
-    'paras':        [208, 145, 125, 110, 85,  'bug',      'grass'],
-    'parasect':     [293, 215, 215, 160, 115, 'bug',      'grass'],
+    'paras':        [35,  70,  55,  55,  25,  'bug',      'grass'],
+    'parasect':     [60,  95,  80,  80,  30,  'bug',      'grass'],
 
     # --- Venonat line ---
-    'venonat':      [263, 120, 120, 120, 120, 'bug',      'poison'],
-    'venomoth':     [303, 148, 138, 198, 218, 'bug',      'poison'],
+    'venonat':      [60,  55,  50,  40,  45,  'bug',      'poison'],
+    'venomoth':     [70,  65,  60,  90,  90,  'bug',      'poison'],
 
     # --- Diglett line ---
-    'diglett':      [153, 135, 85,  98,  215, 'ground',   None],
-    'dugtrio':      [273, 258, 198, 238, 338, 'ground',   None],
+    'diglett':      [10,  55,  25,  45,  95,  'ground',   None],
+    'dugtrio':      [35,  100, 50,  70,  120, 'ground',   None],
 
     # --- Meowth line ---
-    'meowth':       [233, 115, 105, 108, 178, 'normal',   None],
-    'persian':      [333, 238, 218, 228, 328, 'normal',   None],
+    'meowth':       [40,  45,  35,  40,  90,  'normal',   None],
+    'persian':      [65,  70,  60,  65,  115, 'normal',   None],
 
     # --- Psyduck line ---
-    'psyduck':      [263, 148, 138, 148, 168, 'water',    None],
-    'golduck':      [353, 228, 218, 248, 248, 'water',    None],
+    'psyduck':      [50,  52,  48,  50,  55,  'water',    None],
+    'golduck':      [80,  82,  78,  80,  85,  'water',    None],
 
     # --- Mankey line ---
-    'mankey':       [213, 165, 105, 98,  148, 'fighting', None],
-    'primeape':     [303, 245, 178, 158, 238, 'fighting', None],
+    'mankey':       [40,  80,  35,  35,  70,  'fighting', None],
+    'primeape':     [65,  105, 60,  60,  95,  'fighting', None],
 
     # --- Growlithe line ---
-    'growlithe':    [253, 165, 128, 148, 148, 'fire',     None],
-    'arcanine':     [383, 318, 258, 298, 288, 'fire',     None],
+    'growlithe':    [55,  70,  45,  70,  60,  'fire',     None],
+    'arcanine':     [90,  110, 80,  100, 95,  'fire',     None],
 
     # --- Poliwag line ---
-    'poliwag':      [233, 138, 118, 118, 198, 'water',    None],
-    'poliwhirl':    [303, 168, 178, 148, 238, 'water',    None],
-    'poliwrath':    [383, 268, 288, 238, 238, 'water',    'fighting'],
+    'poliwag':      [40,  50,  40,  40,  90,  'water',    None],
+    'poliwhirl':    [65,  65,  65,  50,  90,  'water',    None],
+    'poliwrath':    [90,  95,  95,  70,  70,  'water',    'fighting'],
 
     # --- Abra line ---
-    'abra':         [233, 108, 88,  298, 258, 'psychic',  None],
-    'kadabra':      [273, 148, 128, 338, 298, 'psychic',  None],
-    'alakazam':     [313, 198, 188, 368, 338, 'psychic',  None],
+    'abra':         [25,  20,  15,  105, 90,  'psychic',  None],
+    'kadabra':      [40,  35,  30,  120, 105, 'psychic',  None],
+    'alakazam':     [55,  50,  45,  135, 120, 'psychic',  None],
 
     # --- Machop line ---
-    'machop':       [263, 205, 148, 98,  108, 'fighting', None],
-    'machoke':      [343, 265, 208, 148, 158, 'fighting', None],
-    'machamp':      [383, 358, 258, 228, 208, 'fighting', None],
+    'machop':       [70,  80,  50,  35,  35,  'fighting', None],
+    'machoke':      [80,  100, 70,  50,  45,  'fighting', None],
+    'machamp':      [90,  130, 80,  65,  55,  'fighting', None],
 
     # --- Bellsprout line ---
-    'bellsprout':   [233, 165, 98,  138, 113, 'grass',    'poison'],
-    'weepinbell':   [293, 215, 138, 188, 148, 'grass',    'poison'],
-    'victreebel':   [363, 308, 228, 298, 238, 'grass',    'poison'],
+    'bellsprout':   [50,  75,  35,  70,  40,  'grass',    'poison'],
+    'weepinbell':   [65,  90,  50,  85,  55,  'grass',    'poison'],
+    'victreebel':   [80,  105, 65,  100, 70,  'grass',    'poison'],
 
     # --- Tentacool line ---
-    'tentacool':    [253, 128, 98,  258, 208, 'water',    'poison'],
-    'tentacruel':   [363, 238, 228, 338, 298, 'water',    'poison'],
+    'tentacool':    [40,  40,  35,  100, 70,  'water',    'poison'],
+    'tentacruel':   [80,  70,  65,  120, 100, 'water',    'poison'],
 
     # --- Geodude line ---
-    'geodude':      [228, 185, 255, 108, 88,  'rock',     'ground'],
-    'graveler':     [298, 255, 315, 148, 118, 'rock',     'ground'],
-    'golem':        [363, 318, 358, 208, 188, 'rock',     'ground'],
+    'geodude':      [40,  80,  100, 30,  20,  'rock',     'ground'],
+    'graveler':     [55,  95,  115, 45,  35,  'rock',     'ground'],
+    'golem':        [80,  110, 130, 55,  45,  'rock',     'ground'],
 
     # --- Ponyta line ---
-    'ponyta':       [283, 215, 168, 178, 238, 'fire',     None],
-    'rapidash':     [333, 248, 198, 208, 298, 'fire',     None],
+    'ponyta':       [50,  85,  55,  65,  90,  'fire',     None],
+    'rapidash':     [65,  100, 70,  80,  105, 'fire',     None],
 
     # --- Slowpoke line ---
-    'slowpoke':     [383, 188, 198, 188, 88,  'water',    'psychic'],
-    'slowbro':      [393, 248, 318, 258, 158, 'water',    'psychic'],
+    'slowpoke':     [90,  65,  65,  40,  15,  'water',    'psychic'],
+    'slowbro':      [95,  75,  110, 80,  30,  'water',    'psychic'],
 
     # --- Magnemite line ---
-    'magnemite':    [223, 118, 168, 228, 148, 'electric', None],
-    'magneton':     [303, 218, 288, 338, 238, 'electric', None],
+    'magnemite':    [25,  35,  70,  95,  45,  'electric', None],
+    'magneton':     [50,  60,  95,  120, 70,  'electric', None],
 
     # --- Farfetchd ---
-    "farfetchd":    [273, 168, 148, 148, 168, 'normal',   'flying'],
+    "farfetchd":    [52,  65,  55,  58,  60,  'normal',   'flying'],
 
     # --- Doduo line ---
-    'doduo':        [223, 238, 158, 138, 238, 'normal',   'flying'],
-    'dodrio':       [323, 318, 238, 218, 298, 'normal',   'flying'],
+    'doduo':        [35,  85,  45,  35,  75,  'normal',   'flying'],
+    'dodrio':       [60,  110, 70,  60,  110, 'normal',   'flying'],
 
     # --- Seel line ---
-    'seel':         [293, 148, 168, 148, 148, 'water',    None],
-    'dewgong':      [373, 198, 218, 238, 198, 'water',    'ice'],
+    'seel':         [65,  45,  55,  45,  45,  'water',    None],
+    'dewgong':      [90,  70,  80,  95,  70,  'water',    'ice'],
 
     # --- Grimer line ---
-    'grimer':       [323, 205, 148, 128, 98,  'poison',   None],
-    'muk':          [413, 278, 218, 198, 168, 'poison',   None],
+    'grimer':       [80,  80,  50,  40,  25,  'poison',   None],
+    'muk':          [105, 105, 75,  65,  50,  'poison',   None],
 
     # --- Shellder line ---
-    'shellder':     [203, 165, 298, 108, 118, 'water',    None],
-    'cloyster':     [303, 288, 458, 268, 238, 'water',    'ice'],
+    'shellder':     [30,  65,  100, 45,  40,  'water',    None],
+    'cloyster':     [50,  95,  180, 85,  70,  'water',    'ice'],
 
     # --- Gastly line ---
-    'gastly':       [233, 108, 98,  298, 218, 'ghost',    'poison'],
-    'haunter':      [283, 148, 128, 338, 258, 'ghost',    'poison'],
-    'gengar':       [323, 228, 218, 358, 318, 'ghost',    'poison'],
+    'gastly':       [30,  35,  30,  100, 80,  'ghost',    'poison'],
+    'haunter':      [45,  50,  45,  115, 95,  'ghost',    'poison'],
+    'gengar':       [60,  65,  60,  130, 110, 'ghost',    'poison'],
 
     # --- Onix ---
-    'onix':         [228, 115, 365, 98,  198, 'rock',     'ground'],
+    'onix':         [35,  45,  160, 30,  70,  'rock',     'ground'],
 
     # --- Drowzee line ---
-    'drowzee':      [293, 148, 148, 248, 147, 'psychic',  None],
-    'hypno':        [373, 234, 238, 328, 227, 'psychic',  None],
+    'drowzee':      [60,  48,  45,  90,  42,  'psychic',  None],
+    'hypno':        [85,  73,  70,  115, 67,  'psychic',  None],
 
     # --- Krabby line ---
-    'krabby':       [193, 245, 235, 98,  108, 'water',    None],
-    'kingler':      [273, 348, 318, 148, 188, 'water',    None],
+    'krabby':       [30,  105, 90,  25,  50,  'water',    None],
+    'kingler':      [55,  130, 115, 50,  75,  'water',    None],
 
     # --- Voltorb line ---
-    'voltorb':      [243, 108, 148, 138, 238, 'electric', None],
-    'electrode':    [293, 148, 188, 178, 338, 'electric', None],
+    'voltorb':      [40,  30,  50,  55,  100, 'electric', None],
+    'electrode':    [60,  50,  70,  80,  140, 'electric', None],
 
     # --- Exeggcute line ---
-    'exeggcute':    [283, 128, 148, 188, 118, 'grass',    'psychic'],
-    'exeggutor':    [393, 288, 268, 348, 208, 'grass',    'psychic'],
+    'exeggcute':    [60,  40,  80,  60,  40,  'grass',    'psychic'],
+    'exeggutor':    [95,  95,  85,  125, 55,  'grass',    'psychic'],
 
     # --- Cubone line ---
-    'cubone':       [228, 145, 195, 128, 118, 'ground',   None],
-    'marowak':      [293, 205, 265, 178, 168, 'ground',   None],
+    'cubone':       [50,  50,  95,  40,  35,  'ground',   None],
+    'marowak':      [60,  80,  110, 50,  45,  'ground',   None],
 
     # --- Hitmon line ---
-    'hitmonlee':    [293, 318, 218, 148, 258, 'fighting', None],
-    'hitmonchan':   [293, 278, 238, 148, 238, 'fighting', None],
+    'hitmonlee':    [50,  120, 53,  35,  87,  'fighting', None],
+    'hitmonchan':   [50,  105, 79,  35,  76,  'fighting', None],
 
     # --- Lickitung ---
-    'lickitung':    [363, 168, 228, 178, 128, 'normal',   None],
+    'lickitung':    [90,  55,  75,  60,  30,  'normal',   None],
 
     # --- Koffing line ---
-    'koffing':      [253, 175, 225, 148, 118, 'poison',   None],
-    'weezing':      [313, 235, 285, 198, 158, 'poison',   None],
+    'koffing':      [40,  65,  95,  60,  35,  'poison',   None],
+    'weezing':      [65,  90,  120, 85,  60,  'poison',   None],
 
     # --- Rhyhorn line ---
-    'rhyhorn':      [323, 255, 255, 148, 118, 'ground',   'rock'],
-    'rhydon':       [413, 358, 338, 188, 178, 'ground',   'rock'],
+    'rhyhorn':      [80,  85,  95,  30,  25,  'ground',   'rock'],
+    'rhydon':       [105, 130, 120, 45,  40,  'ground',   'rock'],
 
     # --- Chansey ---
-    'chansey':      [703, 108, 108, 308, 198, 'normal',   None],
+    'chansey':      [250, 5,   5,   105, 50,  'normal',   None],
 
     # --- Tangela ---
-    'tangela':      [323, 168, 298, 218, 218, 'grass',    None],
+    'tangela':      [65,  55,  115, 100, 60,  'grass',    None],
 
     # --- Kangaskhan ---
-    'kangaskhan':   [373, 288, 258, 178, 278, 'normal',   None],
+    'kangaskhan':   [105, 95,  80,  40,  90,  'normal',   None],
 
     # --- Horsea line ---
-    'horsea':       [193, 128, 148, 178, 148, 'water',    None],
-    'seadra':       [283, 218, 228, 258, 248, 'water',    None],
+    'horsea':       [30,  40,  70,  70,  60,  'water',    None],
+    'seadra':       [55,  65,  95,  95,  85,  'water',    None],
 
     # --- Goldeen line ---
-    'goldeen':      [243, 178, 148, 128, 168, 'water',    None],
-    'seaking':      [333, 258, 218, 198, 228, 'water',    None],
+    'goldeen':      [45,  67,  60,  50,  63,  'water',    None],
+    'seaking':      [80,  92,  65,  80,  68,  'water',    None],
 
     # --- Staryu line ---
-    'staryu':       [243, 148, 168, 198, 248, 'water',    None],
-    'starmie':      [323, 248, 268, 298, 328, 'water',    'psychic'],
+    'staryu':       [30,  45,  55,  70,  85,  'water',    None],
+    'starmie':      [60,  75,  85,  100, 115, 'water',    'psychic'],
 
     # --- Mr. Mime ---
-    'mrmime':       [303, 148, 148, 298, 278, 'psychic',  None],
+    'mrmime':       [40,  45,  65,  100, 90,  'psychic',  None],
 
     # --- Scyther ---
-    'scyther':      [343, 298, 268, 198, 298, 'bug',      'flying'],
+    'scyther':      [70,  110, 80,  55,  105, 'bug',      'flying'],
 
     # --- Jynx ---
-    'jynx':         [333, 198, 168, 288, 288, 'ice',      'psychic'],
+    'jynx':         [65,  50,  35,  95,  95,  'ice',      'psychic'],
 
     # --- Electabuzz ---
-    'electabuzz':   [333, 264, 208, 288, 308, 'electric', None],
+    'electabuzz':   [65,  83,  57,  95,  105, 'electric', None],
 
     # --- Magmar ---
-    'magmar':       [343, 278, 228, 298, 268, 'fire',     None],
+    'magmar':       [65,  95,  57,  100, 93,  'fire',     None],
 
     # --- Pinsir ---
-    'pinsir':       [333, 318, 278, 178, 258, 'bug',      None],
+    'pinsir':       [65,  125, 100, 55,  85,  'bug',      None],
 
     # --- Tauros ---
-    'tauros':       [353, 298, 288, 238, 318, 'normal',   None],
+    'tauros':       [75,  100, 95,  70,  110, 'normal',   None],
 
     # --- Magikarp line ---
-    'magikarp':     [163, 68,  128, 68,  128, 'water',    None],
-    'gyarados':     [393, 348, 256, 298, 258, 'water',    'flying'],
+    'magikarp':     [20,  10,  55,  20,  80,  'water',    None],
+    'gyarados':     [95,  125, 79,  100, 81,  'water',    'flying'],
 
     # --- Lapras ---
-    'lapras':       [463, 268, 258, 288, 218, 'water',    'ice'],
+    'lapras':       [130, 85,  80,  95,  60,  'water',    'ice'],
 
     # --- Ditto ---
-    'ditto':        [273, 188, 188, 188, 188, 'normal',   None],
+    'ditto':        [48,  48,  48,  48,  48,  'normal',   None],
 
     # --- Eevee line ---
-    'eevee':        [273, 178, 168, 168, 198, 'normal',   None],
-    'vaporeon':     [463, 228, 218, 318, 228, 'water',    None],
-    'jolteon':      [333, 228, 218, 318, 358, 'electric', None],
-    'flareon':      [333, 318, 218, 298, 218, 'fire',     None],
+    'eevee':        [55,  55,  50,  45,  55,  'normal',   None],
+    'vaporeon':     [130, 65,  60,  110, 65,  'water',    None],
+    'jolteon':      [65,  65,  60,  110, 130, 'electric', None],
+    'flareon':      [65,  130, 60,  110, 65,  'fire',     None],
 
     # --- Porygon ---
-    'porygon':      [313, 198, 218, 238, 198, 'normal',   None],
+    'porygon':      [65,  60,  70,  75,  40,  'normal',   None],
 
     # --- Omanyte line ---
-    'omanyte':      [228, 148, 258, 208, 118, 'rock',     'water'],
-    'omastar':      [318, 228, 338, 298, 198, 'rock',     'water'],
+    'omanyte':      [35,  40,  100, 90,  35,  'rock',     'water'],
+    'omastar':      [70,  60,  125, 115, 55,  'rock',     'water'],
 
     # --- Kabuto line ---
-    'kabuto':       [218, 195, 225, 138, 168, 'rock',     'water'],
-    'kabutops':     [308, 288, 288, 188, 248, 'rock',     'water'],
+    'kabuto':       [30,  80,  90,  45,  55,  'rock',     'water'],
+    'kabutops':     [60,  115, 105, 70,  80,  'rock',     'water'],
 
     # --- Aerodactyl ---
-    'aerodactyl':   [333, 298, 228, 198, 338, 'rock',     'flying'],
+    'aerodactyl':   [80,  105, 65,  60,  130, 'rock',     'flying'],
 
     # --- Snorlax ---
-    'snorlax':      [523, 318, 228, 228, 158, 'normal',   None],
+    'snorlax':      [160, 110, 65,  65,  30,  'normal',   None],
 
     # --- Legendary Birds ---
-    'articuno':     [383, 268, 298, 348, 268, 'ice',      'flying'],
-    'zapdos':       [383, 278, 268, 348, 298, 'electric', 'flying'],
-    'moltres':      [383, 298, 278, 348, 278, 'fire',     'flying'],
+    'articuno':     [90,  85,  100, 125, 85,  'ice',      'flying'],
+    'zapdos':       [90,  90,  85,  125, 100, 'electric', 'flying'],
+    'moltres':      [90,  100, 90,  125, 90,  'fire',     'flying'],
 
     # --- Dratini line ---
-    'dratini':      [223, 168, 148, 148, 148, 'dragon',   None],
-    'dragonair':    [303, 228, 208, 208, 208, 'dragon',   None],
-    'dragonite':    [386, 366, 288, 298, 258, 'dragon',   'flying'],
+    'dratini':      [41,  64,  45,  50,  50,  'dragon',   None],
+    'dragonair':    [61,  84,  65,  70,  70,  'dragon',   None],
+    'dragonite':    [91,  134, 95,  100, 80,  'dragon',   'flying'],
 
     # --- Mewtwo / Mew ---
-    'mewtwo':       [416, 358, 278, 378, 358, 'psychic',  None],
-    'mew':          [383, 298, 298, 298, 298, 'psychic',  None],
+    'mewtwo':       [106, 110, 90,  154, 130, 'psychic',  None],
+    'mew':          [100, 100, 100, 100, 100, 'psychic',  None],
 }
 
 
@@ -352,14 +325,39 @@ POKEMON = {
 # CONVENIENCE ACCESSORS
 # =============================================================================
 
-def get_stats(species: str):
+def get_stats(species: str, level: int = 100, dv: int = 15, stat_exp: int = 65535):
     """
-    Return (HP, Atk, Def, Spc, Spe) for a species, or None if unknown.
+    Return (HP, Atk, Def, Spc, Spe) calculated at the given level/DV/StatExp.
+
+    Defaults to Level 100, max DVs (15), max Stat EXP (65535) — the Gen 1 OU
+    standard used for damage calculations.
+
+    Gen 1 formulas
+    --------------
+    stat_exp_bonus = floor(min(255, ceil(sqrt(stat_exp))) / 4)
+
+    Non-HP:  floor(((Base + DV) * 2 + stat_exp_bonus) * level / 100) + 5
+    HP:      floor(((Base + DV) * 2 + stat_exp_bonus) * level / 100) + level + 10
     """
+    import math
     row = POKEMON.get(species.lower())
     if row is None:
         return None
-    return tuple(row[:5])
+
+    stat_exp_bonus = math.floor(min(255, math.ceil(math.sqrt(stat_exp))) / 4)
+
+    def calc(base, is_hp=False):
+        val = math.floor(((base + dv) * 2 + stat_exp_bonus) * level / 100)
+        return val + (level + 10 if is_hp else 5)
+
+    hp,  atk, dfn, spc, spe = row[0], row[1], row[2], row[3], row[4]
+    return (
+        calc(hp,  is_hp=True),
+        calc(atk),
+        calc(dfn),
+        calc(spc),
+        calc(spe),
+    )
 
 
 def get_types(species: str):
@@ -402,21 +400,18 @@ MOVES = {
     'stomp':         (65,  'normal',   'physical', (1, 1)),
     'hornattack':    (65,  'normal',   'physical', (1, 1)),
     'furyattack':    (15,  'normal',   'physical', (2, 5)),   # multi-hit
-    'comet punch':   (18,  'normal',   'physical', (2, 5)),   # multi-hit
     'cometpunch':    (18,  'normal',   'physical', (2, 5)),   # multi-hit
     'doubleslap':    (15,  'normal',   'physical', (2, 5)),   # multi-hit
     'spikecannon':   (20,  'normal',   'physical', (2, 5)),   # multi-hit
     'wrap':          (15,  'normal',   'physical', (2, 5)),   # trapping / multi-hit
     'bind':          (15,  'normal',   'physical', (2, 5)),   # trapping / multi-hit
-    'lick':          (20,  'normal',   'physical', (1, 1)),
     'rage':          (20,  'normal',   'physical', (1, 1)),
-    'swift':         (60,  'normal',   'special',  (1, 1)),   # Gen 1: special split
+    'swift':         (60,  'normal',   'physical',  (1, 1)),   # Gen 1: special split
     'bide':          (0,   'normal',   'physical', (1, 1)),   # returns 2x damage taken
     'explosion':     (340, 'normal',   'physical', (1, 1)),   # halves target's Def
     'selfdestruct':  (260, 'normal',   'physical', (1, 1)),   # halves target's Def
     'takedown':      (90,  'normal',   'physical', (1, 1)),
     'thrash':        (90,  'normal',   'physical', (2, 3)),   # 2-3 turns
-    'petal dance':   (70,  'normal',   'special',  (2, 3)),   # misses; treated as normal here
     'petaldance':    (70,  'normal',   'special',  (2, 3)),
     'skullbash':     (100, 'normal',   'physical', (1, 1)),   # charges then hits
     'eggbomb':       (100, 'normal',   'physical', (1, 1)),
@@ -424,9 +419,7 @@ MOVES = {
     'recover':       (0,   'normal',   'status',   (1, 1)),
     'substitute':    (0,   'normal',   'status',   (1, 1)),
     'swordsdance':   (0,   'normal',   'status',   (1, 1)),
-    'toxic':         (0,   'normal',   'status',   (1, 1)),   # wait — Toxic is poison type
     'growl':         (0,   'normal',   'status',   (1, 1)),
-    'tail whip':     (0,   'normal',   'status',   (1, 1)),
     'tailwhip':      (0,   'normal',   'status',   (1, 1)),
     'string shot':   (0,   'normal',   'status',   (1, 1)),
     'stringshot':    (0,   'normal',   'status',   (1, 1)),
@@ -446,6 +439,7 @@ MOVES = {
     'splash':        (0,   'normal',   'status',   (1, 1)),
     'transform':     (0,   'normal',   'status',   (1, 1)),
     'rest':          (0,   'psychic',  'status',   (1, 1)),   # restores HP + sleep
+    'sonicboom':     (0,   'normal',   'fixed',    (1, 1)),
 
     # ── Fire (special) ───────────────────────────────────────────────────────
     'ember':         (40,  'fire',     'special',  (1, 1)),
@@ -460,9 +454,9 @@ MOVES = {
     'hydropump':     (120, 'water',    'special',  (1, 1)),
     'bubble':        (20,  'water',    'special',  (1, 1)),
     'bubblebeam':    (65,  'water',    'special',  (1, 1)),
-    'clamp':         (35,  'water',    'physical', (2, 5)),   # trapping; physical in Gen1
-    'crabhammer':    (90,  'water',    'physical', (1, 1)),   # physical in Gen1
-    'waterfall':     (80,  'water',    'physical', (1, 1)),   # physical in Gen1
+    'clamp':         (35,  'water',    'special', (2, 5)),   # trapping; physical in Gen1
+    'crabhammer':    (90,  'water',    'special', (1, 1)),   # physical in Gen1
+    'waterfall':     (80,  'water',    'special', (1, 1)),   # physical in Gen1
     'withdraw':      (0,   'water',    'status',   (1, 1)),
 
     # ── Electric (special) ───────────────────────────────────────────────────
@@ -518,7 +512,6 @@ MOVES = {
     'dig':           (100, 'ground',   'physical', (1, 1)),   # charges + hits
     'bonemerang':    (50,  'ground',   'physical', (2, 2)),   # always 2 hits
     'bonerush':      (25,  'ground',   'physical', (3, 5)),   # 3-5 hits in Gen 1 (changed Gen2+)
-    'mudslap':       (20,  'ground',   'special',  (1, 1)),   # Gen1 special? — treating physical
 
     # ── Flying (physical) ────────────────────────────────────────────────────
     'gust':          (40,  'flying',   'physical', (1, 1)),
@@ -527,7 +520,6 @@ MOVES = {
     'peck':          (35,  'flying',   'physical', (1, 1)),
     'skyattack':     (140, 'flying',   'physical', (1, 1)),   # charges + hits
     'fly':           (70,  'flying',   'physical', (1, 1)),   # charges + hits
-    'mirror move':   (0,   'flying',   'status',   (1, 1)),
     'mirrormove':    (0,   'flying',   'status',   (1, 1)),
     'agility':       (0,   'psychic',  'status',   (1, 1)),   # actually Psychic type in Gen1
 
@@ -560,16 +552,8 @@ MOVES = {
     'confuseray':    (0,   'ghost',    'status',   (1, 1)),
 
     # ── Dragon (special) ─────────────────────────────────────────────────────
-    'dragonrage':    (0,   'dragon',   'fixed',    (1, 'dragon')),  # fixed 40 damage
-    'twister':       (40,  'dragon',   'special',  (1, 1)),   # not in Gen 1 RBY, skip if needed
+    'dragonrage':    (0,   'dragon',   'fixed',    (1, 1)),  # fixed 40 damage
 }
-
-# Fix the duplicate 'lick' key — Ghost type wins (physical ghost lick)
-# Pokémon that learn Lick (Gengar line) deal Ghost-type in Gen 1.
-# The Normal-type Lick entry above is overwritten by the Ghost entry.
-MOVES['lick'] = (20, 'ghost', 'physical', (1, 1))
-# Fix toxic duplication (appears under both normal and poison sections)
-MOVES['toxic'] = (0, 'poison', 'status', (1, 1))
 
 
 # =============================================================================
@@ -654,7 +638,7 @@ if __name__ == '__main__':
     print()
 
     # Spot-check a few Pokémon
-    for species in ['bulbasaur', 'charizard', 'gengar', 'snorlax', 'mewtwo', 'mew']:
+    for species in ['tauros', 'alakazam', 'exeggutor', 'chansey', 'starmie', 'snorlax']:
         stats = get_stats(species)
         types = get_types(species)
         print(f"  {species:12s}: stats={stats}  types={types}")
