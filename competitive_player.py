@@ -35,15 +35,16 @@ from poke_env import LocalhostServerConfiguration, AccountConfiguration
 
 from config import LLM_MODEL, LLM_TIMEOUT_SECONDS, POKE_ENV_LOG_LEVEL
 from gen1_engine import (
+    # Type system
     type_effectiveness, get_pokemon_types, best_move_effectiveness,
     worst_incoming_effectiveness, find_best_switch, resolve_move_types,
     register_move_type, get_move_type,
-    FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, LLM_ONLY_MOVES, IGNORE_MOVES,
-)
-from gen1_calc import (
+    # Damage calc (merged from gen1_calc)
     calc_damage_pct, can_ko, find_ko_move, outspeeds, get_speed,
     evaluate_matchup, find_best_matchup_switch,
     freeze_chance_value, get_substitute_hp, can_break_substitute,
+    # Constants
+    FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, LLM_ONLY_MOVES, IGNORE_MOVES,
 )
 from llm_bridge import (
     call_llm, call_llm_async, strip_think_tags,
