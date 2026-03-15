@@ -60,18 +60,310 @@ from gen1_data import (
     get_immunities, get_resistances,
     # Pokémon accessors
     get_stats, get_types,
-    # Move accessors and cache
-    get_move, get_move_category, get_move_type, register_move_type,
-    is_damaging, average_hits,
     # Calculations
     apply_stage,
-    calc_damage, calc_damage_pct,
-    can_ko, find_ko_move, can_2hko,
-    get_speed, outspeeds,
-    freeze_chance_value,
-    get_substitute_hp, can_break_substitute,
-    evaluate_matchup,
+    get_move
 )
+
+# =============================================================================
+# DAMAGE CALCULATOR
+# All inputs are species-name strings and move IDs.
+# Standard assumptions: Level 100, 15 DVs, max Stat EXP.
+# =============================================================================
+
+def calc_damage(attacker: str, move_id: str, defender: str,
+                crit: bool = False,
+                atk_boosts: dict = None, def_boosts: dict = None,
+                reflect: bool = False, light_screen: bool = False,
+                attacker_burned: bool = False) -> tuple:
+    """
+    Damage range for a specific attack at L100, 15 DVs, max Stat EXP.
+
+    Args:
+        attacker, defender: species name strings (e.g. 'tauros')
+        move_id:            move ID (e.g. 'bodyslam')
+        crit:               critical hit — ignores stat stages in Gen 1
+        atk_boosts:         attacker's stat boost dict
+        def_boosts:         defender's stat boost dict
+        reflect:            Reflect active on defender's side
+        light_screen:       Light Screen active on defender's side
+        attacker_burned:    attacker burned (halves physical Attack)
+
+    Returns:
+        (min_damage, max_damage) — (0, 0) for immune/status, (100, 100) for fixed.
+    """
+    move = get_move(move_id)
+    if move is None:
+        return (0, 0)
+
+    bp, move_type, category, _hits = move
+    atk_boosts = atk_boosts or {}
+    def_boosts = def_boosts or {}
+
+    if category == 'status':
+        return (0, 0)
+
+    # Fixed-damage moves (Seismic Toss, Night Shade, etc.)
+    if category in ('fixed', 'ohko') or move_id in FIXED_DAMAGE_MOVES:
+        def_types = get_types(defender)
+        return (0, 0) if type_effectiveness(move_type, def_types) == 0 else (100, 100)
+
+    atk_stats = get_stats(attacker)
+    def_stats = get_stats(defender)
+    if not atk_stats or not def_stats:
+        return (0, 0)
+
+    atk_types = get_types(attacker)
+    def_types = get_types(defender)
+
+    # Physical/Special split is TYPE-based in Gen 1
+    is_special = move_type in SPECIAL_TYPES
+    if is_special:
+        attack  = atk_stats[3]   # Special (offense)
+        defense = def_stats[3]   # Special (defense)
+        atk_stage = atk_boosts.get('spc', atk_boosts.get('spa', 0))
+        def_stage = def_boosts.get('spc', def_boosts.get('spd', 0))
+    else:
+        attack  = atk_stats[1]   # Attack
+        defense = def_stats[2]   # Defense
+        atk_stage = atk_boosts.get('atk', 0)
+        def_stage = def_boosts.get('def', 0)
+
+    # Crits ignore stat stages in Gen 1
+    if not crit:
+        attack  = apply_stage(attack,  atk_stage)
+        defense = apply_stage(defense, def_stage)
+
+    # Burn halves physical Attack (applied after stages)
+    if attacker_burned and not is_special:
+        attack = max(1, attack // 2)
+
+    # Explosion/Self-Destruct halve target's Defense in Gen 1
+    if move_id in ('explosion', 'selfdestruct'):
+        defense = max(1, defense // 2)
+
+    # Screens double the relevant defense (crits ignore screens)
+    if not crit:
+        if not is_special and reflect:
+            defense = min(999, defense * 2)
+        elif is_special and light_screen:
+            defense = min(999, defense * 2)
+
+    eff = type_effectiveness(move_type, def_types)
+    if eff == 0:
+        return (0, 0)
+
+    stab = 1.5 if move_type in atk_types else 1.0
+
+    # Gen 1 damage formula: ((2*Level/5 + 2) * Power * Atk / Def) / 50 + 2
+    base = ((2 * 100 / 5 + 2) * bp * attack / defense) / 50 + 2
+    base = int(base * stab)
+    base = int(base * eff)
+
+    # Random factor: 217/255 – 255/255
+    min_dmg = max(1, int(base * 217 / 255))
+    max_dmg = base
+
+    return (min_dmg, max_dmg)
+
+
+def calc_damage_pct(attacker: str, move_id: str, defender: str, **kwargs) -> tuple:
+    """Damage as a fraction of defender's max HP. Returns (min_pct, max_pct)."""
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+    def_stats = get_stats(defender)
+    if not def_stats:
+        return (0.0, 0.0)
+    return (lo / def_stats[0], hi / def_stats[0])
+
+
+# =============================================================================
+# KO CHECKS
+# =============================================================================
+
+def can_ko(attacker: str, move_id: str, defender: str,
+           hp_pct: float = 1.0, use_avg: bool = True, **kwargs) -> bool:
+    """
+    Can this move KO the defender at the given HP fraction?
+
+    Args:
+        hp_pct:  defender's current HP as 0.0–1.0
+        use_avg: True → use average roll; False → minimum (guaranteed KO only)
+    """
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+    def_stats = get_stats(defender)
+    if not def_stats:
+        return False
+    current_hp = int(def_stats[0] * hp_pct)
+    return ((lo + hi) // 2 >= current_hp) if use_avg else (lo >= current_hp)
+
+
+def find_ko_move(attacker: str, moves: list, defender: str,
+                 hp_pct: float = 1.0, **kwargs) -> tuple:
+    """
+    From a list of move IDs, find the best one that KOs the defender.
+    Prefers guaranteed KOs (min roll) over average KOs.
+
+    Returns (move_id, guaranteed) or (None, False).
+    """
+    best_guaranteed = None
+    best_avg = None
+
+    for move_id in moves:
+        lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+        def_stats = get_stats(defender)
+        if not def_stats:
+            continue
+        current_hp = int(def_stats[0] * hp_pct)
+
+        if lo >= current_hp:
+            if best_guaranteed is None or lo > best_guaranteed[1]:
+                best_guaranteed = (move_id, lo)
+        elif (lo + hi) // 2 >= current_hp:
+            if best_avg is None or (lo + hi) > best_avg[1]:
+                best_avg = (move_id, lo + hi)
+
+    if best_guaranteed:
+        return (best_guaranteed[0], True)
+    if best_avg:
+        return (best_avg[0], False)
+    return (None, False)
+
+
+def can_2hko(attacker: str, move_id: str, defender: str, hp_pct: float = 1.0) -> bool:
+    """Can two hits KO the defender at current HP? Uses average roll."""
+    lo, hi = calc_damage(attacker, move_id, defender)
+    def_stats = get_stats(defender)
+    if not def_stats:
+        return False
+    return ((lo + hi) // 2) * 2 >= int(def_stats[0] * hp_pct)
+
+
+# =============================================================================
+# SPEED
+# In Gen 1 there is no Speed variance at max DVs/StatEXP — every species has
+# exactly one speed value (quartered by paralysis). get_speed() derives it
+# from the stats formula; outspeeds() is the only comparison needed.
+# =============================================================================
+
+def get_speed(species: str, paralyzed: bool = False) -> int:
+    """Calculated speed at L100/15DVs/maxStatEXP. Paralysis quarters it."""
+    stats = get_stats(species)
+    if not stats:
+        return 0
+    return stats[4] // 4 if paralyzed else stats[4]
+
+
+def outspeeds(species_a: str, species_b: str,
+              a_par: bool = False, b_par: bool = False) -> bool:
+    """
+    Does species_a outspeed species_b?
+    Speed ties are broken randomly in Gen 1 — returns False (conservative).
+    """
+    return get_speed(species_a, a_par) > get_speed(species_b, b_par)
+
+
+# =============================================================================
+# FREEZE CHANCE VALUE
+# All damaging Ice-type moves have a 10% freeze chance in Gen 1.
+# Freeze is essentially permanent — significant strategic value.
+# =============================================================================
+
+def freeze_chance_value(move_id: str, defender_species: str) -> int:
+    """
+    Bonus score (0–15) for freeze potential.
+    Returns 0 if the move can't freeze or the defender is already Ice-type.
+    """
+    if move_id not in FREEZE_MOVES:
+        return 0
+    if 'ice' in get_types(defender_species):
+        return 0
+    return 15  # 10% of a KO ≈ significant but not dominant
+
+
+# =============================================================================
+# SUBSTITUTE HELPERS
+# Sub HP = floor(max_hp / 4). Status moves fail against Subs.
+# =============================================================================
+
+def get_substitute_hp(species: str) -> int:
+    """HP of a Substitute for this species (floor(max_hp / 4))."""
+    stats = get_stats(species)
+    return stats[0] // 4 if stats else 0
+
+
+def can_break_substitute(attacker: str, move_id: str, defender: str, **kwargs) -> bool:
+    """Can this move break the defender's Substitute in one hit? Uses average roll."""
+    lo, hi = calc_damage(attacker, move_id, defender, **kwargs)
+    sub_hp = get_substitute_hp(defender)
+    return sub_hp > 0 and (lo + hi) // 2 >= sub_hp
+
+
+# =============================================================================
+# MATCHUP EVALUATOR
+# Scores how well our_species matches up against opp_species.
+# All inputs are species strings and move-ID lists — no poke-env objects.
+# find_best_matchup_switch() lives in gen1_engine because it iterates
+# poke-env switch objects to read .species / .current_hp_fraction / .status.
+# =============================================================================
+
+def evaluate_matchup(our_species: str, opp_species: str,
+                     our_moves: list = None,
+                     our_hp_pct: float = 1.0, opp_hp_pct: float = 1.0,
+                     our_status: str = None, opp_status: str = None) -> float:
+    """
+    Score how well our_species matches up against opp_species.
+    Higher = better matchup. Negative = bad matchup (roughly –100 to +100).
+
+    Considers: offensive damage output, defensive typing, speed, HP, status.
+    """
+    if not get_stats(our_species) or not get_stats(opp_species):
+        return 0.0
+
+    our_types = get_types(our_species)
+    opp_types = get_types(opp_species)
+    score = 0.0
+
+    # 1. Offensive pressure — best average damage we can deal
+    if our_moves:
+        best_dmg_pct = 0.0
+        for move_id in our_moves:
+            m = get_move(move_id)
+            if m and m[2] != 'status':
+                lo, hi = calc_damage_pct(our_species, move_id, opp_species)
+                avg = (lo + hi) / 2
+                if avg > best_dmg_pct:
+                    best_dmg_pct = avg
+        score += best_dmg_pct * 200  # 50% damage/turn ≈ +100 points
+
+    # 2. Defensive typing vs opponent's STAB
+    worst_incoming = max(
+        (type_effectiveness(t, our_types) for t in opp_types),
+        default=1.0
+    )
+    if worst_incoming >= 2:
+        score -= 40
+    elif worst_incoming == 0:
+        score += 50
+    elif worst_incoming <= 0.5:
+        score += 30
+
+    # 3. Speed advantage
+    our_par = our_status == 'PAR'
+    opp_par = opp_status == 'PAR'
+    score += 10 if outspeeds(our_species, opp_species, a_par=our_par, b_par=opp_par) else -5
+
+    # 4. HP penalty
+    if our_hp_pct < 0.30:
+        score -= 30
+    elif our_hp_pct < 0.50:
+        score -= 10
+
+    # 5. Status penalties
+    if our_status == 'SLP':   score -= 40
+    elif our_status == 'FRZ': score -= 50
+    elif our_status == 'PAR': score -= 10
+
+    return score
 
 # =============================================================================
 # POKE-ENV HELPERS
@@ -197,6 +489,58 @@ def find_best_switch(battle, threat_type=None):
 def resolve_move_types(move_ids: list) -> list:
     """Convert a list of move IDs to their types. Skips unknowns."""
     return [t for mid in move_ids for t in [get_move_type(mid)] if t]
+
+# =============================================================================
+# RUNTIME MOVE-TYPE CACHE
+# Populated during battles from live poke-env Move objects so that moves not
+# in the static MOVES table (e.g. obscure event moves) can still be resolved.
+# gen1_engine.register_move_type / get_move_type delegate here — there is
+# exactly ONE cache and ONE get_move_type in the whole codebase.
+# =============================================================================
+
+_move_type_cache: dict[str, str] = {}
+
+
+def register_move_type(move_id: str, move_type: str) -> None:
+    """Cache a move's type seen from a live poke-env Move object."""
+    _move_type_cache[move_id.lower()] = move_type.lower()
+
+
+def get_move_type(move_id: str) -> str | None:
+    """
+    Return the type string for a move, or None if unknown.
+
+    Resolution order:
+      1. Runtime cache (populated from live battle data via register_move_type)
+      2. Static MOVES table in this file
+    """
+    key = move_id.lower().replace(' ', '').replace('-', '')
+    cached = _move_type_cache.get(key)
+    if cached:
+        return cached
+    m = MOVES.get(key)
+    return m[1] if m else None
+
+
+def is_damaging(move_id: str) -> bool:
+    """True if the move deals damage (physical, special, fixed, or ohko)."""
+    return get_move_category(move_id) != 'status'
+
+
+def average_hits(move_id: str) -> float:
+    """
+    Return the expected number of hits for a move.
+    Multi-hit (2-5): average is ~3.17 in Gen 1 (uniform distribution).
+    """
+    key = move_id.lower().replace(' ', '').replace('-', '')
+    m = MOVES.get(key)
+    if not m:
+        return 1.0
+    lo, hi = m[2]
+    if lo == hi:
+        return float(lo)
+    return sum(range(lo, hi + 1)) / (hi - lo + 1)
+
 
 
 # =============================================================================
