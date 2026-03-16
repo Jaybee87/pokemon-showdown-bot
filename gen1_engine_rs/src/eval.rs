@@ -67,10 +67,19 @@ pub fn evaluate(state: &BattleState) -> f64 {
         let heal_value = (0.50 - (0.55 - state.theirs.active.hp_frac as f64)).max(0.0) * 250.0;
         score -= heal_value;
     }
-    // Toxic urgency: a Toxiced mon with a heal should use it NOW — escalating
-    // damage will kill it faster than the heal bonus above captures.
+    // Penalise healing at full or near-full HP — Softboiled/Recover at 100% is
+    // a wasted turn. This prevents the engine locking into a mutual stall loop
+    // where both sides preemptively heal rather than pressing damage.
+    // The threshold is 0.90: above that, healing costs more than it gains.
+    if our_has_heal && state.ours.active.hp_frac >= 0.90 {
+        score -= 150.0;
+    }
+    if their_has_heal && state.theirs.active.hp_frac >= 0.90 {
+        score += 150.0;  // opponent wasting a heal turn is good for us
+    }
+    // Toxic urgency: a Toxiced mon with a heal should use it NOW.
     if our_has_heal && state.ours.active.status == Status::Tox {
-        score += 200.0;  // bonus for being in a state where healing is correct
+        score += 200.0;
     }
     if their_has_heal && state.theirs.active.status == Status::Tox {
         score -= 200.0;

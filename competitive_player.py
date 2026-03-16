@@ -249,6 +249,8 @@ class CompetitivePlayer(Player):
         # Prevents re-firing a sleep move that missed last turn.
         self._sleep_attempted_vs: dict = {}
         self._last_rust_result:   dict = {}
+        self._last_healed_turn:   int  = -99
+        self._last_healed_species: str = ""
         self._rust_engine = RustEngine(
             algorithm="auto",
             depth=4,
@@ -469,6 +471,8 @@ LEAD: <species>"""
             self._sleep_clause_active  = False
             self._sleep_turns          = {}
             self._sleep_attempted_vs   = {}
+            self._last_healed_turn     = -99
+            self._last_healed_species  = ""
 
         # Sleep Clause tracking
         if not self._sleep_clause_active:
@@ -720,21 +724,17 @@ LEAD: <species>"""
         # ==================================================================
         if my_status_now and my_status_now.name == 'TOX':
             heal_move = next(
-                (m for m in real_moves if m.id in ('softboiled', 'recover')), None
+                (m for m in real_moves if m.id in ('softboiled', 'recover', 'rest')), None
             )
             if heal_move:
                 print(f"  💊 PYTHON: Toxiced — healing with {heal_move.id}")
+                self._last_healed_turn    = battle.turn
+                self._last_healed_species = my_species
                 self._python_call_count += 1
                 return self.create_order(heal_move)
 
         # ==================================================================
-        # STEP 7c — Low-HP heal: any status + below 40% HP + heal available.
-        # At this HP level, healing is almost always correct: we recover 50%
-        # and force the opponent to deal 90%+ total damage to kill us, buying
-        # at least one extra turn. The Rust eval's heal bonus isn't weighted
-        # enough to beat raw damage scores — enforce this as a hard rule.
-        # Exception: skip if the opponent is on their last mon and we can win
-        # the damage race (don't stall when we're already winning).
+        # STEP 7c — Low-HP heal: below 40% HP + heal available.
         # ==================================================================
         if my_hp_frac < 0.40:
             heal_move = next(
@@ -743,10 +743,11 @@ LEAD: <species>"""
             if heal_move:
                 opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
                 our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
-                # Skip healing only if we clearly win without it (last opp mon, we're ahead)
                 skip_heal = (opp_alive == 1 and our_alive >= 2)
                 if not skip_heal:
                     print(f"  💊 PYTHON: low HP ({int(my_hp_frac*100)}%) — healing with {heal_move.id}")
+                    self._last_healed_turn    = battle.turn
+                    self._last_healed_species = my_species
                     self._python_call_count += 1
                     return self.create_order(heal_move)
 
@@ -793,6 +794,33 @@ LEAD: <species>"""
                       f"— using {alt.id} instead")
                 self._python_call_count += 1
                 return self.create_order(alt)
+
+        # Post-process: veto Softboiled/Recover when above 70% HP and we
+        # already healed last turn. Prevents the infinite stall loop where
+        # minimax locks onto score=1595 and heals every turn forever.
+        # The 2-turn cooldown forces the engine to make progress with damage.
+        last_action_id = last.get('action', {}).get('id', '')
+        if last_action_id in ('softboiled', 'recover'):
+            turns_since_heal = battle.turn - self._last_healed_turn
+            same_species = (self._last_healed_species == my_species)
+            if turns_since_heal <= 2 and same_species and my_hp_frac >= 0.70:
+                # Find best damaging alternative
+                alt = next(
+                    (m for m in real_moves
+                     if m.id not in ('softboiled', 'recover', 'rest')
+                     and (m.base_power or 0) > 0),
+                    None
+                )
+                if alt:
+                    print(f"  🚫 PYTHON: heal cooldown ({turns_since_heal}t ago, "
+                          f"{int(my_hp_frac*100)}% HP) — attacking with {alt.id}")
+                    self._python_call_count += 1
+                    return self.create_order(alt)
+
+        # Track if we are about to heal
+        if last_action_id in ('softboiled', 'recover'):
+            self._last_healed_turn    = battle.turn
+            self._last_healed_species = my_species
 
         return rust_result
 
