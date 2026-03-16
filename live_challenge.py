@@ -91,8 +91,29 @@ class ShowdownLogFilter(logging.Filter):
         'Sending authentication',
     ]
 
+    @staticmethod
+    def _parse_rating_line(raw_line):
+        """
+        Convert a Showdown |raw| rating line to a clean one-liner.
+        Input:  |raw|JofarLLM's rating: 1079 &rarr; <strong>1071</strong><br />(-8 for losing)
+        Output: JofarLLM's rating: 1079 → 1071  (-8 for losing)
+        Returns None if the line doesn't match the pattern.
+        """
+        m = re.search(r"\|raw\|(.+?)'s rating: (\d+) &rarr; <strong>(\d+)</strong><br />\(([^)]+)\)", raw_line)
+        if m:
+            name, old, new, delta = m.group(1), m.group(2), m.group(3), m.group(4)
+            return f"{name}'s rating: {old} → {new}  ({delta})"
+        return None
+
     def filter(self, record):
         msg = record.getMessage()
+
+        # Intercept |raw| rating change lines — parse and reprint cleanly
+        if '|raw|' in msg and '&rarr;' in msg and 'rating:' in msg:
+            clean = self._parse_rating_line(msg)
+            if clean:
+                print(clean)
+            return False  # block the raw HTML version regardless
 
         # Block known-harmless warnings before the general pass-through
         HARMLESS_WARNINGS = [
@@ -297,9 +318,15 @@ async def run_challenge(opponent_name, team, n_battles=1, format_name="gen1ou"):
         return
 
     wins = sum(1 for b in player.battles.values() if b.won)
+    total_decisions = (player._python_call_count
+                       + player._rust_call_count
+                       + player._llm_call_count)
     print(f"\n📊 Final: {wins}/{n_battles} wins vs {opponent_name}")
     print(f"   Python decisions: {player._python_call_count}")
+    print(f"   Rust decisions:   {player._rust_call_count}")
     print(f"   LLM decisions:    {player._llm_call_count}")
+    if total_decisions > 0:
+        print(f"   Rust involvement: {int(player._rust_call_count / total_decisions * 100)}%")
 
 
 # =============================================================================
@@ -316,6 +343,7 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
     games_completed = 0
     total_wins = 0
     total_py = 0
+    total_rust = 0
     total_llm = 0
     max_retries = 5
 
@@ -362,8 +390,9 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
                 games_completed += 1
                 if b.won:
                     total_wins += 1
-            total_py += player._python_call_count
-            total_llm += player._llm_call_count
+            total_py   += player._python_call_count
+            total_rust += player._rust_call_count
+            total_llm  += player._llm_call_count
             retry_count = 0  # reset on success
 
         except (ConnectionError, OSError, Exception) as e:
@@ -380,8 +409,9 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
                         games_completed += 1
                         if b.won:
                             total_wins += 1
-                total_py += player._python_call_count
-                total_llm += player._llm_call_count
+                total_py   += player._python_call_count
+                total_rust += player._rust_call_count
+                total_llm  += player._llm_call_count
 
             if is_disconnect:
                 retry_count += 1
@@ -396,8 +426,12 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
 
     print(f"\n📊 Final: {total_wins}W / {games_completed - total_wins}L "
           f"across {games_completed} games")
+    total_decisions = total_py + total_rust + total_llm
     print(f"   Python decisions: {total_py}")
+    print(f"   Rust decisions:   {total_rust}")
     print(f"   LLM decisions:    {total_llm}")
+    if total_decisions > 0:
+        print(f"   Rust involvement: {int(total_rust / total_decisions * 100)}%")
 
 
 # =============================================================================
@@ -415,6 +449,7 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
     games_completed = 0
     total_wins = 0
     total_py = 0
+    total_rust = 0
     total_llm = 0
     max_retries = 5
     last_rating = None
@@ -457,8 +492,9 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
                     total_wins += 1
                 if b.rating:
                     last_rating = b.rating
-            total_py += player._python_call_count
-            total_llm += player._llm_call_count
+            total_py   += player._python_call_count
+            total_rust += player._rust_call_count
+            total_llm  += player._llm_call_count
             retry_count = 0  # reset on success
 
         except (ConnectionError, OSError, Exception) as e:
@@ -479,8 +515,9 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
                         if b.rating:
                             last_rating = b.rating
                 games_completed += session_counted
-                total_py += player._python_call_count
-                total_llm += player._llm_call_count
+                total_py   += player._python_call_count
+                total_rust += player._rust_call_count
+                total_llm  += player._llm_call_count
 
             if is_disconnect:
                 retry_count += 1
@@ -495,8 +532,12 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
 
     print(f"\n📊 Ladder results: {total_wins}W / {games_completed - total_wins}L "
           f"across {games_completed} games")
+    total_decisions = total_py + total_rust + total_llm
     print(f"   Python decisions: {total_py}")
+    print(f"   Rust decisions:   {total_rust}")
     print(f"   LLM decisions:    {total_llm}")
+    if total_decisions > 0:
+        print(f"   Rust involvement: {int(total_rust / total_decisions * 100)}%")
     if last_rating:
         print(f"   Rating: {last_rating}")
 

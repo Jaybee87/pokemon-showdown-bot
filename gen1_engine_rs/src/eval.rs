@@ -51,18 +51,15 @@ pub fn evaluate(state: &BattleState) -> f64 {
     score += status_score(&state.ours.active)   *  1.0;
     score += status_score(&state.theirs.active) * -1.0;
 
-    // ── 4b. Healing move availability bonus ───────────────────────────────
-    // A mon with Recover/Softboiled at low HP is worth more than its current
-    // HP suggests — it can restore 50% next turn. This nudges the search
-    // toward using heals proactively rather than attacking into death.
+    // ── 4b. Healing move availability and urgency ─────────────────────────
     let our_has_heal = state.ours.active.moves.iter().any(|m| {
         matches!(m.as_str(), "recover" | "softboiled")
     });
     let their_has_heal = state.theirs.active.moves.iter().any(|m| {
         matches!(m.as_str(), "recover" | "softboiled")
     });
+    // Low HP + heal available = more valuable than current HP suggests
     if our_has_heal && state.ours.active.hp_frac < 0.55 {
-        // Below 55% with a heal available: award expected recovery value
         let heal_value = (0.50 - (0.55 - state.ours.active.hp_frac as f64)).max(0.0) * 250.0;
         score += heal_value;
     }
@@ -70,16 +67,23 @@ pub fn evaluate(state: &BattleState) -> f64 {
         let heal_value = (0.50 - (0.55 - state.theirs.active.hp_frac as f64)).max(0.0) * 250.0;
         score -= heal_value;
     }
+    // Toxic urgency: a Toxiced mon with a heal should use it NOW — escalating
+    // damage will kill it faster than the heal bonus above captures.
+    if our_has_heal && state.ours.active.status == Status::Tox {
+        score += 200.0;  // bonus for being in a state where healing is correct
+    }
+    if their_has_heal && state.theirs.active.status == Status::Tox {
+        score -= 200.0;
+    }
 
     // ── 5. Recharge penalty ───────────────────────────────────────────────
-    // Increased from 280 to 350: a free turn in Gen 1 is enormously valuable.
     if state.ours.active.recharging   { score -= 350.0; }
     if state.theirs.active.recharging { score += 350.0; }
 
     // ── 6. Screens ────────────────────────────────────────────────────────
-    if state.ours.reflect        { score += state.ours.reflect_turns       as f64 * 15.0; }
-    if state.ours.light_screen   { score += state.ours.light_screen_turns  as f64 * 15.0; }
-    if state.theirs.reflect      { score -= state.theirs.reflect_turns     as f64 * 15.0; }
+    if state.ours.reflect        { score += state.ours.reflect_turns        as f64 * 15.0; }
+    if state.ours.light_screen   { score += state.ours.light_screen_turns   as f64 * 15.0; }
+    if state.theirs.reflect      { score -= state.theirs.reflect_turns      as f64 * 15.0; }
     if state.theirs.light_screen { score -= state.theirs.light_screen_turns as f64 * 15.0; }
 
     // ── 7. Speed advantage ────────────────────────────────────────────────
@@ -89,9 +93,10 @@ pub fn evaluate(state: &BattleState) -> f64 {
     score += spe_ratio.clamp(-1.0, 1.0) * 80.0;
 
     // ── 8. KO threat ──────────────────────────────────────────────────────
-    // Don't count Hyperbeam as a KO threat when paralysed — too risky.
     let we_threaten = state.ours.active.moves.iter().any(|mid| {
         if mid == "hyperbeam" && state.ours.active.status == Status::Par { return false; }
+        // Don't count HB as a threat if opponent has a heal — they recover on the free turn
+        if mid == "hyperbeam" && their_has_heal { return false; }
         can_ko(&state.ours.active, mid, &state.theirs.active)
     });
     let they_threaten = state.theirs.active.moves.iter()
@@ -100,29 +105,28 @@ pub fn evaluate(state: &BattleState) -> f64 {
     if they_threaten { score -= 220.0; }
 
     // ── 9. Hyperbeam-specific penalties ───────────────────────────────────
-    // A) Paralysed user + recharge = catastrophic.
+    let opp_has_heal = their_has_heal; // already computed above
+    // A) Paralysed user + recharge.
     if state.ours.active.recharging && state.ours.active.status == Status::Par {
-        score -= 300.0;  // increased from 200
+        score -= 300.0;
     }
-    // B) Turn 1-3 recharge: opponent exploits the free turn early.
+    // B) Early-game recharge.
     if state.ours.active.recharging && state.turn <= 3 {
         score -= 150.0;
     }
-    // C) Opponent has a healing move (Softboiled / Recover / Rest) AND we are
-    //    recharging — they will heal on our free turn, making HB a net-zero
-    //    or negative trade. This is the core Chansey/Starmie stall trap.
-    let opp_has_heal = state.theirs.active.moves.iter().any(|m| {
-        matches!(m.as_str(), "softboiled" | "recover" | "rest")
-    });
+    // C) Opponent has healing move + we are recharging — they heal for free.
     if state.ours.active.recharging && opp_has_heal {
-        score -= 400.0;
+        score -= 500.0;  // increased from 400 — this is a confirmed trap
     }
-    // D) We are paralysed AND opponent has a healing move — even without
-    //    recharge, Hyperbeam is very risky because para + recharge means
-    //    two consecutive wasted turns while they heal. Penalise the move
-    //    being in our kit by reducing KO-threat bonus for HB specifically.
+    // D) Paralysed + opponent has healer — HB is nearly always wrong.
     if state.ours.active.status == Status::Par && opp_has_heal {
         score -= 120.0;
+    }
+    // E) HB available but opponent has heal — penalise having it as the best
+    //    option pre-emptively. This nudges the search away from HB lines.
+    let we_have_hb = state.ours.active.moves.iter().any(|m| m == "hyperbeam");
+    if we_have_hb && opp_has_heal && !state.ours.active.recharging {
+        score -= 80.0;
     }
 
     // ── 10. Substitute value ──────────────────────────────────────────────
@@ -138,8 +142,10 @@ pub fn evaluate(state: &BattleState) -> f64 {
     if state.theirs.active.is_trapped() { score +=  60.0; }
 
     // ── 13. Bench quality ─────────────────────────────────────────────────
-    score += bench_quality(&state.ours.bench,   &state.theirs.active) * 0.4;
-    score -= bench_quality(&state.theirs.bench, &state.ours.active)   * 0.4;
+    // Weight reduced from 0.4 to 0.2 to reduce switch oscillation — the search
+    // was over-valuing bench mons and switching every turn against neutral targets.
+    score += bench_quality(&state.ours.bench,   &state.theirs.active) * 0.2;
+    score -= bench_quality(&state.theirs.bench, &state.ours.active)   * 0.2;
 
     score
 }

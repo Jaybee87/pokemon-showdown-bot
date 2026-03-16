@@ -248,6 +248,7 @@ class CompetitivePlayer(Player):
         # Sleep move tracking: species.lower() → move_id attempted
         # Prevents re-firing a sleep move that missed last turn.
         self._sleep_attempted_vs: dict = {}
+        self._last_rust_result:   dict = {}
         self._rust_engine = RustEngine(
             algorithm="auto",
             depth=4,
@@ -715,57 +716,104 @@ LEAD: <species>"""
                 return self.create_order(sleep_move)
 
         # ==================================================================
+        # STEP 7b — Toxic heal: if we are Badly Poisoned, heal immediately.
+        # ==================================================================
+        if my_status_now and my_status_now.name == 'TOX':
+            heal_move = next(
+                (m for m in real_moves if m.id in ('softboiled', 'recover')), None
+            )
+            if heal_move:
+                print(f"  💊 PYTHON: Toxiced — healing with {heal_move.id}")
+                self._python_call_count += 1
+                return self.create_order(heal_move)
+
+        # ==================================================================
+        # STEP 7c — Low-HP heal: any status + below 40% HP + heal available.
+        # At this HP level, healing is almost always correct: we recover 50%
+        # and force the opponent to deal 90%+ total damage to kill us, buying
+        # at least one extra turn. The Rust eval's heal bonus isn't weighted
+        # enough to beat raw damage scores — enforce this as a hard rule.
+        # Exception: skip if the opponent is on their last mon and we can win
+        # the damage race (don't stall when we're already winning).
+        # ==================================================================
+        if my_hp_frac < 0.40:
+            heal_move = next(
+                (m for m in real_moves if m.id in ('softboiled', 'recover')), None
+            )
+            if heal_move:
+                opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+                our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
+                # Skip healing only if we clearly win without it (last opp mon, we're ahead)
+                skip_heal = (opp_alive == 1 and our_alive >= 2)
+                if not skip_heal:
+                    print(f"  💊 PYTHON: low HP ({int(my_hp_frac*100)}%) — healing with {heal_move.id}")
+                    self._python_call_count += 1
+                    return self.create_order(heal_move)
+
+        # ==================================================================
+        # STEP 7d — Paralysed + Hyperbeam suppression.
+        # When we are paralysed, strip Hyperbeam from the move list before
+        # passing to Rust. PAR means 25% fully-wasted turns; HB adds a
+        # guaranteed recharge turn on top — two consecutive dead turns while
+        # the opponent acts freely. Rust's eval penalties don't overcome the
+        # raw damage scores. Only allow HB if no other damaging move exists.
+        # ==================================================================
+        my_is_par = my_status_now and my_status_now.name == 'PAR'
+        if my_is_par and any(m.id == 'hyperbeam' for m in real_moves):
+            non_hb = [m for m in real_moves if m.id != 'hyperbeam']
+            has_damage_alt = any((m.base_power or 0) > 0 for m in non_hb)
+            if has_damage_alt:
+                real_moves = non_hb
+                print(f"  🚫 PYTHON: paralysed — suppressing Hyperbeam")
+
+        # ==================================================================
         # STEP 8 — RUST ENGINE
         # Everything else: switch timing, Hyperbeam risk/reward, Thunder Wave,
         # matchup evaluation, stall breaks, damage races, late-game decisions.
         # ==================================================================
-        rust_order = self._try_rust_engine(battle)
-        if rust_order:
-            return rust_order
+        # Pass the filtered move list so suppressed moves (e.g. HB when PAR)
+        # are never visible to the search.
+        active_move_ids = [m.id for m in real_moves]
+        rust_result = self._try_rust_engine(battle, active_move_ids=active_move_ids)
 
-        # ==================================================================
-        # STEP 9 — LLM fallback (Rust errored or returned illegal action)
-        # ==================================================================
+        if rust_result is None:
+            return self._llm_fallback(battle, real_moves, switches)
+
+        # Post-process: veto Hyperbeam when position is deeply losing
+        last = getattr(self, '_last_rust_result', {})
+        if (last.get('action', {}).get('id') == 'hyperbeam'
+                and last.get('score', 0) < -2000):
+            alt = next(
+                (m for m in real_moves
+                 if m.id != 'hyperbeam' and m.base_power and m.base_power > 0),
+                None
+            )
+            if alt:
+                print(f"  🚫 PYTHON: vetoing Hyperbeam (score={last['score']:.0f}, losing) "
+                      f"— using {alt.id} instead")
+                self._python_call_count += 1
+                return self.create_order(alt)
+
+        return rust_result
+
+    def _llm_fallback(self, battle, real_moves, switches):
+        """LLM fallback when Rust engine is unavailable or errored."""
+        my_poke  = battle.active_pokemon
+        opp_poke = battle.opponent_active_pokemon
+        my_types  = get_pokemon_types(my_poke)
+        opp_types = get_pokemon_types(opp_poke)
+
         reason_str = "rust engine unavailable — LLM fallback"
         print(f"\n  🤖 LLM FALLBACK: {reason_str}")
 
         best_move, _ = best_move_effectiveness(
             real_moves, opp_types, attacker_types=my_types
         )
-        opp_known_names = self._opponent_move_names.get(opp_poke.species, [])
+        opp_known_names = self._opponent_move_names.get(opp_poke.species.lower(), [])
         print(f"     Opponent known moves: {opp_known_names or 'none'}")
 
-        prompt, valid_moves, valid_switches = build_battle_prompt(
-            battle, real_moves, switches,
-            self._opponent_move_types, reason_str
-        )
-        raw, err = await call_llm_async(prompt, timeout=self._llm_timeout)
-
-        if err:
-            print(f"  LLM error: {err}")
-        elif raw:
-            print(f"\n  💭 LLM REASONING:")
-            for line in strip_think_tags(raw).split('\n'):
-                print(f"     {line}")
-
-            action_type, action_id = parse_battle_decision(raw, valid_moves, valid_switches)
-            norm = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
-
-            if action_type == 'move' and action_id:
-                chosen = next((m for m in real_moves if norm(m.id) == norm(action_id)), None)
-                if chosen:
-                    print(f"  ✅ LLM: {chosen.id}")
-                    self._llm_call_count += 1
-                    return self.create_order(chosen)
-
-            elif action_type == 'switch' and action_id:
-                chosen = next((p for p in switches if norm(p.species) == norm(action_id)), None)
-                if chosen:
-                    print(f"  ✅ LLM: switch {chosen.species}")
-                    self._llm_call_count += 1
-                    return self.create_order(chosen)
-
-        # Hard fallback
+        # Hard fallback — LLM is async but we're in a sync context here.
+        # Return best move immediately to avoid blocking.
         if best_move:
             print(f"  🔄 HARD FALLBACK: {best_move.id}")
             self._python_call_count += 1
@@ -776,19 +824,24 @@ LEAD: <species>"""
     # Rust engine helpers
     # -------------------------------------------------------------------------
 
-    def _try_rust_engine(self, battle):
+    def _try_rust_engine(self, battle, active_move_ids: list = None):
         """
         Query the Rust engine for a normal (non-faint) decision.
-        Returns a poke-env BattleOrder or None on failure.
+        active_move_ids: optional filtered list of move IDs to present to Rust.
+                         If None, uses the full moveset from poke-env.
         """
+        self._last_rust_result = {}
         try:
-            result = self._rust_engine.choose_from_battle(
-                battle, sleep_turns=self._sleep_turns
-            )
+            state = build_state(battle, sleep_turns=self._sleep_turns)
+            # Apply move suppression — replace active's moves with the filtered list
+            if active_move_ids is not None:
+                state["ours"]["active"]["moves"] = active_move_ids
+            result = self._rust_engine.choose(state)
             if "error" in result:
                 print(f"  ⚠️  Rust engine error: {result['error']}")
                 return None
 
+            self._last_rust_result = result
             action = result.get("action", {})
             atype  = action.get("type")
             algo   = result.get("algorithm", "rust")
@@ -798,14 +851,10 @@ LEAD: <species>"""
             label  = action.get("id") or action.get("species") or atype or "?"
 
             # ── Handle __sleep_frz__ internal token ───────────────────────
-            # Rust returns this when the active mon is frozen/asleep and
-            # can't act.  It means "I can't do anything useful" — we should
-            # switch if possible, else just pick the best available move.
             if atype == "move" and action.get("id") == "__sleep_frz__":
                 print(f"  ⚙️  RUST: active is frozen/asleep — finding best switch")
                 switches = battle.available_switches
                 if switches:
-                    # Pick the non-asleep bench mon with most HP
                     best = max(
                         (p for p in switches
                          if not (p.status and p.status.name in ('SLP', 'FRZ'))),
@@ -815,7 +864,6 @@ LEAD: <species>"""
                     print(f"  ✅ RUST [frozen/sleep switch]: {best.species}")
                     self._rust_call_count += 1
                     return self.create_order(best)
-                # No switches — queue best damaging move
                 real_moves = [m for m in battle.available_moves
                               if m.id not in ('struggle', 'recharge', '__sleep_frz__')]
                 if real_moves:
@@ -837,6 +885,22 @@ LEAD: <species>"""
         except Exception as e:
             print(f"  ⚠️  Rust engine exception: {e}")
             return None
+
+    def _llm_fallback(self, battle, real_moves, switches):
+        """Hard fallback when Rust engine is unavailable or errored."""
+        my_poke  = battle.active_pokemon
+        opp_poke = battle.opponent_active_pokemon
+        my_types  = get_pokemon_types(my_poke)
+        opp_types = get_pokemon_types(opp_poke)
+
+        print(f"\n  🔄 HARD FALLBACK: rust unavailable")
+        best_move, _ = best_move_effectiveness(
+            real_moves, opp_types, attacker_types=my_types
+        )
+        if best_move:
+            self._python_call_count += 1
+            return self.create_order(best_move)
+        return self.choose_default_move()
 
     def _try_rust_faint_switch(self, battle, switches):
         """
