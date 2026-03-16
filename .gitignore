@@ -1,6 +1,9 @@
 # Credentials (NEVER commit)
 credentials.py
 
+# Rust / Cargo
+gen1_engine_rs/target/
+
 # Python
 __pycache__/
 *.pyc

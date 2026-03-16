@@ -6,20 +6,7 @@ Battle-layer functions that require poke-env objects.
 Layer contract
 --------------
 This file deals with live battle state — poke-env Battle objects, Pokemon
-objects, and Move objects. Pure data and calculations that operate only on
-species strings / move IDs live in gen1_data.py and are imported from there.
-
-What belongs here
------------------
-- get_pokemon_types()        — reads poke-env Pokemon.type_1 / type_2
-- best_move_effectiveness()  — iterates poke-env Move objects
-- worst_incoming_effectiveness() — battle-context helper
-- find_best_switch()         — takes a poke-env Battle object
-- resolve_move_types()       — converts move-ID lists using the shared cache
-- find_best_matchup_switch() — iterates poke-env switch objects
-
-Everything else (type chart, damage calc, KO checks, speed, matchup scoring)
-lives in gen1_data and is re-exported below for backwards compatibility.
+objects, and Move objects.
 
 Public API
 ----------
@@ -481,8 +468,6 @@ def find_best_switch(battle, threat_type=None):
 
 # =============================================================================
 # MOVE TYPE RESOLUTION
-# register_move_type / get_move_type are imported from gen1_data — the runtime
-# cache lives there so there is exactly one cache for the whole process.
 # resolve_move_types is a convenience wrapper kept here as part of the engine API.
 # =============================================================================
 
@@ -545,8 +530,6 @@ def average_hits(move_id: str) -> float:
 
 # =============================================================================
 # MATCHUP SWITCH FINDER
-# evaluate_matchup() lives in gen1_data (pure species-string math).
-# find_best_matchup_switch() lives here because it iterates poke-env switch
 # objects to read .species / .current_hp_fraction / .status.
 # =============================================================================
 

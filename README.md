@@ -86,9 +86,9 @@ pokemon-showdown-bot/
 ├── main.py                # Entry point — battle menu, preflight, logging
 ├── live_challenge.py      # Live Showdown connection (accept/challenge/ladder)
 ├── competitive_player.py  # Hybrid Python/LLM decision engine
-├── gen1_engine.py         # Gen 1 math and calculations
-├── gen1_data.py           # Gen 1 Data Values, Base Stats, Typing and full Moves.
-├── llm_bridge.py          # All LLM interaction — async, thread-safe, system prompt
+    ├── llm_bridge.py      # All LLM interaction — async, thread-safe, system prompt
+    ├── gen1_engine.py     # Gen 1 math and calculations
+        ├── gen1_data.py   # Gen 1 Data Values, Base Stats, Typing and full Moves.
 ├── config.py              # Central config — model, timeouts, server URLs
 ├── credentials.py         # Bot's Showdown login (gitignored)
 ├── teams/                 # Team files (gitignored)
@@ -97,7 +97,7 @@ pokemon-showdown-bot/
     ├── team_generator.py  # LLM-driven team builder with battle feedback loop
     ├── battle_runner.py   # Local stress tester (StatTrackingPlayer vs RandomPlayer)
     └── gen1_data.py       # Pokemon/move data from pokered ASM + Showdown tiers
-    └── gen1_calc.py           # Damage calculator, speed table, matchup evaluator
+    └── gen1_calc.py       # Damage calculator, speed table, matchup evaluator
 ```
 
 ---

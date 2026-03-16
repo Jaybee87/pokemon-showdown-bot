@@ -147,10 +147,8 @@ async def run_battle(team_path, mode, n_battles, format_name, opponent=None):
 # INTERACTIVE MENU
 # =============================================================================
 
-def show_menu():
+def show_menu(latest):
     """Show the main menu and return the user's choice."""
-    latest = find_latest_team()
-
     print(f"\n{'='*60}")
     print(f"Pokemon Showdown Bot")
     print(f"   LLM:     {LLM_MODEL} (ctx: {LLM_CONTEXT_LENGTH})")
@@ -165,7 +163,6 @@ def show_menu():
     print()
     print(f"  1. Battle (ladder)  — play ranked games on Showdown")
     print(f"  2. Battle (accept)  — wait for challenges from your browser")
-    print(f"  3. Import a team    — place your own team file in teams/")
     print()
 
     while True:
@@ -210,18 +207,29 @@ if __name__ == "__main__":
     parser.add_argument("--format", default="gen1ou", help="Format (default: gen1ou)")
 
     args = parser.parse_args()
+    
+    # Run Pre-Flight Checks
+    if not run_preflight():
+        sys.exit(1)
 
-    # Direct mode via flags
+    latest = find_latest_team()
+    if not latest:
+        print("❌ No team found. Place a team file in teams/")
+        print(f"\n  Place your team file in teams/ with the format:")
+        print(f"    teams/team_ou_iteration_N.txt")
+        print(f"\n  The bot uses the highest-numbered iteration.")
+        print(f"  Format: one Pokemon per block, moves prefixed with '- '")
+        print(f"\n  Example:")
+        print(f"    Tauros")
+        print(f"    - bodyslam")
+        print(f"    - hyperbeam")
+        print(f"    - earthquake")
+        print(f"    - blizzard")
+        print(f"\n  Separate Pokemon with a blank line.")
+        sys.exit(1)
+
+    # Did the user bypass args?
     if args.ladder or args.accept or args.opponent:
-        if not run_preflight():
-            sys.exit(1)
-
-        latest = find_latest_team()
-        if not latest:
-            print("❌ No team found. Place a team file in teams/")
-            print("   Format: teams/team_ou_iteration_1.txt")
-            sys.exit(1)
-
         # Determine battle mode
         if args.ladder:
             mode = 'ladder'
@@ -245,16 +253,9 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # Interactive menu
-    choice = show_menu()
+    choice = show_menu(latest)
 
-    if choice == '1':
-        if not run_preflight():
-            sys.exit(1)
-        latest = find_latest_team()
-        if not latest:
-            print("❌ No team found. Place a team file in teams/ (option 3).")
-            sys.exit(1)
-
+    if choice == '1': # Ladder
         try:
             n = int(input("How many ladder games? [20]: ").strip() or "20")
         except (ValueError, EOFError, KeyboardInterrupt):
@@ -270,14 +271,7 @@ if __name__ == "__main__":
             tee.close()
             print(f"\nLog saved to: {log_path}")
 
-    elif choice == '2':
-        if not run_preflight():
-            sys.exit(1)
-        latest = find_latest_team()
-        if not latest:
-            print("❌ No team found. Place a team file in teams/ (option 3).")
-            sys.exit(1)
-
+    elif choice == '2': # Wait for Challenge
         log_path, tee = setup_logging()
 
         try:
@@ -288,15 +282,4 @@ if __name__ == "__main__":
             tee.close()
             print(f"\nLog saved to: {log_path}")
 
-    elif choice == '3':
-        print(f"\n  Place your team file in teams/ with the format:")
-        print(f"    teams/team_ou_iteration_N.txt")
-        print(f"\n  The bot uses the highest-numbered iteration.")
-        print(f"  Format: one Pokemon per block, moves prefixed with '- '")
-        print(f"\n  Example:")
-        print(f"    Tauros")
-        print(f"    - bodyslam")
-        print(f"    - hyperbeam")
-        print(f"    - earthquake")
-        print(f"    - blizzard")
-        print(f"\n  Separate Pokemon with a blank line.")
+        
