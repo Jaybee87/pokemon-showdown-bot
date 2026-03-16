@@ -70,9 +70,11 @@ fn main() {
                 inference::infer_moves(p, 4);
             }
         }
-        if state.ours.active.moves.is_empty() {
-            inference::infer_moves(&mut state.ours.active, 4);
-        }
+        // Only infer our moves if we have some already — an empty list means
+        // the Python side deliberately sent a faint-switch query where only
+        // switches are legal. Refilling moves here would cause the engine to
+        // return a move action instead of a switch.
+        // (A non-empty but incomplete list is fine to top up.)
 
         let decision = run_search(&state, &algorithm, depth, iterations, time_ms);
         writeln!(out, "{}", serde_json::to_string(&decision).unwrap_or_default()).ok();

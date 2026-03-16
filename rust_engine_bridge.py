@@ -142,43 +142,53 @@ def _disabled_move(poke) -> str:
 
 # ─── State builder ────────────────────────────────────────────────────────────
 
-def poke_dict(p, move_ids: Optional[list] = None) -> dict:
+def poke_dict(p, move_ids: Optional[list] = None, sleep_turns_override: int = 0) -> dict:
     """Convert a poke-env Pokémon to the Rust engine's BattlePoke schema."""
     boosts = {}
     if hasattr(p, "boosts") and p.boosts:
         for k, v in p.boosts.items():
             boosts[str(k)] = int(v)
 
+    VALID_STATUSES = {"SLP", "PAR", "PSN", "TOX", "BRN", "FRZ"}
     status_name = "NONE"
     if p.status:
-        status_name = p.status.name.upper()
+        raw = p.status.name.upper()
+        status_name = raw if raw in VALID_STATUSES else "NONE"
 
     moves = move_ids if move_ids is not None else [m.id for m in p.moves.values()]
 
-    # Sleep turns: poke-env may store this as p.sleep_turn_count or similar
+    # Sleep turns: use the caller-supplied override (tracked externally) if available,
+    # otherwise fall back to poke-env attributes, otherwise use a conservative estimate.
     sleep_turns = 0
     if status_name == "SLP":
-        sleep_turns = getattr(p, "sleep_turn_count", 0) or 0
-        if sleep_turns == 0:
-            sleep_turns = 3  # expected remaining if we don't know
+        if sleep_turns_override > 0:
+            sleep_turns = sleep_turns_override
+        else:
+            sleep_turns = (
+                getattr(p, "sleep_turn_count", None)
+                or getattr(p, "sleep_turns", None)
+                or 0
+            )
+            if sleep_turns == 0:
+                sleep_turns = 4  # conservative mid-range estimate (Gen 1: 1-7 turns)
 
     return {
-        "species":        p.species.lower(),
-        "hp_frac":        float(p.current_hp_fraction or 0.0),
-        "moves":          moves,
-        "status":         status_name,
-        "boosts":         boosts,
-        "fainted":        bool(p.fainted),
-        "sub_hp_frac":    0.0,          # TODO: track via poke-env effects
-        "sleep_turns":    int(sleep_turns),
-        "recharging":     _is_recharging(p),
-        "toxic_counter":  _toxic_counter(p),
-        "trapping_turns": _trapping_turns(p),
-        "confused":       _is_confused(p),
+        "species":         p.species.lower(),
+        "hp_frac":         float(p.current_hp_fraction or 0.0),
+        "moves":           moves,
+        "status":          status_name,
+        "boosts":          boosts,
+        "fainted":         bool(p.fainted),
+        "sub_hp_frac":     0.0,
+        "sleep_turns":     int(sleep_turns),
+        "recharging":      _is_recharging(p),
+        "toxic_counter":   _toxic_counter(p),
+        "trapping_turns":  _trapping_turns(p),
+        "confused":        _is_confused(p),
         "confusion_turns": _confusion_turns(p),
-        "crit_stage":     0,
-        "disabled_move":  _disabled_move(p),
-        "disable_turns":  0,
+        "crit_stage":      0,
+        "disabled_move":   _disabled_move(p),
+        "disable_turns":   0,
     }
 
 
@@ -204,25 +214,51 @@ def side_dict(active, bench_pokes, side_conditions=None) -> dict:
     }
 
 
-def build_state(battle) -> dict:
+def build_state(battle, sleep_turns: dict = None) -> dict:
     """
     Convert a poke-env Battle into the JSON dict the Rust engine expects.
-    This is the main entry point — call it at the top of your engine decide function.
-    """
-    my_active    = battle.active_pokemon
-    opp_active   = battle.opponent_active_pokemon
 
-    my_bench     = [p for p in battle.available_switches if not p.fainted]
-    opp_bench    = [p for p in battle.opponent_team.values()
-                    if not p.fainted and p != opp_active]
+    sleep_turns: optional dict mapping species.lower() → turns_asleep (int).
+                 Tracked externally in competitive_player.py since poke-env
+                 doesn't reliably expose remaining sleep duration.
+    """
+    sleep_turns = sleep_turns or {}
+    my_active   = battle.active_pokemon
+    opp_active  = battle.opponent_active_pokemon
+    my_bench    = [p for p in battle.available_switches if not p.fainted]
+    opp_bench   = [p for p in battle.opponent_team.values()
+                   if not p.fainted and p != opp_active]
 
     my_sc  = getattr(battle, "side_conditions",          {})
     opp_sc = getattr(battle, "opponent_side_conditions", {})
 
+    def my_poke_dict(p, move_ids=None):
+        override = sleep_turns.get(p.species.lower(), 0)
+        return poke_dict(p, move_ids=move_ids, sleep_turns_override=override)
+
+    my_active_dict = my_poke_dict(my_active)
+    my_bench_dicts = [my_poke_dict(p) for p in my_bench if not p.fainted]
+
+    # Opponent side — use raw poke_dict (no override, inferred)
+    opp_active_dict = poke_dict(opp_active)
+    opp_bench_dicts = [poke_dict(p) for p in opp_bench if not p.fainted]
+
+    def make_side(active_d, bench_d, sc):
+        reflect_turns = _screen_turns(sc, "REFLECT")
+        ls_turns      = _screen_turns(sc, "LIGHTSCREEN")
+        return {
+            "active":              active_d,
+            "bench":               bench_d,
+            "reflect":             reflect_turns > 0,
+            "reflect_turns":       reflect_turns,
+            "light_screen":        ls_turns > 0,
+            "light_screen_turns":  ls_turns,
+        }
+
     return {
         "turn":   battle.turn,
-        "ours":   side_dict(my_active,  my_bench,  my_sc),
-        "theirs": side_dict(opp_active, opp_bench, opp_sc),
+        "ours":   make_side(my_active_dict,  my_bench_dicts,  my_sc),
+        "theirs": make_side(opp_active_dict, opp_bench_dicts, opp_sc),
     }
 
 
@@ -350,8 +386,8 @@ class RustEngine:
         except json.JSONDecodeError as e:
             return {"error": f"JSON parse error: {e}", "raw": resp}
 
-    def choose_from_battle(self, battle) -> dict:
-        return self.choose(build_state(battle))
+    def choose_from_battle(self, battle, sleep_turns: dict = None) -> dict:
+        return self.choose(build_state(battle, sleep_turns=sleep_turns or {}))
 
 
 # ─── poke-env order converter ─────────────────────────────────────────────────

@@ -140,12 +140,18 @@ impl Side {
         self.all_pokes().filter(|p| !p.fainted).count()
     }
     /// Returns available switch targets (alive bench members).
-    /// Blocked while the active Pokémon is trapped.
+    /// Excludes sleeping and frozen mons — switching to them just wastes
+    /// two turns (switch turn + immediate forced switch-back next turn).
+    /// Also blocked while the active Pokémon is trapped.
     pub fn switches(&self) -> Vec<&BattlePoke> {
         if self.active.is_trapped() {
             return Vec::new();
         }
-        self.bench.iter().filter(|p| !p.fainted).collect()
+        self.bench.iter().filter(|p| {
+            !p.fainted
+            && p.status != Status::Slp
+            && p.status != Status::Frz
+        }).collect()
     }
 }
 
