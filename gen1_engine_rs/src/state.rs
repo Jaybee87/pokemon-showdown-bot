@@ -207,14 +207,16 @@ pub fn legal_actions(side: &Side) -> Vec<Action> {
         }
     }
 
-    // If all moves are disabled/gone → Struggle
-    if out.is_empty() {
-        out.push(Action::Move { id: "struggle".to_string() });
-    }
-
-    // Switches (blocked by trapping moves)
+    // Switches (blocked by trapping moves and sleeping/frozen mons)
     for p in side.switches() {
         out.push(Action::Switch { species: p.species.clone() });
+    }
+
+    // Only add Struggle if there are truly no other options at all.
+    // If moves are empty but switches exist (faint-switch context), the
+    // engine should pick a switch — never Struggle.
+    if out.is_empty() {
+        out.push(Action::Move { id: "struggle".to_string() });
     }
 
     out

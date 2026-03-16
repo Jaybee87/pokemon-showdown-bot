@@ -51,6 +51,26 @@ pub fn evaluate(state: &BattleState) -> f64 {
     score += status_score(&state.ours.active)   *  1.0;
     score += status_score(&state.theirs.active) * -1.0;
 
+    // ── 4b. Healing move availability bonus ───────────────────────────────
+    // A mon with Recover/Softboiled at low HP is worth more than its current
+    // HP suggests — it can restore 50% next turn. This nudges the search
+    // toward using heals proactively rather than attacking into death.
+    let our_has_heal = state.ours.active.moves.iter().any(|m| {
+        matches!(m.as_str(), "recover" | "softboiled")
+    });
+    let their_has_heal = state.theirs.active.moves.iter().any(|m| {
+        matches!(m.as_str(), "recover" | "softboiled")
+    });
+    if our_has_heal && state.ours.active.hp_frac < 0.55 {
+        // Below 55% with a heal available: award expected recovery value
+        let heal_value = (0.50 - (0.55 - state.ours.active.hp_frac as f64)).max(0.0) * 250.0;
+        score += heal_value;
+    }
+    if their_has_heal && state.theirs.active.hp_frac < 0.55 {
+        let heal_value = (0.50 - (0.55 - state.theirs.active.hp_frac as f64)).max(0.0) * 250.0;
+        score -= heal_value;
+    }
+
     // ── 5. Recharge penalty ───────────────────────────────────────────────
     // Increased from 280 to 350: a free turn in Gen 1 is enormously valuable.
     if state.ours.active.recharging   { score -= 350.0; }

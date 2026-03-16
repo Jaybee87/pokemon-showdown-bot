@@ -244,7 +244,10 @@ class CompetitivePlayer(Player):
         self._last_llm_count      = 0
         # Sleep turn tracking: species.lower() → turns_asleep (increments each turn)
         # Used to give Rust an accurate sleep duration estimate.
-        self._sleep_turns: dict   = {}
+        self._sleep_turns: dict        = {}
+        # Sleep move tracking: species.lower() → move_id attempted
+        # Prevents re-firing a sleep move that missed last turn.
+        self._sleep_attempted_vs: dict = {}
         self._rust_engine = RustEngine(
             algorithm="auto",
             depth=4,
@@ -464,6 +467,7 @@ LEAD: <species>"""
             self._battle_start_rust = self._rust_call_count
             self._sleep_clause_active  = False
             self._sleep_turns          = {}
+            self._sleep_attempted_vs   = {}
 
         # Sleep Clause tracking
         if not self._sleep_clause_active:
@@ -481,6 +485,10 @@ LEAD: <species>"""
                 self._sleep_turns[key] = self._sleep_turns.get(key, 0) + 1
             elif key in self._sleep_turns:
                 del self._sleep_turns[key]  # woke up
+
+        # Clear sleep attempt record when opponent is confirmed asleep — move landed.
+        if opp_status_now and opp_status_now.name == 'SLP':
+            self._sleep_attempted_vs.pop(opp_species, None)
 
         # ── Build usable move list ─────────────────────────────────────────
         # Strip moves that can never work this turn
@@ -655,10 +663,14 @@ LEAD: <species>"""
         }
 
         # Guaranteed KO check — exclude Hyperbeam (recharge risk needs search)
-        # and explosion/selfdestruct (need eligibility check first)
+        # and explosion/selfdestruct (need eligibility check first).
+        # Also exclude Hyperbeam when we are below 15% HP — at that HP level
+        # the recharge turn will almost certainly be fatal.
+        my_hp_too_low_for_hb = my_hp_frac < 0.15
         safe_ko_ids = [
             m.id for m in real_moves
-            if m.id not in ('hyperbeam', 'explosion', 'selfdestruct')
+            if m.id not in ('explosion', 'selfdestruct')
+            and not (m.id == 'hyperbeam' and my_hp_too_low_for_hb)
         ]
         ko_result, ko_guaranteed = find_ko_move(
             my_species, safe_ko_ids, opp_species, opp_hp_frac, **calc_kwargs
@@ -689,12 +701,15 @@ LEAD: <species>"""
         # ==================================================================
         # STEP 7 — Sleep move: opponent has no status, we have a sleep move
         # (Deterministic — always correct when conditions are met)
+        # Track attempts per species so we don't re-fire if the move missed.
         # ==================================================================
         if not self._sleep_clause_active and not opp_status_now and not _opp_has_sub:
             sleep_move = next(
                 (m for m in real_moves if m.id in SLEEP_MOVES), None
             )
-            if sleep_move:
+            already_tried = self._sleep_attempted_vs.get(opp_species)
+            if sleep_move and already_tried != sleep_move.id:
+                self._sleep_attempted_vs[opp_species] = sleep_move.id
                 print(f"  😴 PYTHON: using {sleep_move.id}")
                 self._python_call_count += 1
                 return self.create_order(sleep_move)
