@@ -83,10 +83,10 @@ class TimeManager:
     # Showdown limits
     BANK_TOTAL_S   = 210.0   # total bank seconds
     TURN_CAP_S     = 150.0   # hard per-turn cap
-    BANK_FLOOR_S   = 15.0    # keep this many seconds in reserve at all times
-    MIN_MS         = 300     # floor — never slower than old engine
-    MAX_MS         = 12_000  # ceiling per turn
-    BASE_MS        = 2_000   # default when bank is healthy
+    BANK_FLOOR_S   = 10.0    # keep 10s reserve (reduced from 15)
+    MIN_MS         = 500     # floor — minimum search quality
+    MAX_MS         = 30_000  # ceiling 30s per turn for critical endgame decisions
+    BASE_MS        = 5_000   # raised from 2000 — we were leaving 95% of bank unused
 
     def __init__(self):
         self._bank_remaining_s: float = self.BANK_TOTAL_S
@@ -170,10 +170,12 @@ class TimeManager:
         score = max(0.05, min(1.0, score))
 
         # ── Budget allocation ─────────────────────────────────────────────
-        # Scale BASE_MS by complexity, cap at both the per-turn limit and
-        # what the bank can actually afford.
+        # Scale BASE_MS by complexity. Cap at the lesser of:
+        #   - The per-turn hard cap (150s)
+        #   - 20% of remaining bank (so we can't blow the whole bank on one turn)
+        # This is more aggressive than before — we were leaving 95% unused.
         raw_ms  = int(self.BASE_MS * (0.3 + score * 1.4))  # 0.3–1.7× base
-        bank_ms = int(min(spendable, self.TURN_CAP_S) * 1000 * 0.6)  # use 60% of available
+        bank_ms = int(min(spendable, self.TURN_CAP_S) * 1000 * 0.20)  # 20% of available
         alloc   = max(self.MIN_MS, min(raw_ms, bank_ms, self.MAX_MS))
 
         return alloc
@@ -388,9 +390,9 @@ class CompetitivePlayer(Player):
         self._time_manager = TimeManager()
         self._rust_engine = RustEngine(
             algorithm="auto",
-            depth=6,        # up from 4 — iterative deepening reaches 6+ plies
-            iterations=3000, # up from 800 — parallel MCTS runs ~500/thread × 6 threads
-            time_ms=500,    # up from 200 — 9800X3D handles this comfortably
+            depth=6,
+            iterations=100_000,  # high ceiling — real cap set dynamically per turn
+            time_ms=500,         # fallback default
         )
 
     def _log(self, msg):
@@ -728,8 +730,10 @@ LEAD: <species>"""
                 opp_hp_frac    = opp_hp_frac,
                 is_faint_switch= True,
             )
+            faint_iters = max(3000, int(faint_time_ms * 4000 / 1000))
             rust_order = self._try_rust_faint_switch(battle, switches,
-                                                     time_ms=faint_time_ms)
+                                                     time_ms=faint_time_ms,
+                                                     iterations=faint_iters)
             if rust_order:
                 self._time_manager.end_turn()
                 return rust_order
@@ -904,74 +908,82 @@ LEAD: <species>"""
                 self._python_call_count  += 1
                 return self.create_order(heal_move)
 
-        # ALWAYS: low HP — but only if we're actually in danger this turn.
-        # "Danger" is defined by the opponent's known damage output, not a
-        # fixed threshold. We heal if we can't safely survive the next hit.
-        #
-        # Logic:
-        #   - Calculate the opponent's max expected damage this turn from
-        #     their revealed moves (or a conservative fallback if unknown).
-        #   - If we're slower: also account for their next turn hit, since
-        #     they'll attack before we can heal.
-        #   - Heal if current HP ≤ expected_max_hit * safety_margin.
-        #   - Don't heal if we have room to take 2+ hits — defer to Rust.
+        # ALWAYS: low HP — but only if we're actually in danger this turn
+        # AND healing can actually help us win.
         heal_move_nontox = next(
             (m for m in real_moves if m.id in ('softboiled', 'recover')), None
         )
         if heal_move_nontox and my_hp_frac < 0.55:
-            # Build opponent's max damage per turn from revealed moves
-            opp_known_names = self._opponent_move_names.get(opp_species, [])
-            opp_max_dmg = 0.0
-            if opp_known_names:
-                for move_id in opp_known_names:
-                    try:
-                        lo, hi = calc_damage_pct(
-                            opp_species, move_id, my_species,
-                            atk_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
-                            def_boosts=dict(my_poke.boosts)  if my_poke.boosts  else {},
-                        )
-                        opp_max_dmg = max(opp_max_dmg, hi)
-                    except Exception:
-                        pass
-            if opp_max_dmg == 0.0:
-                # No revealed moves — use conservative type-based estimate.
-                # Assume ~30% as a neutral baseline; scale up for super-effective.
-                opp_known_types = self._opponent_move_types.get(opp_species, [])
-                worst_eff = worst_incoming_effectiveness(opp_known_types, my_types)
-                opp_max_dmg = 0.30 * worst_eff  # rough upper-bound estimate
+            turns_since_heal = battle.turn - self._last_healed_turn
+            same_species     = (self._last_healed_species == my_species)
+            consecutive_heals = turns_since_heal <= 2 and same_species
 
-            # If we're slower, we'll take a hit before we can heal next turn too.
-            we_are_slower = not outspeeds(my_species, opp_species,
-                                          a_par=(my_status_now and my_status_now.name=='PAR'),
-                                          b_par=(opp_poke.status and opp_poke.status.name=='PAR'
-                                                 if opp_poke.status else False))
-            hits_before_heal = 2 if we_are_slower else 1
+            # Never fire if we've healed 2+ consecutive turns — we're in a loop.
+            # Rust should handle it; Python healing repeatedly achieves nothing.
+            if consecutive_heals:
+                pass  # fall through to Rust
+            else:
+                # Build opponent's max damage per turn from revealed moves
+                opp_known_names = self._opponent_move_names.get(opp_species, [])
+                opp_max_dmg = 0.0
+                if opp_known_names:
+                    for move_id in opp_known_names:
+                        try:
+                            lo, hi = calc_damage_pct(
+                                opp_species, move_id, my_species,
+                                atk_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
+                                def_boosts=dict(my_poke.boosts)  if my_poke.boosts  else {},
+                            )
+                            opp_max_dmg = max(opp_max_dmg, hi)
+                        except Exception:
+                            pass
+                if opp_max_dmg == 0.0:
+                    # No revealed moves — conservative fallback, but cap it
+                    # at 0.25 (not 0.30) to reduce false positives.
+                    opp_known_types = self._opponent_move_types.get(opp_species, [])
+                    worst_eff = worst_incoming_effectiveness(opp_known_types, my_types)
+                    opp_max_dmg = min(0.25 * worst_eff, 0.40)
 
-            # PAR: 25% chance of full immobilisation each turn we need to act.
-            # If we need 1 action to heal: 75% success → scale threshold by 1/0.75
-            # If we need 2 actions (slower+PAR): 56% success → scale by 1/0.56
-            # This means we heal earlier when paralysed since we can't guarantee
-            # the heal action will land.
-            par_scale = 1.0
-            if my_is_par:
-                par_success_prob = 0.75 ** hits_before_heal
-                par_scale = 1.0 / par_success_prob  # 1.33× if faster, 1.78× if slower
+                # Can-win check: if opponent also has a heal move, healing
+                # into their heal is a treadmill — don't fire, let Rust decide.
+                opp_has_heal = any(
+                    m in self._opponent_move_names.get(opp_species, [])
+                    for m in ('softboiled', 'recover', 'rest')
+                )
 
-            danger_threshold = opp_max_dmg * hits_before_heal * 1.2 * par_scale
+                # Net gain check: Recover restores ~50%. If opp does more
+                # than ~40% per turn, we're net negative every cycle — switch
+                # is the right answer, not heal. Let Rust decide.
+                heal_is_futile = opp_max_dmg > 0.42
 
-            if my_hp_frac <= danger_threshold:
-                opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
-                our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
-                if not (opp_alive == 1 and our_alive >= 2):
-                    print(f"  💊 PYTHON: danger heal ({int(my_hp_frac*100)}% HP, "
-                          f"opp max ~{int(opp_max_dmg*100)}%/turn, "
-                          f"{'slower' if we_are_slower else 'faster'}"
-                          f"{f', PAR ×{par_scale:.2f}' if my_is_par else ''}) "
-                          f"— healing with {heal_move_nontox.id}")
-                    self._last_healed_turn    = battle.turn
-                    self._last_healed_species = my_species
-                    self._python_call_count  += 1
-                    return self.create_order(heal_move_nontox)
+                if not opp_has_heal and not heal_is_futile:
+                    we_are_slower = not outspeeds(my_species, opp_species,
+                                                  a_par=(my_is_par),
+                                                  b_par=(opp_poke.status and
+                                                         opp_poke.status.name=='PAR'
+                                                         if opp_poke.status else False))
+                    hits_before_heal = 2 if we_are_slower else 1
+
+                    par_scale = 1.0
+                    if my_is_par:
+                        par_success_prob = 0.75 ** hits_before_heal
+                        par_scale = 1.0 / par_success_prob
+
+                    danger_threshold = opp_max_dmg * hits_before_heal * 1.2 * par_scale
+
+                    if my_hp_frac <= danger_threshold:
+                        opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+                        our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
+                        if not (opp_alive == 1 and our_alive >= 2):
+                            print(f"  💊 PYTHON: danger heal ({int(my_hp_frac*100)}% HP, "
+                                  f"opp max ~{int(opp_max_dmg*100)}%/turn, "
+                                  f"{'slower' if we_are_slower else 'faster'}"
+                                  f"{f', PAR ×{par_scale:.2f}' if my_is_par else ''}) "
+                                  f"— healing with {heal_move_nontox.id}")
+                            self._last_healed_turn    = battle.turn
+                            self._last_healed_species = my_species
+                            self._python_call_count  += 1
+                            return self.create_order(heal_move_nontox)
 
         # NEVER (strip from move list before Rust):
         heal_moves_available = [m for m in real_moves if m.id in HEAL_MOVES]
@@ -1010,7 +1022,39 @@ LEAD: <species>"""
                     real_moves = filtered
 
         # ==================================================================
-        # STEP 7d — Paralysed + Hyperbeam suppression.
+        # STEP 7e — Recover stall prevention: if opponent has Recover and
+        # we cannot 2HKO them, Thunder Wave is higher value than attacking.
+        # Paralysing a Recover user cuts their speed and creates win conditions
+        # through PAR immobilisation. Without T-Wave the matchup is unwinnable
+        # by damage alone.
+        # ==================================================================
+        opp_has_recover = any(
+            m in self._opponent_move_names.get(opp_species, [])
+            for m in ('recover', 'softboiled', 'rest')
+        )
+        if opp_has_recover and not (opp_poke.status and opp_poke.status.name == 'PAR'):
+            twave = next((m for m in real_moves if m.id == 'thunderwave'), None)
+            if twave:
+                # Check if we can 2HKO (deal >50% per hit)
+                best_dmg = 0.0
+                for mv in real_moves:
+                    if mv.id in ('thunderwave', 'recover', 'softboiled', 'rest'):
+                        continue
+                    try:
+                        lo, hi = calc_damage_pct(
+                            my_species, mv.id, opp_species,
+                            atk_boosts=dict(my_poke.boosts) if my_poke.boosts else {},
+                            def_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
+                        )
+                        best_dmg = max(best_dmg, (lo + hi) / 2)
+                    except Exception:
+                        pass
+                if best_dmg < 0.50:
+                    # Can't 2HKO — T-Wave is the winning move
+                    print(f"  ⚡ PYTHON: opponent has Recover, can't 2HKO "
+                          f"(best ~{int(best_dmg*100)}%) — Thunder Wave")
+                    self._python_call_count += 1
+                    return self.create_order(twave)
         # ==================================================================
         if my_is_par and any(m.id == 'hyperbeam' for m in real_moves):
             non_hb = [m for m in real_moves if m.id != 'hyperbeam']
@@ -1040,10 +1084,19 @@ LEAD: <species>"""
         )
         print(f"  ⏱  Time budget: {time_budget_ms}ms ({self._time_manager.status()})")
 
+        # Dynamic iteration cap: nodes/sec × budget.
+        # Measured throughput is ~4000 nodes/sec on the 9800X3D with 6 threads.
+        # Setting iterations = budget_ms * 4 means the time limit and iteration
+        # cap both fire at approximately the same point — no idle time wasted.
+        # Floor of 3000 preserves minimum quality on very short budgets.
+        NODES_PER_SEC = 4000
+        iters = max(3000, int(time_budget_ms * NODES_PER_SEC / 1000))
+
         rust_result = self._try_rust_engine(
             battle,
             active_move_ids=active_move_ids,
             time_ms=time_budget_ms,
+            iterations=iters,
         )
         self._time_manager.end_turn()
 
@@ -1051,19 +1104,28 @@ LEAD: <species>"""
             return self._llm_fallback(battle, real_moves, switches)
 
         # Post-process: veto Hyperbeam when position is deeply losing
+        # BUT: never veto a guaranteed KO — if they die, there's no recharge turn.
         last = getattr(self, '_last_rust_result', {})
         if (last.get('action', {}).get('id') == 'hyperbeam'
                 and last.get('score', 0) < -2000):
-            alt = next(
-                (m for m in real_moves
-                 if m.id != 'hyperbeam' and m.base_power and m.base_power > 0),
-                None
-            )
-            if alt:
-                print(f"  🚫 PYTHON: vetoing Hyperbeam (score={last['score']:.0f}, losing) "
-                      f"— using {alt.id} instead")
-                self._python_call_count += 1
-                return self.create_order(alt)
+            # Check if this is a guaranteed KO before vetoing
+            hb_is_guaranteed_ko = can_ko(
+                my_species, 'hyperbeam', opp_species,
+                hp_pct=opp_hp_frac, use_avg=False,  # use min roll = guaranteed
+                atk_boosts=dict(my_poke.boosts) if my_poke.boosts else {},
+                def_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
+            ) if opp_hp_frac > 0 else False
+            if not hb_is_guaranteed_ko:
+                alt = next(
+                    (m for m in real_moves
+                     if m.id != 'hyperbeam' and m.base_power and m.base_power > 0),
+                    None
+                )
+                if alt:
+                    print(f"  🚫 PYTHON: vetoing Hyperbeam (score={last['score']:.0f}, losing) "
+                          f"— using {alt.id} instead")
+                    self._python_call_count += 1
+                    return self.create_order(alt)
 
         # Post-process: switch cooldown — if the active mon switched in last
         # turn, don't immediately switch out again unless HP is below 50%.
@@ -1127,18 +1189,21 @@ LEAD: <species>"""
     # Rust engine helpers
     # -------------------------------------------------------------------------
 
-    def _try_rust_engine(self, battle, active_move_ids: list = None, time_ms: int = None):
+    def _try_rust_engine(self, battle, active_move_ids: list = None,
+                         time_ms: int = None, iterations: int = None):
         """
         Query the Rust engine for a normal (non-faint) decision.
         active_move_ids: optional filtered list of move IDs to present to Rust.
         time_ms: search budget in ms; defaults to engine default if None.
+        iterations: iteration cap; defaults to engine default if None.
         """
         self._last_rust_result = {}
         try:
             state = build_state(battle, sleep_turns=self._sleep_turns)
             if active_move_ids is not None:
                 state["ours"]["active"]["moves"] = active_move_ids
-            result = self._rust_engine.choose(state, time_ms=time_ms)
+            result = self._rust_engine.choose(state, time_ms=time_ms,
+                                               iterations=iterations)
             if "error" in result:
                 print(f"  ⚠️  Rust engine error: {result['error']}")
                 return None
@@ -1204,7 +1269,8 @@ LEAD: <species>"""
             return self.create_order(best_move)
         return self.choose_default_move()
 
-    def _try_rust_faint_switch(self, battle, switches, time_ms: int = None):
+    def _try_rust_faint_switch(self, battle, switches, time_ms: int = None,
+                               iterations: int = None):
         """
         Query Rust specifically for a faint switch.
         Builds a state where our active has no moves (switch-only position)
@@ -1213,7 +1279,8 @@ LEAD: <species>"""
         try:
             state = build_state(battle, sleep_turns=self._sleep_turns)
             state["ours"]["active"]["moves"] = []
-            result = self._rust_engine.choose(state, time_ms=time_ms)
+            result = self._rust_engine.choose(state, time_ms=time_ms,
+                                               iterations=iterations)
 
             if "error" in result:
                 print(f"  ⚠️  Rust faint-switch error: {result['error']}")
