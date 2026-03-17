@@ -1,20 +1,25 @@
-/// mcts.rs v2 — MCTS with Action::Recharge support and smarter rollout.
+/// mcts.rs v3 — Parallel root MCTS using rayon.
 ///
-/// Changes from v1:
-///   - Handles Recharge action in legal_actions (trivially expands)
-///   - Rollout policy uses the same move-ordering heuristic as minimax
-///   - Parallelism hook (single-threaded for now, easy to rayon later)
+/// Changes from v2:
+///   - Parallel root parallelisation: spawn N independent trees on rayon
+///     threads, merge visit counts at the root action level.
+///   - Each thread gets its own RNG so there is no contention.
+///   - Rollout depth increased 14→20 to catch multi-turn heal/stall cycles.
+///   - Time budget per thread = wall_time_ms (they all start simultaneously).
+///   - Iterations per thread = total_iterations / num_threads (ceiling).
 
 use std::time::Instant;
 use rand::Rng;
+use rayon::prelude::*;
 
 use crate::state::*;
 use crate::eval::*;
 use crate::sim::apply_turn;
 use crate::calc::{avg_damage_pct, can_ko, guaranteed_ko};
 
-const EXPLORATION_C:    f64 = 1.414;
-const MAX_ROLLOUT_DEPTH: u8 = 14;
+const EXPLORATION_C:     f64 = 1.414;
+const MAX_ROLLOUT_DEPTH: u8  = 20;   // up from 14 — sees heal/recharge cycles
+const NUM_THREADS:       u32 = 6;    // leave 2 cores for OS + Python
 
 struct Node {
     action:   Option<Action>,
@@ -43,23 +48,30 @@ impl Node {
 struct Tree { nodes: Vec<Node> }
 
 impl Tree {
-    fn new(root: BattleState) -> Self { Tree { nodes: vec![Node::new(root, None, None)] } }
+    fn new(root: BattleState) -> Self {
+        Tree { nodes: vec![Node::new(root, None, None)] }
+    }
 
     fn select(&self) -> usize {
         let mut n = 0usize;
         loop {
-            if is_terminal(&self.nodes[n].state) || !self.nodes[n].fully_expanded() { return n; }
+            if is_terminal(&self.nodes[n].state) || !self.nodes[n].fully_expanded() {
+                return n;
+            }
             let pv = self.nodes[n].visits;
             n = *self.nodes[n].children.iter()
-                .max_by(|&&a, &&b| self.nodes[a].ucb1(pv).partial_cmp(&self.nodes[b].ucb1(pv))
-                    .unwrap_or(std::cmp::Ordering::Equal))
+                .max_by(|&&a, &&b| {
+                    self.nodes[a].ucb1(pv)
+                        .partial_cmp(&self.nodes[b].ucb1(pv))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .unwrap();
         }
     }
 
     fn expand(&mut self, idx: usize) -> usize {
         if is_terminal(&self.nodes[idx].state) { return idx; }
-        let action = self.nodes[idx].untried.pop().unwrap();
+        let action     = self.nodes[idx].untried.pop().unwrap();
         let opp_action = best_opponent_action(&self.nodes[idx].state);
         let child_state = apply_turn(&self.nodes[idx].state, &action, &opp_action);
         let child_idx   = self.nodes.len();
@@ -77,7 +89,6 @@ impl Tree {
             let mut ta = legal_actions(&state.theirs);
             order_actions(&mut oa, &state.ours, &state.theirs);
             order_actions(&mut ta, &state.theirs, &state.ours);
-            // 80% guided, 20% random
             let our_a = if rng.gen::<f64>() < 0.80 { oa[0].clone() }
                         else { oa[rng.gen_range(0..oa.len())].clone() };
             let opp_a = if rng.gen::<f64>() < 0.80 { ta[0].clone() }
@@ -94,6 +105,30 @@ impl Tree {
             match self.nodes[idx].parent { Some(p) => idx = p, None => break }
         }
     }
+
+    /// Run iterations until time_ms elapsed or iteration cap reached.
+    /// Returns (action_label → (total_wins, total_visits)) for root children.
+    fn run(&mut self, iterations: u32, time_ms: u64) -> u64 {
+        let start = Instant::now();
+        let mut sims = 0u64;
+        for _ in 0..iterations {
+            if start.elapsed().as_millis() as u64 >= time_ms { break; }
+            let sel    = self.select();
+            let exp    = self.expand(sel);
+            let result = self.simulate(exp);
+            self.backprop(exp, result);
+            sims += 1;
+        }
+        sims
+    }
+
+    /// Extract (action, wins, visits) for each root child.
+    fn root_stats(&self) -> Vec<(Action, f64, u32)> {
+        self.nodes[0].children.iter().filter_map(|&ci| {
+            let n = &self.nodes[ci];
+            n.action.as_ref().map(|a| (a.clone(), n.wins, n.visits))
+        }).collect()
+    }
 }
 
 pub struct MctsResult {
@@ -103,30 +138,53 @@ pub struct MctsResult {
 }
 
 pub fn mcts_search(state: &BattleState, iterations: u32, time_ms: u64) -> MctsResult {
-    let start = Instant::now();
-    let mut tree = Tree::new(state.clone());
-    let mut sims = 0u64;
+    let iters_per_thread = (iterations + NUM_THREADS - 1) / NUM_THREADS;
 
-    for _ in 0..iterations {
-        if start.elapsed().as_millis() as u64 >= time_ms { break; }
-        let sel    = tree.select();
-        let exp    = tree.expand(sel);
-        let result = tree.simulate(exp);
-        tree.backprop(exp, result);
-        sims += 1;
+    // Run NUM_THREADS independent trees in parallel.
+    // Each tree is fully independent (no shared state), so no locking needed.
+    let per_thread: Vec<(Vec<(Action, f64, u32)>, u64)> = (0..NUM_THREADS)
+        .into_par_iter()
+        .map(|_| {
+            let mut tree = Tree::new(state.clone());
+            let sims     = tree.run(iters_per_thread, time_ms);
+            (tree.root_stats(), sims)
+        })
+        .collect();
+
+    // Merge: accumulate wins+visits per action identity across all trees.
+    use std::collections::HashMap;
+    let mut merged: HashMap<String, (Action, f64, u32)> = HashMap::new();
+    let mut total_sims = 0u64;
+
+    for (stats, sims) in per_thread {
+        total_sims += sims;
+        for (action, wins, visits) in stats {
+            let key = action_key(&action);
+            let entry = merged.entry(key).or_insert((action, 0.0, 0));
+            entry.1 += wins;
+            entry.2 += visits;
+        }
     }
 
-    let best_idx = *tree.nodes[0].children.iter()
-        .max_by_key(|&&i| tree.nodes[i].visits)
-        .expect("no children expanded");
+    // Pick action with most visits (standard MCTS selection).
+    let best = merged.values()
+        .max_by_key(|(_, _, v)| *v)
+        .expect("no actions explored");
 
-    let best = &tree.nodes[best_idx];
-    let score = if best.visits > 0 { best.wins / best.visits as f64 } else { 0.0 };
+    let score = if best.2 > 0 { best.1 / best.2 as f64 } else { 0.0 };
 
     MctsResult {
-        best_action: best.action.clone().unwrap(),
+        best_action: best.0.clone(),
         score: score * 10_000.0,
-        simulations: sims,
+        simulations: total_sims,
+    }
+}
+
+fn action_key(a: &Action) -> String {
+    match a {
+        Action::Move    { id }      => format!("move:{}", id),
+        Action::Switch  { species } => format!("switch:{}", species),
+        Action::Recharge            => "recharge".into(),
     }
 }
 

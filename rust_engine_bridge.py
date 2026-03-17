@@ -380,6 +380,15 @@ class RustEngine:
                 resp = self._proc.stdout.readline()
 
         if not resp:
+            # Engine returned nothing — process likely crashed. Restart and retry once.
+            self._start()
+            try:
+                self._proc.stdin.write(line)
+                self._proc.stdin.flush()
+                resp = self._proc.stdout.readline()
+            except Exception:
+                pass
+        if not resp:
             return {"error": "engine returned empty response"}
         try:
             return json.loads(resp)

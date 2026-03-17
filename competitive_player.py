@@ -253,9 +253,9 @@ class CompetitivePlayer(Player):
         self._last_healed_species: str = ""
         self._rust_engine = RustEngine(
             algorithm="auto",
-            depth=4,
-            iterations=800,
-            time_ms=200,
+            depth=6,        # up from 4 — iterative deepening reaches 6+ plies
+            iterations=3000, # up from 800 — parallel MCTS runs ~500/thread × 6 threads
+            time_ms=500,    # up from 200 — 9800X3D handles this comfortably
         )
 
     def _log(self, msg):
@@ -795,16 +795,14 @@ LEAD: <species>"""
                 self._python_call_count += 1
                 return self.create_order(alt)
 
-        # Post-process: veto Softboiled/Recover when above 70% HP and we
-        # already healed last turn. Prevents the infinite stall loop where
-        # minimax locks onto score=1595 and heals every turn forever.
-        # The 2-turn cooldown forces the engine to make progress with damage.
+        # Post-process: veto Softboiled/Recover when above 80% HP and we
+        # already healed within the last 3 turns. The 2-turn/70% threshold
+        # was too loose — PAR chip drops HP fast enough to reset it.
         last_action_id = last.get('action', {}).get('id', '')
         if last_action_id in ('softboiled', 'recover'):
             turns_since_heal = battle.turn - self._last_healed_turn
             same_species = (self._last_healed_species == my_species)
-            if turns_since_heal <= 2 and same_species and my_hp_frac >= 0.70:
-                # Find best damaging alternative
+            if turns_since_heal <= 3 and same_species and my_hp_frac >= 0.80:
                 alt = next(
                     (m for m in real_moves
                      if m.id not in ('softboiled', 'recover', 'rest')
@@ -965,7 +963,14 @@ LEAD: <species>"""
                     return self.create_order(chosen)
                 print(f"  ⚠️  Rust faint-switch species '{species}' not in bench")
             else:
-                # Engine returned a move despite empty move list — shouldn't happen
+                move_id = action.get("id", "")
+                if move_id == "struggle":
+                    # All remaining mons are asleep/frozen — no valid switches.
+                    # Pick the healthiest available switch regardless of status.
+                    best = max(switches, key=lambda p: p.current_hp_fraction or 0)
+                    print(f"  ✅ RUST [all incapacitated — sending {best.species}]")
+                    self._rust_call_count += 1
+                    return self.create_order(best)
                 print(f"  ⚠️  Rust returned move during faint switch: {action}")
             return None
 

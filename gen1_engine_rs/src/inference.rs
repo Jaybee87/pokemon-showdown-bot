@@ -48,9 +48,10 @@ static TEMPLATES: &[Template] = &[
         &["softboiled", "thunderwave", "seismictoss", "sing"],
     ]},
     Template { species: "snorlax",   movesets: &[
+        &["bodyslam", "earthquake", "hyperbeam", "rest"],
         &["bodyslam", "earthquake", "selfdestruct", "amnesia"],
         &["bodyslam", "earthquake", "fireblast",    "selfdestruct"],
-        &["bodyslam", "icebeam",    "earthquake",   "selfdestruct"],
+        &["bodyslam", "icebeam",    "earthquake",   "rest"],
     ]},
     Template { species: "exeggutor", movesets: &[
         &["psychic", "sleeppowder", "explosion", "hyperbeam"],

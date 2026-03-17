@@ -152,7 +152,11 @@ pub fn iterative_deepening(
 
     // In late-game, go deeper automatically
     let alive = (state.ours.alive_count() + state.theirs.alive_count()) as u8;
-    let effective_max = if alive <= 2 { max_depth + 2 } else { max_depth };
+    let effective_max = if alive <= 4 {
+        max_depth + 3   // was +2 at <=2; now +3 at <=4 — catches endgame stalls
+    } else {
+        max_depth
+    };
 
     let mut best = minimax_search(state, 1);
     for depth in 2..=effective_max {
