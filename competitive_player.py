@@ -981,24 +981,32 @@ LEAD: <species>"""
             turns_since_heal = battle.turn - self._last_healed_turn
             same_species     = (self._last_healed_species == my_species)
 
-            strip_heals = set()
+            strip_heals = {}  # move_id → reason string
             for hm in heal_moves_available:
-                # Rest at high HP without poison: 2 turns of sleep for minimal gain
-                if hm.id == 'rest' and my_hp_frac >= 0.85:
-                    strip_heals.add(hm.id)
+                # Rest at high HP without poison: 2-turn sleep cost is too high.
+                # Instant heals (Softboiled/Recover) use a higher threshold since
+                # they don't incapacitate. When paralysed, PAR chip (~10%/turn)
+                # erodes HP quickly so we allow healing until 95% (not 90%).
+                if hm.id == 'rest':
+                    hp_threshold = 0.85
+                elif my_is_par:
+                    hp_threshold = 0.95  # PAR chip will eat the margin fast
+                else:
+                    hp_threshold = 0.90
+                if my_hp_frac >= hp_threshold and not my_is_tox:
+                    strip_heals[hm.id] = f"{int(my_hp_frac*100)}% HP ≥ {int(hp_threshold*100)}%"
                 # Heal spam: healed same mon within last 3 turns and HP still high
-                if turns_since_heal <= 3 and same_species and my_hp_frac >= 0.80:
-                    strip_heals.add(hm.id)
+                elif turns_since_heal <= 3 and same_species and my_hp_frac >= 0.80:
+                    strip_heals[hm.id] = f"healed {turns_since_heal}t ago"
                 # Up on mons significantly: press the advantage, don't stall
-                if my_hp_frac >= 0.80 and our_alive >= opp_alive + 2:
-                    strip_heals.add(hm.id)
+                elif my_hp_frac >= 0.80 and our_alive >= opp_alive + 2:
+                    strip_heals[hm.id] = f"up {our_alive - opp_alive} mons"
 
             if strip_heals:
                 filtered = [m for m in real_moves if m.id not in strip_heals]
                 if filtered:  # only strip if alternatives exist
-                    stripped_names = sorted(strip_heals)
-                    print(f"  🚫 PYTHON: suppressing {'/'.join(stripped_names)} "
-                          f"({int(my_hp_frac*100)}% HP, {turns_since_heal}t since last heal)")
+                    for mv_id, reason in sorted(strip_heals.items()):
+                        print(f"  🚫 PYTHON: suppressing {mv_id} ({reason})")
                     real_moves = filtered
 
         # ==================================================================
