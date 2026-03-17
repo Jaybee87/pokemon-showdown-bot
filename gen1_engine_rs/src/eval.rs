@@ -52,12 +52,10 @@ pub fn evaluate(state: &BattleState) -> f64 {
     score += status_score(&state.theirs.active) * -1.0;
 
     // ── 4b. Healing move availability and urgency ─────────────────────────
-    let our_has_heal = state.ours.active.moves.iter().any(|m| {
-        matches!(m.as_str(), "recover" | "softboiled")
-    });
-    let their_has_heal = state.theirs.active.moves.iter().any(|m| {
-        matches!(m.as_str(), "recover" | "softboiled")
-    });
+    let our_has_heal = state.ours.active.has_move_str("recover")
+        || state.ours.active.has_move_str("softboiled");
+    let their_has_heal = state.theirs.active.has_move_str("recover")
+        || state.theirs.active.has_move_str("softboiled");
     // Low HP + heal available = more valuable than current HP suggests
     if our_has_heal && state.ours.active.hp_frac < 0.55 {
         let heal_value = (0.50 - (0.55 - state.ours.active.hp_frac as f64)).max(0.0) * 250.0;
@@ -102,14 +100,14 @@ pub fn evaluate(state: &BattleState) -> f64 {
     score += spe_ratio.clamp(-1.0, 1.0) * 80.0;
 
     // ── 8. KO threat ──────────────────────────────────────────────────────
-    let we_threaten = state.ours.active.moves.iter().any(|mid| {
+    let we_threaten = state.ours.active.move_ids().iter().any(|&mid_u16| {
+        let mid = crate::ids::id_to_move(mid_u16);
         if mid == "hyperbeam" && state.ours.active.status == Status::Par { return false; }
-        // Don't count HB as a threat if opponent has a heal — they recover on the free turn
         if mid == "hyperbeam" && their_has_heal { return false; }
         can_ko(&state.ours.active, mid, &state.theirs.active)
     });
-    let they_threaten = state.theirs.active.moves.iter()
-        .any(|mid| can_ko(&state.theirs.active, mid, &state.ours.active));
+    let they_threaten = state.theirs.active.move_ids().iter()
+        .any(|&mid_u16| can_ko(&state.theirs.active, crate::ids::id_to_move(mid_u16), &state.ours.active));
     if we_threaten   { score += 220.0; }
     if they_threaten { score -= 220.0; }
 
@@ -133,7 +131,7 @@ pub fn evaluate(state: &BattleState) -> f64 {
     }
     // E) HB available but opponent has heal — penalise having it as the best
     //    option pre-emptively. This nudges the search away from HB lines.
-    let we_have_hb = state.ours.active.moves.iter().any(|m| m == "hyperbeam");
+    let we_have_hb = state.ours.active.has_move_str("hyperbeam");
     if we_have_hb && opp_has_heal && !state.ours.active.recharging {
         score -= 80.0;
     }
@@ -153,8 +151,8 @@ pub fn evaluate(state: &BattleState) -> f64 {
     // ── 13. Bench quality ─────────────────────────────────────────────────
     // Weight reduced from 0.4 to 0.2 to reduce switch oscillation — the search
     // was over-valuing bench mons and switching every turn against neutral targets.
-    score += bench_quality(&state.ours.bench,   &state.theirs.active) * 0.2;
-    score -= bench_quality(&state.theirs.bench, &state.ours.active)   * 0.2;
+    score += bench_quality(&state.ours.bench[..state.ours.bench_count as usize],   &state.theirs.active) * 0.2;
+    score -= bench_quality(&state.theirs.bench[..state.theirs.bench_count as usize], &state.ours.active)   * 0.2;
 
     score
 }
@@ -168,7 +166,8 @@ pub fn matchup_score(ours: &BattlePoke, theirs: &BattlePoke) -> f64 {
 }
 
 fn best_expected_damage_pct(attacker: &BattlePoke, defender: &BattlePoke) -> f64 {
-    attacker.moves.iter().map(|mid| {
+    attacker.move_ids().iter().map(|&mid_u16| {
+        let mid = crate::ids::id_to_move(mid_u16);
         avg_damage_pct(attacker, mid, defender, false, false)
     }).fold(0.0f64, f64::max)
 }

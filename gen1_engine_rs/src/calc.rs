@@ -17,17 +17,17 @@ pub struct EffectiveStats {
 }
 
 pub fn effective_stats(p: &BattlePoke) -> Option<EffectiveStats> {
-    let base = get_pokemon(&p.species)?;
-    let atk = apply_stage(calc_stat(base.atk) as i32, p.boost("atk"));
-    let def = apply_stage(calc_stat(base.def) as i32, p.boost("def"));
-    let spc = apply_stage(calc_stat(base.spc) as i32, p.boost("spc"));
+    let base = get_pokemon(p.species_str())?;
+    let atk = apply_stage(calc_stat(base.atk) as i32, p.boost(crate::ids::BOOST_ATK));
+    let def = apply_stage(calc_stat(base.def) as i32, p.boost(crate::ids::BOOST_DEF));
+    let spc = apply_stage(calc_stat(base.spc) as i32, p.boost(crate::ids::BOOST_SPC));
     let spe_raw = calc_stat(base.spe) as i32;
     let spe = if p.status == Status::Par {
         (spe_raw / 4).max(1)
     } else {
         spe_raw
     };
-    let spe = apply_stage(spe, p.boost("spe"));
+    let spe = apply_stage(spe, p.boost(crate::ids::BOOST_SPE));
     Some(EffectiveStats { atk, def, spc, spe })
 }
 
@@ -48,7 +48,7 @@ pub fn damage_range(
         let atk_spe = effective_stats(attacker).map(|s| s.spe).unwrap_or(0);
         let def_spe = effective_stats(defender).map(|s| s.spe).unwrap_or(0);
         return if atk_spe >= def_spe {
-            let def_base = get_pokemon(&defender.species)
+            let def_base = get_pokemon(defender.species_str())
                 .map(|b| calc_stat_hp(b.hp) as u32).unwrap_or(1);
             (def_base, def_base)
         } else {
@@ -58,7 +58,7 @@ pub fn damage_range(
 
     if is_fixed_damage(mid) {
         // Fixed-damage moves: approximate as level 100 (= 100 HP)
-        let def_types = get_pokemon(&defender.species)
+        let def_types = get_pokemon(defender.species_str())
             .map(|b| (b.t1, b.t2)).unwrap_or((Type::Normal, None));
         let move_data = get_move(mid);
         let eff = move_data.map(|m| {
@@ -75,8 +75,8 @@ pub fn damage_range(
 
     let atk_stats = match effective_stats(attacker) { Some(s) => s, None => return (0, 0) };
     let def_stats = match effective_stats(defender)  { Some(s) => s, None => return (0, 0) };
-    let atk_base  = match get_pokemon(&attacker.species) { Some(b) => b, None => return (0, 0) };
-    let def_base  = match get_pokemon(&defender.species) { Some(b) => b, None => return (0, 0) };
+    let atk_base  = match get_pokemon(attacker.species_str()) { Some(b) => b, None => return (0, 0) };
+    let def_base  = match get_pokemon(defender.species_str()) { Some(b) => b, None => return (0, 0) };
 
     let is_special = move_data.move_type.is_special();
     let (mut attack, mut defense) = if is_special {
@@ -132,7 +132,7 @@ pub fn damage_pct(
     reflect: bool, light_screen: bool,
 ) -> (f64, f64) {
     let (lo, hi) = damage_range(attacker, move_id, defender, reflect, light_screen);
-    let max_hp = get_pokemon(&defender.species)
+    let max_hp = get_pokemon(defender.species_str())
         .map(|b| calc_stat_hp(b.hp) as f64)
         .unwrap_or(100.0);
     (lo as f64 / max_hp, hi as f64 / max_hp)

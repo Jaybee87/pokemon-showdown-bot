@@ -193,7 +193,7 @@ fn action_key(a: &Action) -> String {
 fn best_opponent_action(state: &BattleState) -> Action {
     let mut acts = legal_actions(&state.theirs);
     order_actions(&mut acts, &state.theirs, &state.ours);
-    acts.into_iter().next().unwrap_or(Action::Move { id: "struggle".into() })
+    acts.into_iter().next().unwrap_or(Action::Move { id: crate::ids::MOVE_STRUGGLE })
 }
 
 fn order_actions(actions: &mut Vec<Action>, attacker: &Side, defender: &Side) {
@@ -208,13 +208,15 @@ fn action_score(action: &Action, attacker: &Side, defender: &Side) -> f64 {
     match action {
         Action::Recharge => -500.0,
         Action::Move { id } => {
-            if guaranteed_ko(&attacker.active, id, &defender.active) { return 10000.0; }
-            if can_ko(&attacker.active, id, &defender.active)         { return  5000.0; }
-            avg_damage_pct(&attacker.active, id, &defender.active, false, false) * 100.0
+            let mid = crate::ids::id_to_move(*id);
+            if guaranteed_ko(&attacker.active, mid, &defender.active) { return 10000.0; }
+            if can_ko(&attacker.active, mid, &defender.active)         { return  5000.0; }
+            avg_damage_pct(&attacker.active, mid, &defender.active, false, false) * 100.0
         }
         Action::Switch { species } => {
-            attacker.bench.iter()
-                .find(|p| &p.species == species)
+            let count = attacker.bench_count as usize;
+            attacker.bench[..count].iter()
+                .find(|p| p.species == *species)
                 .map(|p| p.hp_frac as f64 * 25.0)
                 .unwrap_or(10.0)
         }

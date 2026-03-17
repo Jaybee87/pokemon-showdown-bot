@@ -1,31 +1,23 @@
-/// state.rs — Serialisable battle state that Python passes to the engine.
+/// state.rs v3 — Zero-allocation battle state.
 ///
-/// Python sends a JSON blob (BattleState) every turn; the engine runs
-/// Minimax/MCTS and returns a Decision.  No poke-env objects cross the
-/// boundary — only plain data.
+/// All String fields replaced with u16 integer IDs (see ids.rs).
+/// Moves stored as [u16; 4] fixed array — no Vec, no heap.
+/// Boosts stored as [i8; 6] fixed array — no HashMap, no heap.
+/// BattleState::clone() is now a plain stack memcpy.
 ///
-/// Changelog (v2):
-///   - BattlePoke: added recharging, toxic_counter, trapping_turns,
-///     confused, crit_stage, disabled_move fields
-///   - Side: added screen_turns (reflect/light_screen turn counters)
-///   - legal_actions: respects recharge lock, disabled moves
-///   - BattleState: added weather (unused in Gen 1 but forward-compat slot)
+/// JSON deserialization still accepts the string format from Python.
+/// Conversion happens once at the boundary in main.rs (from_json_state).
 
 use serde::{Deserialize, Serialize};
+use crate::ids::*;
 
 // ─── Status ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Status {
-    #[default]
-    None,
-    Slp,
-    Par,
-    Psn,
-    Tox,
-    Brn,
-    Frz,
+    #[default] None,
+    Slp, Par, Psn, Tox, Brn, Frz,
 }
 
 impl Status {
@@ -34,202 +26,339 @@ impl Status {
     }
 }
 
-// ─── Individual Pokémon in battle ─────────────────────────────────────────────
+// ─── Compact Pokémon struct — zero heap allocation ────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]  // Copy because no heap fields
 pub struct BattlePoke {
-    /// Canonical species name (e.g. "tauros")
-    pub species: String,
-    /// Current HP as 0.0–1.0 fraction
-    pub hp_frac: f32,
-    /// Known / inferred moves available (move IDs, e.g. "bodyslam")
-    pub moves: Vec<String>,
-    pub status: Status,
-    /// Stat-stage boosts  (keys: "atk","def","spc","spe","acc","eva")
-    #[serde(default)]
-    pub boosts: std::collections::HashMap<String, i8>,
-    /// Is this slot fainted?
-    #[serde(default)]
-    pub fainted: bool,
-
-    // ── Volatile state (resets on switch) ────────────────────────────────
-
-    /// Substitute HP fraction (0.0 = no sub active)
-    #[serde(default)]
-    pub sub_hp_frac: f32,
-
-    /// Sleep counter: turns of sleep remaining (Gen 1: 1-7 turns, random).
-    /// We store the *expected* remaining turns (avg = 3.5 on start, counts down).
-    #[serde(default)]
-    pub sleep_turns: u8,
-
-    /// True when the Pokémon used Hyper Beam last turn and must recharge.
-    /// While true the only legal action is the implicit "recharge" turn.
-    #[serde(default)]
-    pub recharging: bool,
-
-    /// Toxic counter: number of turns since Toxic was applied (0 = not toxic).
-    /// Damage per turn = (toxic_counter / 16) × max_hp.
-    /// Resets to 0 on switch-out in Gen 1.
-    #[serde(default)]
-    pub toxic_counter: u8,
-
-    /// Trapping turns remaining (Wrap / Bind / Clamp / Fire Spin).
-    /// 0 = not trapped.  Gen 1: 2–5 turns, expected ~3.5.
-    #[serde(default)]
-    pub trapping_turns: u8,
-
-    /// True if the Pokémon is confused this turn.
-    #[serde(default)]
-    pub confused: bool,
-
-    /// Confusion turns remaining (for simulation; 0 if not confused).
-    #[serde(default)]
+    pub species:         u16,       // ids::species_to_id()
+    pub hp_frac:         f32,
+    pub moves:           [u16; 4],  // up to 4 moves; MOVE_NONE = empty slot
+    pub move_count:      u8,        // how many slots are actually filled
+    pub status:          Status,
+    pub boosts:          [i8; 6],   // [atk,def,spc,spe,acc,eva]
+    pub fainted:         bool,
+    pub sub_hp_frac:     f32,
+    pub sleep_turns:     u8,
+    pub recharging:      bool,
+    pub toxic_counter:   u8,
+    pub trapping_turns:  u8,
+    pub confused:        bool,
     pub confusion_turns: u8,
+    pub crit_stage:      u8,
+    pub disabled_move:   u16,       // MOVE_NONE = none
+    pub disable_turns:   u8,
+}
 
-    /// Focus Energy / crit-rate stage (Gen 1 bug: raises crit stage but
-    /// lowers effective crit rate — we track it to penalise the move).
-    #[serde(default)]
-    pub crit_stage: u8,
-
-    /// Move ID currently disabled by Disable (empty string = none).
-    #[serde(default)]
-    pub disabled_move: String,
-
-    /// Turns remaining on Disable (0 = not disabled).
-    #[serde(default)]
-    pub disable_turns: u8,
+impl Default for BattlePoke {
+    fn default() -> Self {
+        Self {
+            species: SPECIES_UNKNOWN,
+            hp_frac: 1.0,
+            moves: [MOVE_NONE; 4],
+            move_count: 0,
+            status: Status::None,
+            boosts: [0i8; 6],
+            fainted: false,
+            sub_hp_frac: 0.0,
+            sleep_turns: 0,
+            recharging: false,
+            toxic_counter: 0,
+            trapping_turns: 0,
+            confused: false,
+            confusion_turns: 0,
+            crit_stage: 0,
+            disabled_move: MOVE_NONE,
+            disable_turns: 0,
+        }
+    }
 }
 
 impl BattlePoke {
-    pub fn boost(&self, key: &str) -> i8 {
-        self.boosts.get(key).copied().unwrap_or(0)
-    }
-    pub fn has_sub(&self) -> bool { self.sub_hp_frac > 0.0 }
+    pub fn boost(&self, slot: usize) -> i8 { self.boosts[slot] }
+    pub fn has_sub(&self)   -> bool { self.sub_hp_frac > 0.0 }
     pub fn is_trapped(&self) -> bool { self.trapping_turns > 0 }
+
+    /// Iterate over non-empty move IDs.
+    pub fn move_ids(&self) -> &[u16] {
+        &self.moves[..self.move_count as usize]
+    }
+
+    /// Check if this poke has a move by string name (used in eval/inference).
+    pub fn has_move_str(&self, name: &str) -> bool {
+        let id = move_to_id(name);
+        if id == MOVE_NONE { return false; }
+        self.move_ids().contains(&id)
+    }
+
+    pub fn species_str(&self) -> &'static str {
+        id_to_species(self.species)
+    }
 }
 
-// ─── Side of the field ────────────────────────────────────────────────────────
+// ─── Side ─────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Max bench size: 5 (6 total - 1 active)
+pub const MAX_BENCH: usize = 5;
+
+#[derive(Debug, Clone, Copy)]
 pub struct Side {
-    pub active: BattlePoke,
-    /// Benched Pokémon (not fainted, not active)
-    pub bench: Vec<BattlePoke>,
+    pub active:              BattlePoke,
+    pub bench:               [BattlePoke; MAX_BENCH],
+    pub bench_count:         u8,
+    pub reflect:             bool,
+    pub reflect_turns:       u8,
+    pub light_screen:        bool,
+    pub light_screen_turns:  u8,
+}
 
-    /// Reflect active on this side.
-    #[serde(default)]
-    pub reflect: bool,
-    /// Turns remaining on Reflect (0 when inactive).
-    #[serde(default)]
-    pub reflect_turns: u8,
-
-    /// Light Screen active on this side.
-    #[serde(default)]
-    pub light_screen: bool,
-    /// Turns remaining on Light Screen (0 when inactive).
-    #[serde(default)]
-    pub light_screen_turns: u8,
+impl Default for Side {
+    fn default() -> Self {
+        Self {
+            active: BattlePoke::default(),
+            bench: [BattlePoke::default(); MAX_BENCH],
+            bench_count: 0,
+            reflect: false,
+            reflect_turns: 0,
+            light_screen: false,
+            light_screen_turns: 0,
+        }
+    }
 }
 
 impl Side {
     pub fn all_pokes(&self) -> impl Iterator<Item = &BattlePoke> {
-        std::iter::once(&self.active).chain(self.bench.iter())
+        std::iter::once(&self.active)
+            .chain(self.bench[..self.bench_count as usize].iter())
     }
+
     pub fn alive_count(&self) -> usize {
         self.all_pokes().filter(|p| !p.fainted).count()
     }
-    /// Returns available switch targets (alive bench members).
-    /// Excludes sleeping and frozen mons — switching to them just wastes
-    /// two turns (switch turn + immediate forced switch-back next turn).
-    /// Also blocked while the active Pokémon is trapped.
-    pub fn switches(&self) -> Vec<&BattlePoke> {
-        if self.active.is_trapped() {
-            return Vec::new();
-        }
-        self.bench.iter().filter(|p| {
+
+    pub fn switches(&self) -> impl Iterator<Item = &BattlePoke> {
+        let trapped = self.active.is_trapped();
+        self.bench[..self.bench_count as usize].iter().filter(move |p| {
             !p.fainted
+            && !trapped
             && p.status != Status::Slp
             && p.status != Status::Frz
-        }).collect()
+        })
     }
 }
 
-// ─── Top-level battle state ───────────────────────────────────────────────────
+// ─── Top-level state — now a plain Copy struct ────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct BattleState {
-    pub turn: u32,
-    pub ours: Side,
+    pub turn:   u32,
+    pub ours:   Side,
     pub theirs: Side,
 }
 
-// ─── Actions ─────────────────────────────────────────────────────────────────
+// ─── Actions — also string-free ───────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    Move    { id: String },
-    Switch  { species: String },
-    Recharge,   // forced recharge turn after Hyper Beam
+    Move     { id: u16 },      // MOVE_* constants or real move ID
+    Switch   { species: u16 }, // species ID
+    Recharge,
 }
 
 impl Action {
-    pub fn move_id(&self) -> Option<&str> {
-        if let Action::Move { id } = self { Some(id.as_str()) } else { None }
+    pub fn move_id_u16(&self) -> Option<u16> {
+        if let Action::Move { id } = self { Some(*id) } else { None }
+    }
+    /// String name of the move (for sim/calc lookups that still use &str).
+    pub fn move_str(&self) -> Option<&'static str> {
+        self.move_id_u16().map(id_to_move)
     }
 }
 
 // ─── Legal-action generator ───────────────────────────────────────────────────
 
 pub fn legal_actions(side: &Side) -> Vec<Action> {
-    // Recharge lock: only option is to waste the turn
     if side.active.recharging {
         return vec![Action::Recharge];
     }
-
-    // Immobilised by sleep or freeze: only option is to try to move (fail)
-    // We model this as a single "no-op move" so the tree still branches correctly.
     if side.active.status.is_immobilising() {
-        return vec![Action::Move { id: "__sleep_frz__".to_string() }];
+        return vec![Action::Move { id: MOVE_SLEEP_FRZ }];
     }
 
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(8);
 
-    // Available moves (excluding disabled)
-    for m in &side.active.moves {
-        if !m.is_empty()
-            && m != "struggle"
-            && m != "recharge"
-            && *m != side.active.disabled_move
-        {
-            out.push(Action::Move { id: m.clone() });
+    for &mid in side.active.move_ids() {
+        if mid == MOVE_NONE || mid == MOVE_STRUGGLE || mid == MOVE_RECHARGE {
+            continue;
+        }
+        if mid == side.active.disabled_move { continue; }
+        out.push(Action::Move { id: mid });
+    }
+
+    for p in side.switches() {
+        out.push(Action::Switch { species: p.species });
+    }
+
+    if out.is_empty() {
+        out.push(Action::Move { id: MOVE_STRUGGLE });
+    }
+    out
+}
+
+// ─── JSON wire format (Python still sends strings) ────────────────────────────
+// These types are only used once per turn at the deserialization boundary.
+// They are never cloned during search.
+
+#[derive(Debug, Deserialize)]
+pub struct JsonBattlePoke {
+    pub species:         String,
+    #[serde(default = "one_f32")]
+    pub hp_frac:         f32,
+    #[serde(default)]
+    pub moves:           Vec<String>,
+    #[serde(default)]
+    pub status:          Status,
+    #[serde(default)]
+    pub boosts:          std::collections::HashMap<String, i8>,
+    #[serde(default)]
+    pub fainted:         bool,
+    #[serde(default)]
+    pub sub_hp_frac:     f32,
+    #[serde(default)]
+    pub sleep_turns:     u8,
+    #[serde(default)]
+    pub recharging:      bool,
+    #[serde(default)]
+    pub toxic_counter:   u8,
+    #[serde(default)]
+    pub trapping_turns:  u8,
+    #[serde(default)]
+    pub confused:        bool,
+    #[serde(default)]
+    pub confusion_turns: u8,
+    #[serde(default)]
+    pub crit_stage:      u8,
+    #[serde(default)]
+    pub disabled_move:   String,
+    #[serde(default)]
+    pub disable_turns:   u8,
+}
+
+fn one_f32() -> f32 { 1.0 }
+
+#[derive(Debug, Deserialize)]
+pub struct JsonSide {
+    pub active: JsonBattlePoke,
+    #[serde(default)]
+    pub bench: Vec<JsonBattlePoke>,
+    #[serde(default)]
+    pub reflect: bool,
+    #[serde(default)]
+    pub reflect_turns: u8,
+    #[serde(default)]
+    pub light_screen: bool,
+    #[serde(default)]
+    pub light_screen_turns: u8,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JsonBattleState {
+    #[serde(default)]
+    pub turn: u32,
+    pub ours:   JsonSide,
+    pub theirs: JsonSide,
+}
+
+// Conversion: JsonBattlePoke → BattlePoke
+impl From<JsonBattlePoke> for BattlePoke {
+    fn from(j: JsonBattlePoke) -> Self {
+        let mut moves = [MOVE_NONE; 4];
+        let count = j.moves.len().min(4);
+        for (i, m) in j.moves.iter().take(4).enumerate() {
+            moves[i] = move_to_id(m);
+        }
+        let mut boosts = [0i8; 6];
+        for (k, v) in &j.boosts {
+            if let Some(idx) = boost_key_to_idx(k) {
+                boosts[idx] = *v;
+            }
+        }
+        BattlePoke {
+            species:        species_to_id(&j.species),
+            hp_frac:        j.hp_frac,
+            moves,
+            move_count:     count as u8,
+            status:         j.status,
+            boosts,
+            fainted:        j.fainted,
+            sub_hp_frac:    j.sub_hp_frac,
+            sleep_turns:    j.sleep_turns,
+            recharging:     j.recharging,
+            toxic_counter:  j.toxic_counter,
+            trapping_turns: j.trapping_turns,
+            confused:       j.confused,
+            confusion_turns:j.confusion_turns,
+            crit_stage:     j.crit_stage,
+            disabled_move:  move_to_id(&j.disabled_move),
+            disable_turns:  j.disable_turns,
         }
     }
+}
 
-    // Switches (blocked by trapping moves and sleeping/frozen mons)
-    for p in side.switches() {
-        out.push(Action::Switch { species: p.species.clone() });
+impl From<JsonSide> for Side {
+    fn from(j: JsonSide) -> Self {
+        let bench_count = j.bench.len().min(MAX_BENCH);
+        let mut bench = [BattlePoke::default(); MAX_BENCH];
+        for (i, b) in j.bench.into_iter().take(MAX_BENCH).enumerate() {
+            bench[i] = BattlePoke::from(b);
+        }
+        Side {
+            active:              BattlePoke::from(j.active),
+            bench,
+            bench_count:         bench_count as u8,
+            reflect:             j.reflect,
+            reflect_turns:       j.reflect_turns,
+            light_screen:        j.light_screen,
+            light_screen_turns:  j.light_screen_turns,
+        }
     }
+}
 
-    // Only add Struggle if there are truly no other options at all.
-    // If moves are empty but switches exist (faint-switch context), the
-    // engine should pick a switch — never Struggle.
-    if out.is_empty() {
-        out.push(Action::Move { id: "struggle".to_string() });
+impl From<JsonBattleState> for BattleState {
+    fn from(j: JsonBattleState) -> Self {
+        BattleState {
+            turn:   j.turn,
+            ours:   Side::from(j.ours),
+            theirs: Side::from(j.theirs),
+        }
     }
-
-    out
 }
 
 // ─── Decision (returned to Python) ───────────────────────────────────────────
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct Decision {
-    pub action: Action,
-    pub score: f64,
+    pub action:         ActionJson,
+    pub score:          f64,
     pub nodes_searched: u64,
-    pub algorithm: String,
-    /// Human-readable reason
-    pub reason: String,
+    pub algorithm:      String,
+    pub reason:         String,
+}
+
+/// Python-facing action — convert back to strings for JSON output.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ActionJson {
+    Move    { id: String },
+    Switch  { species: String },
+    Recharge,
+}
+
+impl From<Action> for ActionJson {
+    fn from(a: Action) -> Self {
+        match a {
+            Action::Move { id }      => ActionJson::Move    { id: id_to_move(id).to_string() },
+            Action::Switch { species }=> ActionJson::Switch  { species: id_to_species(species).to_string() },
+            Action::Recharge          => ActionJson::Recharge,
+        }
+    }
 }

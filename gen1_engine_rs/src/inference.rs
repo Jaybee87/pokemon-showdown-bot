@@ -163,10 +163,14 @@ static TEMPLATES: &[Template] = &[
 ///
 /// `max_moves` is typically 4 (Gen 1 max).
 pub fn infer_moves(poke: &mut BattlePoke, max_moves: usize) {
-    if poke.moves.len() >= max_moves { return; }
+    let current_count = poke.move_count as usize;
+    if current_count >= max_moves { return; }
 
-    let known: Vec<String> = poke.moves.clone();
-    let species = poke.species.to_lowercase();
+    // Build known list as strings for template matching
+    let known: Vec<String> = poke.move_ids().iter()
+        .map(|&id| crate::ids::id_to_move(id).to_string())
+        .collect();
+    let species = crate::ids::id_to_species(poke.species).to_lowercase();
 
     let inferred = if let Some(template_moves) = best_template(&species, &known) {
         template_moves
@@ -174,10 +178,16 @@ pub fn infer_moves(poke: &mut BattlePoke, max_moves: usize) {
         generic_coverage(&species, &known, max_moves)
     };
 
-    for mid in inferred {
-        if poke.moves.len() >= max_moves { break; }
-        if !poke.moves.contains(&mid) {
-            poke.moves.push(mid);
+    for mid_str in inferred {
+        if poke.move_count as usize >= max_moves { break; }
+        let mid_id = crate::ids::move_to_id(&mid_str);
+        if mid_id == crate::ids::MOVE_NONE { continue; }
+        // Don't duplicate
+        if poke.move_ids().contains(&mid_id) { continue; }
+        let slot = poke.move_count as usize;
+        if slot < 4 {
+            poke.moves[slot] = mid_id;
+            poke.move_count += 1;
         }
     }
 }

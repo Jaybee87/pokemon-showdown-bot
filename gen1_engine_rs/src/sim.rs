@@ -48,12 +48,12 @@ pub fn apply_turn(state: &BattleState, our_action: &Action, opp_action: &Action)
     let mut next = state.clone();
 
     // Phase 0: Switches
-    if let Action::Switch { species } = our_action  { do_switch(&mut next.ours,   species); }
-    if let Action::Switch { species } = opp_action  { do_switch(&mut next.theirs, species); }
+    if let Action::Switch { species } = our_action  { do_switch(&mut next.ours,   *species); }
+    if let Action::Switch { species } = opp_action  { do_switch(&mut next.theirs, *species); }
 
     // Phase 1: Move order
-    let our_mid = our_action.move_id();
-    let opp_mid = opp_action.move_id();
+    let our_mid = our_action.move_str();
+    let opp_mid = opp_action.move_str();
     let our_spe = effective_stats(&next.ours.active).map(|s| s.spe).unwrap_or(0);
     let opp_spe = effective_stats(&next.theirs.active).map(|s| s.spe).unwrap_or(0);
     let our_pri = move_priority(our_mid.unwrap_or(""));
@@ -173,7 +173,7 @@ fn apply_damage_to_side(
         defender_side.active.trapping_turns = 3;
     }
 
-    let max_hp = get_pokemon(&defender_side.active.species)
+    let max_hp = get_pokemon(defender_side.active.species_str())
         .map(|b| calc_stat_hp(b.hp) as f64).unwrap_or(100.0);
     let dmg_frac = (expected / max_hp) as f32;
 
@@ -196,8 +196,8 @@ fn damage_range_crit(attacker: &BattlePoke, mid: &str, defender: &BattlePoke) ->
     let move_data = match get_move(mid) { Some(m) => m, None => return (0,0) };
     if move_data.bp == 0 { return (0,0); }
 
-    let atk_base = match get_pokemon(&attacker.species) { Some(b) => b, None => return (0,0) };
-    let def_base = match get_pokemon(&defender.species)  { Some(b) => b, None => return (0,0) };
+    let atk_base = match get_pokemon(attacker.species_str()) { Some(b) => b, None => return (0,0) };
+    let def_base = match get_pokemon(defender.species_str())  { Some(b) => b, None => return (0,0) };
 
     let is_spec = move_data.move_type.is_special();
     let mut atk = if is_spec { calc_stat(atk_base.spc) as i32 } else { calc_stat(atk_base.atk) as i32 };
@@ -224,7 +224,7 @@ fn damage_range_crit(attacker: &BattlePoke, mid: &str, defender: &BattlePoke) ->
 
 fn confusion_dmg_frac(p: &BattlePoke) -> f64 {
     let stats = match effective_stats(p) { Some(s) => s, None => return 0.0 };
-    let max_hp = get_pokemon(&p.species).map(|b| calc_stat_hp(b.hp) as f64).unwrap_or(100.0);
+    let max_hp = get_pokemon(p.species_str()).map(|b| calc_stat_hp(b.hp) as f64).unwrap_or(100.0);
     let raw = (42.0 * CONFUSION_BP * stats.atk as f64) / (stats.def as f64 * 50.0) + 2.0;
     raw / max_hp
 }
@@ -274,7 +274,7 @@ fn tick_volatiles(p: &mut BattlePoke) {
     }
     if p.disable_turns > 0 {
         p.disable_turns -= 1;
-        if p.disable_turns == 0 { p.disabled_move.clear(); }
+        if p.disable_turns == 0 { p.disabled_move = crate::ids::MOVE_NONE; }
     }
     if p.trapping_turns > 0 { p.trapping_turns -= 1; }
     // Recharge is consumed at start of the locked turn; clear here so next turn is free
@@ -283,8 +283,10 @@ fn tick_volatiles(p: &mut BattlePoke) {
 
 // ─── Switch and send helpers ──────────────────────────────────────────────────
 
-fn do_switch(side: &mut Side, species: &str) {
-    if let Some(idx) = side.bench.iter().position(|p| p.species == species) {
+fn do_switch(side: &mut Side, species_id: u16) {
+    let count = side.bench_count as usize;
+    if let Some(idx) = side.bench[..count].iter().position(|p| p.species == species_id) {
+        side.bench.swap(0, idx);  // bring to front temporarily
         std::mem::swap(&mut side.active, &mut side.bench[idx]);
         reset_volatile(&mut side.active);
     }
@@ -298,18 +300,18 @@ fn reset_volatile(p: &mut BattlePoke) {
     p.confusion_turns = 0;
     p.crit_stage = 0;
     p.disable_turns = 0;
-    p.disabled_move.clear();
+    p.disabled_move = crate::ids::MOVE_NONE;
     p.sub_hp_frac = 0.0;
-    p.boosts.clear();
+    p.boosts = [0i8; 6];
     // Status (SLP/PSN/etc.) persists through switch in Gen 1
 }
 
 fn auto_send(side: &mut Side) {
     if side.active.fainted {
-        if let Some(idx) = side.bench.iter().position(|p| !p.fainted) {
-            let next = side.bench.remove(idx);
-            let old  = std::mem::replace(&mut side.active, next);
-            side.bench.push(old);
+        let count = side.bench_count as usize;
+        if let Some(idx) = side.bench[..count].iter().position(|p| !p.fainted) {
+            std::mem::swap(&mut side.active, &mut side.bench[idx]);
+            reset_volatile(&mut side.active);
         }
     }
 }
