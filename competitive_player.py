@@ -873,50 +873,140 @@ LEAD: <species>"""
                 return self.create_order(sleep_move)
 
         # ==================================================================
-        # STEP 7b — Toxic heal: if we are Badly Poisoned, heal immediately.
+        # STEP 7b/c/e — Unified heal filter.
+        #
+        # All heal logic in one place with clear precedence. Applies to
+        # all Gen 1 heal moves: softboiled, recover, rest.
+        #
+        # ALWAYS heal (fire immediately before Rust):
+        #   - Toxic/Poison: escalating damage, cure now regardless of HP
+        #   - HP < 40% with Softboiled/Recover available: one hit from death
+        #
+        # NEVER offer to Rust (strip from move list):
+        #   - Rest at ≥ 85% HP without poison: 2-turn sleep for near-zero gain
+        #   - Any heal within 3 turns of last heal AND HP ≥ 80%: spam prevention
+        #   - Any heal when HP ≥ 80% AND we're up 2+ mons: press the win
+        #
+        # Everything else (40–85% HP, no active status forcing action):
+        #   defer to Rust — it has context we don't.
         # ==================================================================
-        if my_status_now and my_status_now.name == 'TOX':
-            heal_move = next(
-                (m for m in real_moves if m.id in ('softboiled', 'recover', 'rest')), None
-            )
+        HEAL_MOVES = ('softboiled', 'recover', 'rest')
+        my_is_tox  = my_status_now and my_status_now.name in ('TOX', 'PSN')
+        my_is_par  = my_status_now and my_status_now.name == 'PAR'
+
+        # ALWAYS: Toxic/Poison — heal immediately regardless of HP
+        if my_is_tox:
+            heal_move = next((m for m in real_moves if m.id in HEAL_MOVES), None)
             if heal_move:
                 print(f"  💊 PYTHON: Toxiced — healing with {heal_move.id}")
                 self._last_healed_turn    = battle.turn
                 self._last_healed_species = my_species
-                self._python_call_count += 1
+                self._python_call_count  += 1
                 return self.create_order(heal_move)
 
-        # ==================================================================
-        # STEP 7c — Low-HP heal: below 40% HP + heal available.
-        # ==================================================================
-        if my_hp_frac < 0.40:
-            heal_move = next(
-                (m for m in real_moves if m.id in ('softboiled', 'recover')), None
-            )
-            if heal_move:
+        # ALWAYS: low HP — but only if we're actually in danger this turn.
+        # "Danger" is defined by the opponent's known damage output, not a
+        # fixed threshold. We heal if we can't safely survive the next hit.
+        #
+        # Logic:
+        #   - Calculate the opponent's max expected damage this turn from
+        #     their revealed moves (or a conservative fallback if unknown).
+        #   - If we're slower: also account for their next turn hit, since
+        #     they'll attack before we can heal.
+        #   - Heal if current HP ≤ expected_max_hit * safety_margin.
+        #   - Don't heal if we have room to take 2+ hits — defer to Rust.
+        heal_move_nontox = next(
+            (m for m in real_moves if m.id in ('softboiled', 'recover')), None
+        )
+        if heal_move_nontox and my_hp_frac < 0.55:
+            # Build opponent's max damage per turn from revealed moves
+            opp_known_names = self._opponent_move_names.get(opp_species, [])
+            opp_max_dmg = 0.0
+            if opp_known_names:
+                for move_id in opp_known_names:
+                    try:
+                        lo, hi = calc_damage_pct(
+                            opp_species, move_id, my_species,
+                            atk_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
+                            def_boosts=dict(my_poke.boosts)  if my_poke.boosts  else {},
+                        )
+                        opp_max_dmg = max(opp_max_dmg, hi)
+                    except Exception:
+                        pass
+            if opp_max_dmg == 0.0:
+                # No revealed moves — use conservative type-based estimate.
+                # Assume ~30% as a neutral baseline; scale up for super-effective.
+                opp_known_types = self._opponent_move_types.get(opp_species, [])
+                worst_eff = worst_incoming_effectiveness(opp_known_types, my_types)
+                opp_max_dmg = 0.30 * worst_eff  # rough upper-bound estimate
+
+            # If we're slower, we'll take a hit before we can heal next turn too.
+            we_are_slower = not outspeeds(my_species, opp_species,
+                                          a_par=(my_status_now and my_status_now.name=='PAR'),
+                                          b_par=(opp_poke.status and opp_poke.status.name=='PAR'
+                                                 if opp_poke.status else False))
+            hits_before_heal = 2 if we_are_slower else 1
+
+            # PAR: 25% chance of full immobilisation each turn we need to act.
+            # If we need 1 action to heal: 75% success → scale threshold by 1/0.75
+            # If we need 2 actions (slower+PAR): 56% success → scale by 1/0.56
+            # This means we heal earlier when paralysed since we can't guarantee
+            # the heal action will land.
+            par_scale = 1.0
+            if my_is_par:
+                par_success_prob = 0.75 ** hits_before_heal
+                par_scale = 1.0 / par_success_prob  # 1.33× if faster, 1.78× if slower
+
+            danger_threshold = opp_max_dmg * hits_before_heal * 1.2 * par_scale
+
+            if my_hp_frac <= danger_threshold:
                 opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
                 our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
-                skip_heal = (opp_alive == 1 and our_alive >= 2)
-                if not skip_heal:
-                    print(f"  💊 PYTHON: low HP ({int(my_hp_frac*100)}%) — healing with {heal_move.id}")
+                if not (opp_alive == 1 and our_alive >= 2):
+                    print(f"  💊 PYTHON: danger heal ({int(my_hp_frac*100)}% HP, "
+                          f"opp max ~{int(opp_max_dmg*100)}%/turn, "
+                          f"{'slower' if we_are_slower else 'faster'}"
+                          f"{f', PAR ×{par_scale:.2f}' if my_is_par else ''}) "
+                          f"— healing with {heal_move_nontox.id}")
                     self._last_healed_turn    = battle.turn
                     self._last_healed_species = my_species
-                    self._python_call_count += 1
-                    return self.create_order(heal_move)
+                    self._python_call_count  += 1
+                    return self.create_order(heal_move_nontox)
+
+        # NEVER (strip from move list before Rust):
+        heal_moves_available = [m for m in real_moves if m.id in HEAL_MOVES]
+        if heal_moves_available:
+            opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+            our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
+            turns_since_heal = battle.turn - self._last_healed_turn
+            same_species     = (self._last_healed_species == my_species)
+
+            strip_heals = set()
+            for hm in heal_moves_available:
+                # Rest at high HP without poison: 2 turns of sleep for minimal gain
+                if hm.id == 'rest' and my_hp_frac >= 0.85:
+                    strip_heals.add(hm.id)
+                # Heal spam: healed same mon within last 3 turns and HP still high
+                if turns_since_heal <= 3 and same_species and my_hp_frac >= 0.80:
+                    strip_heals.add(hm.id)
+                # Up on mons significantly: press the advantage, don't stall
+                if my_hp_frac >= 0.80 and our_alive >= opp_alive + 2:
+                    strip_heals.add(hm.id)
+
+            if strip_heals:
+                filtered = [m for m in real_moves if m.id not in strip_heals]
+                if filtered:  # only strip if alternatives exist
+                    stripped_names = sorted(strip_heals)
+                    print(f"  🚫 PYTHON: suppressing {'/'.join(stripped_names)} "
+                          f"({int(my_hp_frac*100)}% HP, {turns_since_heal}t since last heal)")
+                    real_moves = filtered
 
         # ==================================================================
         # STEP 7d — Paralysed + Hyperbeam suppression.
-        # When we are paralysed, strip Hyperbeam from the move list before
-        # passing to Rust. PAR means 25% fully-wasted turns; HB adds a
-        # guaranteed recharge turn on top — two consecutive dead turns while
-        # the opponent acts freely. Rust's eval penalties don't overcome the
-        # raw damage scores. Only allow HB if no other damaging move exists.
         # ==================================================================
-        my_is_par = my_status_now and my_status_now.name == 'PAR'
         if my_is_par and any(m.id == 'hyperbeam' for m in real_moves):
             non_hb = [m for m in real_moves if m.id != 'hyperbeam']
-            has_damage_alt = any((m.base_power or 0) > 0 for m in non_hb)
-            if has_damage_alt:
+            if any((m.base_power or 0) > 0 for m in non_hb):
                 real_moves = non_hb
                 print(f"  🚫 PYTHON: paralysed — suppressing Hyperbeam")
 
@@ -987,24 +1077,9 @@ LEAD: <species>"""
                     self._python_call_count += 1
                     return self.create_order(best_move)
 
-        # Track heals
-        if last_action_id in ('softboiled', 'recover'):
-            turns_since_heal = battle.turn - self._last_healed_turn
-            same_species = (self._last_healed_species == my_species)
-            if turns_since_heal <= 3 and same_species and my_hp_frac >= 0.80:
-                alt = next(
-                    (m for m in real_moves
-                     if m.id not in ('softboiled', 'recover', 'rest')
-                     and (m.base_power or 0) > 0),
-                    None
-                )
-                if alt:
-                    print(f"  🚫 PYTHON: heal cooldown ({turns_since_heal}t ago, "
-                          f"{int(my_hp_frac*100)}% HP) — attacking with {alt.id}")
-                    self._python_call_count += 1
-                    return self.create_order(alt)
-
-        if last_action_id in ('softboiled', 'recover'):
+        # Track heals so the unified heal filter above can apply the
+        # spam-prevention cooldown next turn.
+        if last_action_id in ('softboiled', 'recover', 'rest'):
             self._last_healed_turn    = battle.turn
             self._last_healed_species = my_species
 
