@@ -29,6 +29,7 @@ import random
 import string
 import re
 import glob
+import time
 
 from poke_env.player import Player
 from poke_env import LocalhostServerConfiguration, AccountConfiguration
@@ -48,6 +49,137 @@ from llm_bridge import (
     parse_battle_decision, parse_lead_choice, ensure_ollama_running,
 )
 from rust_engine_bridge import RustEngine, build_state, action_to_poke_env
+
+
+# =============================================================================
+# TIME MANAGER
+# =============================================================================
+
+class TimeManager:
+    """
+    Allocates the Showdown time bank across turns.
+
+    Showdown ladder rules:
+      - 210 seconds total bank per game (shared across all turns)
+      - Hard cap of 150 seconds per individual turn
+      - Timer only counts when it's YOUR turn to move
+
+    Strategy: score each position for complexity (0.0–1.0) and allocate
+    compute time proportionally, preserving enough bank for remaining turns.
+
+    Complexity factors:
+      - Late game (few mons alive): higher — fewer branches but each matters more
+      - HP close / both sides chipped: higher — outcome less certain
+      - First turn: higher — unknown opponent team, widest decision space
+      - Faint switch: higher — irreversible, sets next N turns
+      - Clear winning position (3+ mon advantage): lower — don't waste time
+      - Python fast-path fired: zero — time manager not consulted at all
+
+    Time budget floor: 300ms  (never slower than original for trivial spots)
+    Time budget ceiling: 12,000ms per turn (leaves headroom in bank)
+    Default base budget: 2,000ms when bank is healthy
+    """
+
+    # Showdown limits
+    BANK_TOTAL_S   = 210.0   # total bank seconds
+    TURN_CAP_S     = 150.0   # hard per-turn cap
+    BANK_FLOOR_S   = 15.0    # keep this many seconds in reserve at all times
+    MIN_MS         = 300     # floor — never slower than old engine
+    MAX_MS         = 12_000  # ceiling per turn
+    BASE_MS        = 2_000   # default when bank is healthy
+
+    def __init__(self):
+        self._bank_remaining_s: float = self.BANK_TOTAL_S
+        self._turn_start: float       = 0.0
+        self._last_turn: int          = 0
+
+    def reset(self):
+        """Call at the start of each new game."""
+        self._bank_remaining_s = self.BANK_TOTAL_S
+        self._turn_start       = 0.0
+        self._last_turn        = 0
+
+    def start_turn(self, turn: int):
+        """Record when we started thinking this turn."""
+        if turn != self._last_turn:
+            self._last_turn  = turn
+            self._turn_start = time.monotonic()
+
+    def end_turn(self):
+        """Deduct actual elapsed time from the bank."""
+        if self._turn_start > 0:
+            elapsed = time.monotonic() - self._turn_start
+            self._bank_remaining_s = max(0.0, self._bank_remaining_s - elapsed)
+            self._turn_start = 0.0
+
+    def allocate(
+        self,
+        battle_turn:   int,
+        our_alive:     int,
+        opp_alive:     int,
+        our_hp_frac:   float,
+        opp_hp_frac:   float,
+        is_faint_switch: bool = False,
+    ) -> int:
+        """
+        Return the number of milliseconds to give the Rust engine this turn.
+        Called after Python fast-paths have been checked — only invoked when
+        we're actually going to run a search.
+        """
+        spendable = self._bank_remaining_s - self.BANK_FLOOR_S
+        if spendable <= 0:
+            return self.MIN_MS
+
+        # ── Complexity score 0.0–1.0 ─────────────────────────────────────
+        score = 0.0
+
+        # Game phase: late game is highest stakes
+        total_alive = our_alive + opp_alive
+        if total_alive <= 2:
+            score += 0.45   # last mons — every node matters
+        elif total_alive <= 4:
+            score += 0.30   # endgame
+        elif total_alive <= 6:
+            score += 0.15   # midgame
+        else:
+            score += 0.05   # early game, full teams
+
+        # Turn 1: widest decision space, opponent team unknown
+        if battle_turn == 1:
+            score += 0.20
+
+        # Faint switch: irreversible send-in decision
+        if is_faint_switch:
+            score += 0.25
+
+        # Position closeness: close HP = harder to evaluate
+        hp_diff = abs(our_hp_frac - opp_hp_frac)
+        if hp_diff < 0.15:
+            score += 0.20   # essentially even
+        elif hp_diff < 0.30:
+            score += 0.10
+
+        # Clear lead: we're winning easily → spend less
+        mon_diff = our_alive - opp_alive
+        if mon_diff >= 2:
+            score -= 0.15
+        elif mon_diff <= -2:
+            # We're losing — think harder about the comeback
+            score += 0.15
+
+        score = max(0.05, min(1.0, score))
+
+        # ── Budget allocation ─────────────────────────────────────────────
+        # Scale BASE_MS by complexity, cap at both the per-turn limit and
+        # what the bank can actually afford.
+        raw_ms  = int(self.BASE_MS * (0.3 + score * 1.4))  # 0.3–1.7× base
+        bank_ms = int(min(spendable, self.TURN_CAP_S) * 1000 * 0.6)  # use 60% of available
+        alloc   = max(self.MIN_MS, min(raw_ms, bank_ms, self.MAX_MS))
+
+        return alloc
+
+    def status(self) -> str:
+        return f"bank={self._bank_remaining_s:.1f}s"
 
 
 # =============================================================================
@@ -251,6 +383,9 @@ class CompetitivePlayer(Player):
         self._last_rust_result:   dict = {}
         self._last_healed_turn:   int  = -99
         self._last_healed_species: str = ""
+        self._last_switched_in_turn: int  = -99   # switch cooldown
+        self._last_switched_in_species: str = ""  # which mon just switched in
+        self._time_manager = TimeManager()
         self._rust_engine = RustEngine(
             algorithm="auto",
             depth=6,        # up from 4 — iterative deepening reaches 6+ plies
@@ -473,6 +608,12 @@ LEAD: <species>"""
             self._sleep_attempted_vs   = {}
             self._last_healed_turn     = -99
             self._last_healed_species  = ""
+            self._last_switched_in_turn    = -99
+            self._last_switched_in_species = ""
+            self._time_manager.reset()
+
+        # Record turn start for time bank tracking
+        self._time_manager.start_turn(battle.turn)
 
         # Sleep Clause tracking
         if not self._sleep_clause_active:
@@ -577,8 +718,20 @@ LEAD: <species>"""
 
             opp_known_types = self._opponent_move_types.get(opp_poke.species, [])
             print(f"\n  ⚙️  RUST ENGINE (faint switch)")
-            rust_order = self._try_rust_faint_switch(battle, switches)
+            our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
+            opp_alive  = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+            faint_time_ms = self._time_manager.allocate(
+                battle_turn    = battle.turn,
+                our_alive      = our_alive,
+                opp_alive      = opp_alive,
+                our_hp_frac    = my_hp_frac,
+                opp_hp_frac    = opp_hp_frac,
+                is_faint_switch= True,
+            )
+            rust_order = self._try_rust_faint_switch(battle, switches,
+                                                     time_ms=faint_time_ms)
             if rust_order:
+                self._time_manager.end_turn()
                 return rust_order
 
             # LLM fallback
@@ -775,7 +928,26 @@ LEAD: <species>"""
         # Pass the filtered move list so suppressed moves (e.g. HB when PAR)
         # are never visible to the search.
         active_move_ids = [m.id for m in real_moves]
-        rust_result = self._try_rust_engine(battle, active_move_ids=active_move_ids)
+
+        # Allocate compute time based on position complexity
+        our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
+        opp_alive  = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+        time_budget_ms = self._time_manager.allocate(
+            battle_turn    = battle.turn,
+            our_alive      = our_alive,
+            opp_alive      = opp_alive,
+            our_hp_frac    = my_hp_frac,
+            opp_hp_frac    = opp_hp_frac,
+            is_faint_switch= False,
+        )
+        print(f"  ⏱  Time budget: {time_budget_ms}ms ({self._time_manager.status()})")
+
+        rust_result = self._try_rust_engine(
+            battle,
+            active_move_ids=active_move_ids,
+            time_ms=time_budget_ms,
+        )
+        self._time_manager.end_turn()
 
         if rust_result is None:
             return self._llm_fallback(battle, real_moves, switches)
@@ -795,10 +967,27 @@ LEAD: <species>"""
                 self._python_call_count += 1
                 return self.create_order(alt)
 
-        # Post-process: veto Softboiled/Recover when above 80% HP and we
-        # already healed within the last 3 turns. The 2-turn/70% threshold
-        # was too loose — PAR chip drops HP fast enough to reset it.
-        last_action_id = last.get('action', {}).get('id', '')
+        # Post-process: switch cooldown — if the active mon switched in last
+        # turn, don't immediately switch out again unless HP is below 50%.
+        # Repeated pivoting wastes turns and chips our own mons on switch-in damage.
+        last_action = last.get('action', {})
+        last_action_id = last_action.get('id', '')
+        if last_action.get('type') == 'switch':
+            just_switched_in = (
+                self._last_switched_in_species == my_species
+                and battle.turn - self._last_switched_in_turn == 1
+            )
+            if just_switched_in and my_hp_frac > 0.50 and real_moves:
+                best_move, _ = best_move_effectiveness(
+                    real_moves, opp_types, attacker_types=my_types
+                )
+                if best_move:
+                    print(f"  🚫 PYTHON: switch cooldown (just switched in) "
+                          f"— attacking with {best_move.id}")
+                    self._python_call_count += 1
+                    return self.create_order(best_move)
+
+        # Track heals
         if last_action_id in ('softboiled', 'recover'):
             turns_since_heal = battle.turn - self._last_healed_turn
             same_species = (self._last_healed_species == my_species)
@@ -815,10 +1004,15 @@ LEAD: <species>"""
                     self._python_call_count += 1
                     return self.create_order(alt)
 
-        # Track if we are about to heal
         if last_action_id in ('softboiled', 'recover'):
             self._last_healed_turn    = battle.turn
             self._last_healed_species = my_species
+
+        # Track the switch we're about to make
+        if last_action.get('type') == 'switch':
+            target_species = last_action.get('species', '').lower()
+            self._last_switched_in_turn    = battle.turn
+            self._last_switched_in_species = target_species
 
         return rust_result
 
@@ -850,19 +1044,18 @@ LEAD: <species>"""
     # Rust engine helpers
     # -------------------------------------------------------------------------
 
-    def _try_rust_engine(self, battle, active_move_ids: list = None):
+    def _try_rust_engine(self, battle, active_move_ids: list = None, time_ms: int = None):
         """
         Query the Rust engine for a normal (non-faint) decision.
         active_move_ids: optional filtered list of move IDs to present to Rust.
-                         If None, uses the full moveset from poke-env.
+        time_ms: search budget in ms; defaults to engine default if None.
         """
         self._last_rust_result = {}
         try:
             state = build_state(battle, sleep_turns=self._sleep_turns)
-            # Apply move suppression — replace active's moves with the filtered list
             if active_move_ids is not None:
                 state["ours"]["active"]["moves"] = active_move_ids
-            result = self._rust_engine.choose(state)
+            result = self._rust_engine.choose(state, time_ms=time_ms)
             if "error" in result:
                 print(f"  ⚠️  Rust engine error: {result['error']}")
                 return None
@@ -928,7 +1121,7 @@ LEAD: <species>"""
             return self.create_order(best_move)
         return self.choose_default_move()
 
-    def _try_rust_faint_switch(self, battle, switches):
+    def _try_rust_faint_switch(self, battle, switches, time_ms: int = None):
         """
         Query Rust specifically for a faint switch.
         Builds a state where our active has no moves (switch-only position)
@@ -936,9 +1129,8 @@ LEAD: <species>"""
         """
         try:
             state = build_state(battle, sleep_turns=self._sleep_turns)
-            # Zero out our active's moves — only switches are legal
             state["ours"]["active"]["moves"] = []
-            result = self._rust_engine.choose(state)
+            result = self._rust_engine.choose(state, time_ms=time_ms)
 
             if "error" in result:
                 print(f"  ⚠️  Rust faint-switch error: {result['error']}")
