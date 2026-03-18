@@ -1172,9 +1172,13 @@ LEAD: <species>"""
 
         # Post-process: veto Hyperbeam when position is deeply losing
         # BUT: never veto a guaranteed KO — if they die, there's no recharge turn.
+        # BUT: never veto when opponent is asleep — a sleeping opponent can't move
+        # during our recharge turn, so the recharge risk is zero.
         last = getattr(self, '_last_rust_result', {})
+        opp_is_asleep = opp_poke.status and opp_poke.status.name == 'SLP'
         if (last.get('action', {}).get('id') == 'hyperbeam'
-                and last.get('score', 0) < -2000):
+                and last.get('score', 0) < -2000
+                and not opp_is_asleep):
             # Check if this is a guaranteed KO before vetoing
             hb_is_guaranteed_ko = can_ko(
                 my_species, 'hyperbeam', opp_species,
