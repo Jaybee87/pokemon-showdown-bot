@@ -385,6 +385,7 @@ class CompetitivePlayer(Player):
         self._last_rust_result:   dict = {}
         self._last_healed_turn:   int  = -99
         self._last_healed_species: str = ""
+        self._last_healed_hp_frac: float = 1.0   # HP at time of last heal (tox race check)
         self._last_switched_in_turn: int  = -99   # switch cooldown
         self._last_switched_in_species: str = ""  # which mon just switched in
         self._time_manager = TimeManager()
@@ -610,6 +611,7 @@ LEAD: <species>"""
             self._sleep_attempted_vs   = {}
             self._last_healed_turn     = -99
             self._last_healed_species  = ""
+            self._last_healed_hp_frac  = 1.0
             self._last_switched_in_turn    = -99
             self._last_switched_in_species = ""
             self._time_manager.reset()
@@ -825,29 +827,44 @@ LEAD: <species>"""
         }
 
         # Guaranteed KO check — use min damage roll (use_avg=False) so "guaranteed"
-        # means the WORST roll still kills. Previously used average roll which caused
-        # 22 cases across all logs where we called "guaranteed" and opp survived.
-        # Exclude Hyperbeam (recharge risk needs search) and explosion/selfdestruct.
+        # means the WORST roll still kills.
+        # Exclude Hyperbeam (recharge risk handled by Rust) and explosion/selfdestruct.
         # Also exclude Hyperbeam when we are below 15% HP — recharge turn is fatal.
+        #
+        # Speed+heal guard: if the opponent is faster AND has a revealed heal move,
+        # they will Recover/Softboiled BEFORE our attack lands on the same turn.
+        # The hp_pct we have is pre-heal — the actual HP when we hit will be ~50% higher.
+        # In this case the GKO math is correct but the premise is wrong, so skip the gate.
+        opp_revealed_heals = self._opponent_move_names.get(opp_species, [])
+        opp_has_heal = any(m in opp_revealed_heals for m in ('recover', 'softboiled', 'rest'))
+        opp_is_faster = not outspeeds(
+            my_species, opp_species,
+            a_par=(my_status_now and my_status_now.name == 'PAR'),
+            b_par=(opp_poke.status and opp_poke.status.name == 'PAR'
+                   if opp_poke.status else False)
+        )
+        skip_gko = opp_has_heal and opp_is_faster
+
         my_hp_too_low_for_hb = my_hp_frac < 0.15
         ko_move_obj = None
-        for mv in real_moves:
-            if mv.id in ('explosion', 'selfdestruct'):
-                continue
-            if mv.id == 'hyperbeam' and my_hp_too_low_for_hb:
-                continue
-            try:
-                is_ko = can_ko(
-                    my_species, mv.id, opp_species,
-                    hp_pct=opp_hp_frac,
-                    use_avg=False,          # min roll — truly guaranteed
-                    **calc_kwargs
-                )
-            except Exception:
-                is_ko = False
-            if is_ko:
-                ko_move_obj = mv
-                break
+        if not skip_gko:
+            for mv in real_moves:
+                if mv.id in ('explosion', 'selfdestruct'):
+                    continue
+                if mv.id == 'hyperbeam' and my_hp_too_low_for_hb:
+                    continue
+                try:
+                    is_ko = can_ko(
+                        my_species, mv.id, opp_species,
+                        hp_pct=opp_hp_frac,
+                        use_avg=False,      # min roll — truly guaranteed
+                        **calc_kwargs
+                    )
+                except Exception:
+                    is_ko = False
+                if is_ko:
+                    ko_move_obj = mv
+                    break
         if ko_move_obj:
             print(f"  🎯 PYTHON GUARANTEED KO: {ko_move_obj.id} finishes "
                   f"{opp_poke.species} at {int(opp_hp_frac*100)}%")
@@ -907,15 +924,56 @@ LEAD: <species>"""
         my_is_tox  = my_status_now and my_status_now.name in ('TOX', 'PSN')
         my_is_par  = my_status_now and my_status_now.name == 'PAR'
 
-        # ALWAYS: Toxic/Poison — heal immediately regardless of HP
+        # ALWAYS: Toxic/Poison — heal immediately, BUT only when recovery
+        # can actually help. Gen 1 Toxic escalates: counter N → N/16 HP lost
+        # per turn. Recover restores 50%. Once the counter hits 9+, Toxic
+        # drains more than 56%/turn — recovery can never catch up and we just
+        # waste turns. The correct play at that point is to switch or attack.
+        #
+        # Futility check: if we healed last turn AND HP is still lower than
+        # it was before that heal (net negative), recovery has failed — stop.
+        # Also cap at tox_counter >= 9 (>50%/turn drain beats 50% recovery).
         if my_is_tox:
             heal_move = next((m for m in real_moves if m.id in HEAL_MOVES), None)
             if heal_move:
-                print(f"  💊 PYTHON: Toxiced — healing with {heal_move.id}")
-                self._last_healed_turn    = battle.turn
-                self._last_healed_species = my_species
-                self._python_call_count  += 1
-                return self.create_order(heal_move)
+                tox_counter = getattr(my_poke, 'toxic_turn_counter',
+                                      getattr(my_poke, 'toxic_turns_left',
+                                      None))
+                # poke-env sometimes exposes this as n_turns_statused for TOX
+                if tox_counter is None:
+                    try:
+                        tox_counter = battle.active_pokemon.n_turns_statused
+                    except AttributeError:
+                        tox_counter = None
+
+                # Hard cap: counter >= 9 means ≥56.25% drain vs 50% recovery
+                tox_is_futile = (tox_counter is not None and tox_counter >= 9)
+
+                # Soft cap: if we healed last turn and HP is still trending down,
+                # recovery is not keeping up — hand off to Rust
+                healed_last_turn = (
+                    self._last_healed_turn == battle.turn - 1
+                    and self._last_healed_species == my_species
+                )
+                tox_losing_race = (
+                    healed_last_turn
+                    and my_hp_frac < self._last_healed_hp_frac - 0.05
+                )
+
+                if not tox_is_futile and not tox_losing_race:
+                    print(f"  💊 PYTHON: Toxiced — healing with {heal_move.id}")
+                    self._last_healed_turn     = battle.turn
+                    self._last_healed_species  = my_species
+                    self._last_healed_hp_frac  = my_hp_frac
+                    self._python_call_count   += 1
+                    return self.create_order(heal_move)
+                elif tox_is_futile:
+                    print(f"  🚫 PYTHON: Toxic futile (counter={tox_counter}, "
+                          f"drain>{50:.0f}%) — deferring to Rust")
+                else:
+                    print(f"  🚫 PYTHON: Toxic recovery losing race "
+                          f"(HP {int(self._last_healed_hp_frac*100)}%→{int(my_hp_frac*100)}% after heal) "
+                          f"— deferring to Rust")
 
         # ALWAYS: low HP — but only if we're actually in danger this turn
         # AND healing can actually help us win.
