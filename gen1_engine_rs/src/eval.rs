@@ -1,6 +1,13 @@
-/// eval.rs v3 — Fixes from live battle analysis.
+/// eval.rs v4 — Two Gen 1-specific evaluator tweaks from external review.
 ///
-/// Key changes:
+/// New in v4:
+///   - PAR speed breakpoint bonus (§7b): discrete +90/-90 when paralysis
+///     flips who moves first, capturing the binary nature of Gen 1 speed control
+///   - Crit pressure (§7c): small bonus proportional to crit rate differential
+///     when faster, reflecting that fast mons (Tauros/Alakazam/Starmie at ~22%)
+///     apply meaningfully more crit variance than slow mons (~6%) in damage races
+///
+/// Previous changes (v3):
 ///   - Hyperbeam penalised when user is paralysed (recharge + 25% para = disaster)
 ///   - Hyperbeam penalised on turn 1 (opponent gets free recharge turn early)
 ///   - Sleep status penalty now uses sleep_turns correctly (was always 3 before)
@@ -9,6 +16,7 @@
 
 use crate::state::*;
 use crate::calc::*;
+use crate::data::{get_pokemon, calc_stat};
 
 // ─── Terminal detection ───────────────────────────────────────────────────────
 
@@ -98,6 +106,57 @@ pub fn evaluate(state: &BattleState) -> f64 {
     let their_spe = effective_stats(&state.theirs.active).map(|s| s.spe).unwrap_or(1) as f64;
     let spe_ratio = (our_spe - their_spe) / their_spe.max(1.0);
     score += spe_ratio.clamp(-1.0, 1.0) * 80.0;
+
+    // ── 7b. PAR speed breakpoint bonus ───────────────────────────────────
+    // In Gen 1, speed control is binary: you either go first or you don't.
+    // A gradual spe_ratio undersells what PAR actually does — it flips a
+    // matchup from "they move first" to "we move first", which is a discrete
+    // strategic advantage worth more than a smooth interpolation captures.
+    //
+    // When PAR flips who has first-move advantage, award a discrete bonus.
+    // We compute base speeds (pre-PAR) to detect the before/after flip.
+    let our_base_spe   = get_pokemon(state.ours.active.species_str())
+        .map(|b| calc_stat(b.spe) as f64).unwrap_or(1.0);
+    let their_base_spe = get_pokemon(state.theirs.active.species_str())
+        .map(|b| calc_stat(b.spe) as f64).unwrap_or(1.0);
+    let our_par   = state.ours.active.status   == Status::Par;
+    let their_par = state.theirs.active.status == Status::Par;
+    // Was trailing in speed before PAR, now leading after PAR?
+    if their_par && !our_par {
+        let their_par_spe = their_base_spe / 4.0;
+        if our_base_spe < their_base_spe && our_spe > their_par_spe {
+            score += 90.0; // we flipped to going first — meaningful advantage
+        }
+    }
+    // Did we lose first-move advantage because WE are PAR'd?
+    if our_par && !their_par {
+        let our_par_spe = our_base_spe / 4.0;
+        if their_base_spe < our_base_spe && their_spe > our_par_spe {
+            score -= 90.0; // opponent flipped to going first — meaningful disadvantage
+        }
+    }
+
+    // ── 7c. Crit pressure ────────────────────────────────────────────────
+    // Gen 1 critical hit rate = base_speed / 512 (per-hit, ignoring Focus
+    // Energy). Fast Pokémon land crits ~20-23% of the time; slow ones ~6-10%.
+    // In close damage races the eval currently treats two 20% rolls as equal
+    // to one 40% roll — but a 23% crit Alakazam attacking first is meaningfully
+    // different from a 6% crit Snorlax attacking second. We add a small bonus
+    // proportional to the *difference* in expected crit rates when it's us
+    // attacking a slower, lower-crit-rate defender. Kept small (max ~25 pts)
+    // so it nudges move selection in close races without distorting strategy.
+    let our_crit_rate   = get_pokemon(state.ours.active.species_str())
+        .map(|b| b.spe as f64 / 512.0).unwrap_or(0.0);
+    let their_crit_rate = get_pokemon(state.theirs.active.species_str())
+        .map(|b| b.spe as f64 / 512.0).unwrap_or(0.0);
+    // Only apply when we're the faster attacker — crit pressure is asymmetric
+    if our_spe > their_spe {
+        let crit_edge = (our_crit_rate - their_crit_rate).max(0.0);
+        score += crit_edge * 120.0; // max ~(0.23-0.06)*120 ≈ 20 pts
+    } else {
+        let crit_edge = (their_crit_rate - our_crit_rate).max(0.0);
+        score -= crit_edge * 120.0;
+    }
 
     // ── 8. KO threat ──────────────────────────────────────────────────────
     let we_threaten = state.ours.active.move_ids().iter().any(|&mid_u16| {

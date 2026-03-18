@@ -824,26 +824,35 @@ LEAD: <species>"""
             'attacker_burned': my_burned,
         }
 
-        # Guaranteed KO check — exclude Hyperbeam (recharge risk needs search)
-        # and explosion/selfdestruct (need eligibility check first).
-        # Also exclude Hyperbeam when we are below 15% HP — at that HP level
-        # the recharge turn will almost certainly be fatal.
+        # Guaranteed KO check — use min damage roll (use_avg=False) so "guaranteed"
+        # means the WORST roll still kills. Previously used average roll which caused
+        # 22 cases across all logs where we called "guaranteed" and opp survived.
+        # Exclude Hyperbeam (recharge risk needs search) and explosion/selfdestruct.
+        # Also exclude Hyperbeam when we are below 15% HP — recharge turn is fatal.
         my_hp_too_low_for_hb = my_hp_frac < 0.15
-        safe_ko_ids = [
-            m.id for m in real_moves
-            if m.id not in ('explosion', 'selfdestruct')
-            and not (m.id == 'hyperbeam' and my_hp_too_low_for_hb)
-        ]
-        ko_result, ko_guaranteed = find_ko_move(
-            my_species, safe_ko_ids, opp_species, opp_hp_frac, **calc_kwargs
-        )
-        if ko_result and ko_guaranteed:
-            ko_move_obj = next((m for m in real_moves if m.id == ko_result), None)
-            if ko_move_obj:
-                print(f"  🎯 PYTHON GUARANTEED KO: {ko_result} finishes "
-                      f"{opp_poke.species} at {int(opp_hp_frac*100)}%")
-                self._python_call_count += 1
-                return self.create_order(ko_move_obj)
+        ko_move_obj = None
+        for mv in real_moves:
+            if mv.id in ('explosion', 'selfdestruct'):
+                continue
+            if mv.id == 'hyperbeam' and my_hp_too_low_for_hb:
+                continue
+            try:
+                is_ko = can_ko(
+                    my_species, mv.id, opp_species,
+                    hp_pct=opp_hp_frac,
+                    use_avg=False,          # min roll — truly guaranteed
+                    **calc_kwargs
+                )
+            except Exception:
+                is_ko = False
+            if is_ko:
+                ko_move_obj = mv
+                break
+        if ko_move_obj:
+            print(f"  🎯 PYTHON GUARANTEED KO: {ko_move_obj.id} finishes "
+                  f"{opp_poke.species} at {int(opp_hp_frac*100)}%")
+            self._python_call_count += 1
+            return self.create_order(ko_move_obj)
 
         # ==================================================================
         # STEP 6 — Immune to all revealed opponent moves: stay in and hit
@@ -1130,9 +1139,13 @@ LEAD: <species>"""
         # Post-process: switch cooldown — if the active mon switched in last
         # turn, don't immediately switch out again unless HP is below 50%.
         # Repeated pivoting wastes turns and chips our own mons on switch-in damage.
+        # EXCEPTION: disabled when position is deeply losing (score < -3000) —
+        # in that case the search found a switch as the recovery line and we
+        # should trust it. 7 cases in logs where this blocked a score=-8976 escape.
         last_action = last.get('action', {})
         last_action_id = last_action.get('id', '')
-        if last_action.get('type') == 'switch':
+        last_score = last.get('score', 0)
+        if last_action.get('type') == 'switch' and last_score > -3000:
             just_switched_in = (
                 self._last_switched_in_species == my_species
                 and battle.turn - self._last_switched_in_turn == 1
