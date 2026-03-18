@@ -130,16 +130,16 @@ fn action_reason(action: &Action, state: &BattleState) -> String {
     match action {
         Action::Recharge => "forced recharge turn".into(),
         Action::Move { id } => {
-            let mid    = id_to_move(*id);
-            let ours   = &state.ours.active;
-            let theirs = &state.theirs.active;
-            if guaranteed_ko(ours, mid, theirs) {
-                format!("guaranteed KO with {mid}")
-            } else if can_ko(ours, mid, theirs) {
-                format!("likely KO with {mid}")
+            let mid_str = id_to_move(*id);
+            let ours    = &state.ours.active;
+            let theirs  = &state.theirs.active;
+            if guaranteed_ko(ours, *id, theirs) {
+                format!("guaranteed KO with {mid_str}")
+            } else if can_ko(ours, *id, theirs) {
+                format!("likely KO with {mid_str}")
             } else {
-                let dmg = avg_damage_pct(ours, mid, theirs, false, false);
-                format!("{mid} → ~{:.0}% avg dmg", dmg * 100.0)
+                let dmg = avg_damage_pct(ours, *id, theirs, false, false);
+                format!("{mid_str} → ~{:.0}% avg dmg", dmg * 100.0)
             }
         }
         Action::Switch { species } => {

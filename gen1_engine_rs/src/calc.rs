@@ -1,13 +1,13 @@
-/// calc.rs — Gen 1 damage calculator and turn simulator.
+/// calc.rs v5 — Zero-lookup damage calculator.
 ///
-/// All calculations operate on pure data (species strings + move IDs) so they
-/// can be called from both the search algorithms and from unit tests without
-/// needing any poke-env objects.
+/// All stat data is read directly from BattlePoke fields, which are
+/// pre-computed at JSON parse time. No get_pokemon() calls in the hot path.
+/// get_move_by_id() replaces the linear MOVE_TABLE scan with an O(1) array lookup.
 
 use crate::data::*;
 use crate::state::*;
 
-// ─── Stat helpers ─────────────────────────────────────────────────────────────
+// ─── Effective stats — reads directly from BattlePoke, zero table lookups ─────
 
 pub struct EffectiveStats {
     pub atk: i32,
@@ -16,109 +16,112 @@ pub struct EffectiveStats {
     pub spe: i32,
 }
 
-pub fn effective_stats(p: &BattlePoke) -> Option<EffectiveStats> {
-    let base = get_pokemon(p.species_str())?;
-    let atk = apply_stage(calc_stat(base.atk) as i32, p.boost(crate::ids::BOOST_ATK));
-    let def = apply_stage(calc_stat(base.def) as i32, p.boost(crate::ids::BOOST_DEF));
-    let spc = apply_stage(calc_stat(base.spc) as i32, p.boost(crate::ids::BOOST_SPC));
-    let spe_raw = calc_stat(base.spe) as i32;
-    let spe = if p.status == Status::Par {
-        (spe_raw / 4).max(1)
-    } else {
-        spe_raw
-    };
-    let spe = apply_stage(spe, p.boost(crate::ids::BOOST_SPE));
-    Some(EffectiveStats { atk, def, spc, spe })
+#[inline]
+pub fn effective_stats(p: &BattlePoke) -> EffectiveStats {
+    let atk = apply_stage(p.base_atk as i32, p.boost(crate::ids::BOOST_ATK));
+    let def = apply_stage(p.base_def as i32, p.boost(crate::ids::BOOST_DEF));
+    let spc = apply_stage(p.base_spc as i32, p.boost(crate::ids::BOOST_SPC));
+    let spe_raw = p.base_spe as i32;
+    let spe_raw = if p.status == Status::Par { (spe_raw / 4).max(1) } else { spe_raw };
+    let spe = apply_stage(spe_raw, p.boost(crate::ids::BOOST_SPE));
+    EffectiveStats { atk, def, spc, spe }
 }
 
-// ─── Core damage formula ──────────────────────────────────────────────────────
-/// Returns (min_dmg, max_dmg) as raw HP values.
+// ─── Pre-computed move data table keyed by move u16 ID ───────────────────────
+
+use std::sync::OnceLock;
+
+static MOVE_DATA_BY_ID: OnceLock<Vec<Option<MoveData>>> = OnceLock::new();
+
+fn get_move_by_id(id: u16) -> Option<&'static MoveData> {
+    if id < crate::ids::MOVE_ID_OFFSET { return None; }
+    let table = MOVE_DATA_BY_ID.get_or_init(|| {
+        let n = crate::ids::MOVE_NAMES.len();
+        let mut v: Vec<Option<MoveData>> = vec![None; n];
+        for name in crate::ids::MOVE_NAMES.iter() {
+            if let Some(md) = get_move(name) {
+                let mid = crate::ids::move_to_id(name);
+                if mid >= crate::ids::MOVE_ID_OFFSET {
+                    let idx = (mid - crate::ids::MOVE_ID_OFFSET) as usize;
+                    if idx < n { v[idx] = Some(md); }
+                }
+            }
+        }
+        v
+    });
+    let idx = (id - crate::ids::MOVE_ID_OFFSET) as usize;
+    table.get(idx).and_then(|opt| opt.as_ref())
+}
+
+// ─── Explosion/Selfdestruct IDs cached after first call ───────────────────────
+
+fn explosion_id()    -> u16 { crate::ids::move_to_id("explosion") }
+fn selfdestruct_id() -> u16 { crate::ids::move_to_id("selfdestruct") }
+
+// ─── Core damage formula — pure arithmetic, zero table lookups ────────────────
+
 pub fn damage_range(
-    attacker: &BattlePoke,
-    move_id:  &str,
-    defender: &BattlePoke,
-    reflect:  bool,
+    attacker:     &BattlePoke,
+    move_id_u16:  u16,
+    defender:     &BattlePoke,
+    reflect:      bool,
     light_screen: bool,
 ) -> (u32, u32) {
-    let mid = move_id.to_lowercase();
-    let mid = mid.as_str();
+    let mid_str = crate::ids::id_to_move(move_id_u16);
 
-    if is_ohko(mid) {
-        // OHKO: 0 if slower, else OHKO (simplified — assume hits)
-        let atk_spe = effective_stats(attacker).map(|s| s.spe).unwrap_or(0);
-        let def_spe = effective_stats(defender).map(|s| s.spe).unwrap_or(0);
-        return if atk_spe >= def_spe {
-            let def_base = get_pokemon(defender.species_str())
-                .map(|b| calc_stat_hp(b.hp) as u32).unwrap_or(1);
-            (def_base, def_base)
-        } else {
-            (0, 0)
-        };
+    if is_ohko(mid_str) {
+        let our_spe   = effective_stats(attacker).spe;
+        let their_spe = effective_stats(defender).spe;
+        return if our_spe >= their_spe {
+            (defender.max_hp as u32, defender.max_hp as u32)
+        } else { (0, 0) };
     }
 
-    if is_fixed_damage(mid) {
-        // Fixed-damage moves: approximate as level 100 (= 100 HP)
-        let def_types = get_pokemon(defender.species_str())
-            .map(|b| (b.t1, b.t2)).unwrap_or((Type::Normal, None));
-        let move_data = get_move(mid);
-        let eff = move_data.map(|m| {
-            type_effectiveness(m.move_type, def_types.0, def_types.1)
-        }).unwrap_or(1.0);
+    if is_fixed_damage(mid_str) {
+        let eff = get_move(mid_str)
+            .map(|m| type_effectiveness(m.move_type, defender.type1, defender.type2))
+            .unwrap_or(1.0);
         return if eff == 0.0 { (0, 0) } else { (100, 100) };
     }
 
-    let move_data = match get_move(mid) {
+    let move_data = match get_move_by_id(move_id_u16) {
         Some(m) => m,
-        None => return (0, 0),
+        None    => return (0, 0),
     };
     if move_data.bp == 0 { return (0, 0); }
 
-    let atk_stats = match effective_stats(attacker) { Some(s) => s, None => return (0, 0) };
-    let def_stats = match effective_stats(defender)  { Some(s) => s, None => return (0, 0) };
-    let atk_base  = match get_pokemon(attacker.species_str()) { Some(b) => b, None => return (0, 0) };
-    let def_base  = match get_pokemon(defender.species_str()) { Some(b) => b, None => return (0, 0) };
+    let atk_eff = effective_stats(attacker);
+    let def_eff = effective_stats(defender);
 
     let is_special = move_data.move_type.is_special();
     let (mut attack, mut defense) = if is_special {
-        (atk_stats.spc, def_stats.spc)
+        (atk_eff.spc, def_eff.spc)
     } else {
-        (atk_stats.atk, def_stats.def)
+        (atk_eff.atk, def_eff.def)
     };
 
-    // Burn halves physical Attack
-    if attacker.status == Status::Brn && !is_special {
-        attack = (attack / 2).max(1);
-    }
-
-    // Explosion/Selfdestruct halve target Defense
-    if mid == "explosion" || mid == "selfdestruct" {
+    if attacker.status == Status::Brn && !is_special { attack = (attack / 2).max(1); }
+    if move_id_u16 == explosion_id() || move_id_u16 == selfdestruct_id() {
         defense = (defense / 2).max(1);
     }
-
-    // Screens (not on crits — we use non-crit path for search)
-    if !is_special && reflect    { defense = (defense * 2).min(999); }
+    if !is_special && reflect      { defense = (defense * 2).min(999); }
     if  is_special && light_screen { defense = (defense * 2).min(999); }
 
-    let eff = type_effectiveness(move_data.move_type, def_base.t1, def_base.t2);
+    let eff = type_effectiveness(move_data.move_type, defender.type1, defender.type2);
     if eff == 0.0 { return (0, 0); }
 
-    let stab = if move_data.move_type == atk_base.t1
-                || Some(move_data.move_type) == atk_base.t2
+    let stab = if move_data.move_type == attacker.type1
+                || attacker.type2.map_or(false, |t| t == move_data.move_type)
                { 1.5f64 } else { 1.0 };
 
-    // Gen 1 formula: ((2*Lv/5+2) * BP * Atk / Def) / 50 + 2
     let base = ((42.0 * move_data.bp as f64 * attack as f64) / (defense as f64 * 50.0)) + 2.0;
     let base = (base * stab) as u32;
     let base = (base as f64 * eff) as u32;
 
-    // Multi-hit: use expected hits
     let hits = if move_data.min_hits == move_data.max_hits {
         move_data.min_hits as f64
     } else {
-        // 2-5 hits, uniform distribution → 3.17
-        let lo = move_data.min_hits as f64;
-        let hi = move_data.max_hits as f64;
-        (lo + hi) / 2.0
+        (move_data.min_hits as f64 + move_data.max_hits as f64) / 2.0
     };
 
     let min_dmg = ((base as f64 * 217.0 / 255.0) * hits) as u32;
@@ -126,39 +129,84 @@ pub fn damage_range(
     (min_dmg.max(1), max_dmg.max(1))
 }
 
-/// Damage as fraction of defender's max HP  (0.0–1.0+).
-pub fn damage_pct(
-    attacker: &BattlePoke, move_id: &str, defender: &BattlePoke,
-    reflect: bool, light_screen: bool,
-) -> (f64, f64) {
-    let (lo, hi) = damage_range(attacker, move_id, defender, reflect, light_screen);
-    let max_hp = get_pokemon(defender.species_str())
-        .map(|b| calc_stat_hp(b.hp) as f64)
-        .unwrap_or(100.0);
-    (lo as f64 / max_hp, hi as f64 / max_hp)
+pub fn damage_range_crit(attacker: &BattlePoke, move_id_u16: u16, defender: &BattlePoke) -> (u32, u32) {
+    let mid_str = crate::ids::id_to_move(move_id_u16);
+    if is_ohko(mid_str) || is_fixed_damage(mid_str) {
+        return damage_range(attacker, move_id_u16, defender, false, false);
+    }
+    let move_data = match get_move_by_id(move_id_u16) {
+        Some(m) => m,
+        None    => return (0, 0),
+    };
+    if move_data.bp == 0 { return (0, 0); }
+
+    let is_special = move_data.move_type.is_special();
+    let mut attack  = if is_special { attacker.base_spc as i32 } else { attacker.base_atk as i32 };
+    let mut defense = if is_special { defender.base_spc as i32 } else { defender.base_def as i32 };
+
+    if attacker.status == Status::Brn && !is_special { attack = (attack / 2).max(1); }
+    if move_id_u16 == explosion_id() || move_id_u16 == selfdestruct_id() {
+        defense = (defense / 2).max(1);
+    }
+
+    let eff = type_effectiveness(move_data.move_type, defender.type1, defender.type2);
+    if eff == 0.0 { return (0, 0); }
+
+    let stab = if move_data.move_type == attacker.type1
+                || attacker.type2.map_or(false, |t| t == move_data.move_type)
+               { 1.5f64 } else { 1.0 };
+
+    let hits = if move_data.min_hits == move_data.max_hits {
+        move_data.min_hits as f64
+    } else {
+        (move_data.min_hits as f64 + move_data.max_hits as f64) / 2.0
+    };
+
+    let base = ((42.0 * move_data.bp as f64 * attack as f64) / (defense as f64 * 50.0)) + 2.0;
+    let base = (base * stab) as u32;
+    let base = (base as f64 * eff) as u32;
+    let lo   = ((base as f64 * 217.0 / 255.0) * hits) as u32;
+    let hi   = (base as f64 * hits) as u32;
+    (lo.max(1), hi.max(1))
 }
 
-/// Average damage percentage — convenience.
-pub fn avg_damage_pct(
-    attacker: &BattlePoke, move_id: &str, defender: &BattlePoke,
-    reflect: bool, light_screen: bool,
-) -> f64 {
-    let (lo, hi) = damage_pct(attacker, move_id, defender, reflect, light_screen);
+// ─── Damage as fraction of max HP ─────────────────────────────────────────────
+
+#[inline]
+pub fn damage_pct(attacker: &BattlePoke, move_id_u16: u16, defender: &BattlePoke, reflect: bool, light_screen: bool) -> (f64, f64) {
+    let (lo, hi) = damage_range(attacker, move_id_u16, defender, reflect, light_screen);
+    let mhp = defender.max_hp as f64;
+    (lo as f64 / mhp, hi as f64 / mhp)
+}
+
+#[inline]
+pub fn avg_damage_pct(attacker: &BattlePoke, move_id_u16: u16, defender: &BattlePoke, reflect: bool, light_screen: bool) -> f64 {
+    let (lo, hi) = damage_pct(attacker, move_id_u16, defender, reflect, light_screen);
     (lo + hi) / 2.0
 }
 
-// ─── KO checks ───────────────────────────────────────────────────────────────
+// ─── KO checks — integer HP comparison, no float ──────────────────────────────
 
-pub fn can_ko(
-    attacker: &BattlePoke, move_id: &str, defender: &BattlePoke,
-) -> bool {
-    let (lo, hi) = damage_pct(attacker, move_id, defender, false, false);
-    (lo + hi) / 2.0 >= defender.hp_frac as f64
+#[inline]
+pub fn can_ko(attacker: &BattlePoke, move_id_u16: u16, defender: &BattlePoke) -> bool {
+    let (lo, hi) = damage_range(attacker, move_id_u16, defender, false, false);
+    (lo + hi) / 2 >= defender.hp as u32
 }
 
-pub fn guaranteed_ko(
-    attacker: &BattlePoke, move_id: &str, defender: &BattlePoke,
-) -> bool {
-    let (lo, _) = damage_pct(attacker, move_id, defender, false, false);
-    lo >= defender.hp_frac as f64
+#[inline]
+pub fn guaranteed_ko(attacker: &BattlePoke, move_id_u16: u16, defender: &BattlePoke) -> bool {
+    let (lo, _) = damage_range(attacker, move_id_u16, defender, false, false);
+    lo >= defender.hp as u32
+}
+
+// ─── String-based wrappers (Python bridge only, not in search hot path) ────────
+
+pub fn can_ko_str(attacker: &BattlePoke, move_id: &str, defender: &BattlePoke) -> bool {
+    can_ko(attacker, crate::ids::move_to_id(move_id), defender)
+}
+pub fn guaranteed_ko_str(attacker: &BattlePoke, move_id: &str, defender: &BattlePoke) -> bool {
+    guaranteed_ko(attacker, crate::ids::move_to_id(move_id), defender)
+}
+pub fn avg_damage_pct_str(attacker: &BattlePoke, move_id: &str, defender: &BattlePoke, reflect: bool, light_screen: bool) -> f64 {
+    avg_damage_pct(attacker, crate::ids::move_to_id(move_id), defender, reflect, light_screen)
 }

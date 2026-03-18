@@ -27,17 +27,30 @@ impl Status {
 }
 
 // ─── Compact Pokémon struct — zero heap allocation ────────────────────────────
+// v5: hp stored as u16 integer (actual HP, not fraction).
+//     Computed stats (atk/def/spc/spe/max_hp/types) cached directly in struct.
+//     Zero runtime table lookups during search — all data is inline.
 
-#[derive(Debug, Clone, Copy)]  // Copy because no heap fields
+#[derive(Debug, Clone, Copy)]
 pub struct BattlePoke {
-    pub species:         u16,       // ids::species_to_id()
-    pub hp_frac:         f32,
-    pub moves:           [u16; 4],  // up to 4 moves; MOVE_NONE = empty slot
-    pub move_count:      u8,        // how many slots are actually filled
+    pub species:         u16,
+    // HP stored as integer — eliminates f32<->f64 conversions and max_hp lookups
+    pub hp:              u16,
+    pub max_hp:          u16,
+    // Pre-computed battle stats at L100/DV15/maxStatExp — set at construction,
+    // never recalculated. apply_stage() modifies effective stats transiently.
+    pub base_atk:        u16,
+    pub base_def:        u16,
+    pub base_spc:        u16,
+    pub base_spe:        u16,
+    pub type1:           crate::data::Type,
+    pub type2:           Option<crate::data::Type>,
+    pub moves:           [u16; 4],
+    pub move_count:      u8,
     pub status:          Status,
-    pub boosts:          [i8; 6],   // [atk,def,spc,spe,acc,eva]
+    pub boosts:          [i8; 6],
     pub fainted:         bool,
-    pub sub_hp_frac:     f32,
+    pub sub_hp:          u16,      // substitute HP in actual HP units
     pub sleep_turns:     u8,
     pub recharging:      bool,
     pub toxic_counter:   u8,
@@ -45,45 +58,58 @@ pub struct BattlePoke {
     pub confused:        bool,
     pub confusion_turns: u8,
     pub crit_stage:      u8,
-    pub disabled_move:   u16,       // MOVE_NONE = none
+    pub disabled_move:   u16,
     pub disable_turns:   u8,
 }
 
 impl Default for BattlePoke {
     fn default() -> Self {
         Self {
-            species: SPECIES_UNKNOWN,
-            hp_frac: 1.0,
-            moves: [MOVE_NONE; 4],
-            move_count: 0,
-            status: Status::None,
-            boosts: [0i8; 6],
-            fainted: false,
-            sub_hp_frac: 0.0,
-            sleep_turns: 0,
-            recharging: false,
-            toxic_counter: 0,
+            species:        SPECIES_UNKNOWN,
+            hp:             100,
+            max_hp:         100,
+            base_atk:       100,
+            base_def:       100,
+            base_spc:       100,
+            base_spe:       100,
+            type1:          crate::data::Type::Normal,
+            type2:          None,
+            moves:          [MOVE_NONE; 4],
+            move_count:     0,
+            status:         Status::None,
+            boosts:         [0i8; 6],
+            fainted:        false,
+            sub_hp:         0,
+            sleep_turns:    0,
+            recharging:     false,
+            toxic_counter:  0,
             trapping_turns: 0,
-            confused: false,
-            confusion_turns: 0,
-            crit_stage: 0,
-            disabled_move: MOVE_NONE,
-            disable_turns: 0,
+            confused:       false,
+            confusion_turns:0,
+            crit_stage:     0,
+            disabled_move:  MOVE_NONE,
+            disable_turns:  0,
         }
     }
 }
 
 impl BattlePoke {
     pub fn boost(&self, slot: usize) -> i8 { self.boosts[slot] }
-    pub fn has_sub(&self)   -> bool { self.sub_hp_frac > 0.0 }
+    pub fn has_sub(&self)    -> bool { self.sub_hp > 0 }
     pub fn is_trapped(&self) -> bool { self.trapping_turns > 0 }
+
+    /// HP as a 0.0–1.0 fraction — for eval comparisons and Python output.
+    #[inline]
+    pub fn hp_frac(&self) -> f32 {
+        if self.max_hp == 0 { return 0.0; }
+        self.hp as f32 / self.max_hp as f32
+    }
 
     /// Iterate over non-empty move IDs.
     pub fn move_ids(&self) -> &[u16] {
         &self.moves[..self.move_count as usize]
     }
 
-    /// Check if this poke has a move by string name (used in eval/inference).
     pub fn has_move_str(&self, name: &str) -> bool {
         let id = move_to_id(name);
         if id == MOVE_NONE { return false; }
@@ -212,7 +238,7 @@ pub fn legal_actions(side: &Side) -> Vec<Action> {
 pub struct JsonBattlePoke {
     pub species:         String,
     #[serde(default = "one_f32")]
-    pub hp_frac:         f32,
+    pub hp_frac:         f32,   // poke-env gives us a fraction; we convert to integer
     #[serde(default)]
     pub moves:           Vec<String>,
     #[serde(default)]
@@ -282,15 +308,37 @@ impl From<JsonBattlePoke> for BattlePoke {
                 boosts[idx] = *v;
             }
         }
+        let species_id = species_to_id(&j.species);
+
+        // Pre-compute battle stats from the table — happens once at JSON boundary,
+        // never again during search.
+        let (max_hp, base_atk, base_def, base_spc, base_spe, type1, type2) =
+            if let Some(bs) = crate::data::get_battle_stats(species_id) {
+                (bs.hp, bs.atk, bs.def, bs.spc, bs.spe, bs.t1, bs.t2)
+            } else {
+                (100, 100, 100, 100, 100, crate::data::Type::Normal, None)
+            };
+
+        // Convert hp_frac from poke-env to integer HP
+        let hp = ((j.hp_frac.clamp(0.0, 1.0) * max_hp as f32).round() as u16).min(max_hp);
+        let sub_hp = ((j.sub_hp_frac.clamp(0.0, 1.0) * max_hp as f32).round() as u16);
+
         BattlePoke {
-            species:        species_to_id(&j.species),
-            hp_frac:        j.hp_frac,
+            species:        species_id,
+            hp,
+            max_hp,
+            base_atk,
+            base_def,
+            base_spc,
+            base_spe,
+            type1,
+            type2,
             moves,
             move_count:     count as u8,
             status:         j.status,
             boosts,
             fainted:        j.fainted,
-            sub_hp_frac:    j.sub_hp_frac,
+            sub_hp,
             sleep_turns:    j.sleep_turns,
             recharging:     j.recharging,
             toxic_counter:  j.toxic_counter,

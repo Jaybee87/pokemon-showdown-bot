@@ -94,16 +94,70 @@ pub struct PokeStats {
     pub t1: Type, pub t2: Option<Type>,
 }
 
+/// O(n) name lookup — used only at JSON parse time, never in the search hot path.
 pub fn get_pokemon(name: &str) -> Option<PokeStats> {
-    let key = normalise(name);
+    let key = name.trim();
     POKEMON_TABLE.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone())
 }
 
-fn normalise(s: &str) -> &str {
-    // Caller must use the canonical lowercase name (matching Python gen1_data keys)
-    // Trim but don't allocate — compare directly in the table with a linear scan.
-    s.trim()
+/// O(1) lookup by species ID — use this everywhere inside the search.
+/// species_id is the same u16 used in BattlePoke.species (from ids.rs).
+/// Returns None only for SPECIES_UNKNOWN (0).
+pub fn get_pokemon_by_id(species_id: u16) -> Option<&'static PokeStats> {
+    if species_id == 0 { return None; }
+    let idx = (species_id - 1) as usize;
+    POKEMON_TABLE_BY_ID.get(idx).map(|(_, ps)| ps)
 }
+
+/// Gen 1 stat formula at L100, DV=15, max StatExp.
+/// stat_exp_bonus = floor(min(255, ceil(sqrt(65535))) / 4) = floor(255/4) = 63
+pub fn calc_stat(base: u16) -> u16 {
+    // floor(((base + 15) * 2 + 63) * 100 / 100) + 5
+    ((base + 15) * 2 + 63 + 5)
+}
+
+pub fn calc_stat_hp(base: u16) -> u16 {
+    // floor(((base + 15) * 2 + 63) * 100 / 100) + 100 + 10
+    ((base + 15) * 2 + 63 + 110)
+}
+
+/// Pre-computed battle stats at L100/DV15/maxStatExp — stored per species by ID.
+/// Indexed by (species_id - 1). Avoids all formula work during search.
+#[derive(Clone, Debug)]
+pub struct BattleStats {
+    pub hp:  u16,
+    pub atk: u16,
+    pub def: u16,
+    pub spc: u16,
+    pub spe: u16,
+    pub t1:  Type,
+    pub t2:  Option<Type>,
+}
+
+/// Table of pre-computed BattleStats indexed by (species_id - 1).
+/// Built once at startup via lazy_static.
+use std::sync::OnceLock;
+static BATTLE_STATS_TABLE: OnceLock<Vec<BattleStats>> = OnceLock::new();
+
+pub fn get_battle_stats(species_id: u16) -> Option<&'static BattleStats> {
+    if species_id == 0 { return None; }
+    let table = BATTLE_STATS_TABLE.get_or_init(|| {
+        POKEMON_TABLE_BY_ID.iter().map(|(_, ps)| BattleStats {
+            hp:  calc_stat_hp(ps.hp),
+            atk: calc_stat(ps.atk),
+            def: calc_stat(ps.def),
+            spc: calc_stat(ps.spc),
+            spe: calc_stat(ps.spe),
+            t1:  ps.t1,
+            t2:  ps.t2,
+        }).collect()
+    });
+    table.get((species_id - 1) as usize)
+}
+
+/// POKEMON_TABLE_BY_ID: same data as POKEMON_TABLE but in species-ID order
+/// (matching SPECIES_NAMES in ids.rs). Index 0 = bulbasaur (species_id=1).
+pub static POKEMON_TABLE_BY_ID: &[(&str, PokeStats)] = POKEMON_TABLE;
 
 macro_rules! poke {
     ($hp:expr,$atk:expr,$def:expr,$spc:expr,$spe:expr,$t1:ident) => {

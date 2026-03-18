@@ -16,7 +16,7 @@
 
 use crate::state::*;
 use crate::calc::*;
-use crate::data::{get_pokemon, calc_stat};
+use crate::calc::{avg_damage_pct, can_ko, effective_stats};
 
 // ─── Terminal detection ───────────────────────────────────────────────────────
 
@@ -47,9 +47,9 @@ pub fn evaluate(state: &BattleState) -> f64 {
 
     // ── 2. Total HP remaining across the whole team ───────────────────────
     let our_hp: f64 = state.ours.all_pokes()
-        .filter(|p| !p.fainted).map(|p| p.hp_frac as f64).sum();
+        .filter(|p| !p.fainted).map(|p| p.hp_frac() as f64).sum();
     let their_hp: f64 = state.theirs.all_pokes()
-        .filter(|p| !p.fainted).map(|p| p.hp_frac as f64).sum();
+        .filter(|p| !p.fainted).map(|p| p.hp_frac() as f64).sum();
     score += (our_hp - their_hp) * 250.0;
 
     // ── 3. Active matchup ─────────────────────────────────────────────────
@@ -65,22 +65,22 @@ pub fn evaluate(state: &BattleState) -> f64 {
     let their_has_heal = state.theirs.active.has_move_str("recover")
         || state.theirs.active.has_move_str("softboiled");
     // Low HP + heal available = more valuable than current HP suggests
-    if our_has_heal && state.ours.active.hp_frac < 0.55 {
-        let heal_value = (0.50 - (0.55 - state.ours.active.hp_frac as f64)).max(0.0) * 250.0;
+    if our_has_heal && state.ours.active.hp_frac() < 0.55 {
+        let heal_value = (0.50 - (0.55 - state.ours.active.hp_frac() as f64)).max(0.0) * 250.0;
         score += heal_value;
     }
-    if their_has_heal && state.theirs.active.hp_frac < 0.55 {
-        let heal_value = (0.50 - (0.55 - state.theirs.active.hp_frac as f64)).max(0.0) * 250.0;
+    if their_has_heal && state.theirs.active.hp_frac() < 0.55 {
+        let heal_value = (0.50 - (0.55 - state.theirs.active.hp_frac() as f64)).max(0.0) * 250.0;
         score -= heal_value;
     }
     // Penalise healing at full or near-full HP — Softboiled/Recover at 100% is
     // a wasted turn. This prevents the engine locking into a mutual stall loop
     // where both sides preemptively heal rather than pressing damage.
     // The threshold is 0.90: above that, healing costs more than it gains.
-    if our_has_heal && state.ours.active.hp_frac >= 0.90 {
+    if our_has_heal && state.ours.active.hp_frac() >= 0.90 {
         score -= 150.0;
     }
-    if their_has_heal && state.theirs.active.hp_frac >= 0.90 {
+    if their_has_heal && state.theirs.active.hp_frac() >= 0.90 {
         score += 150.0;  // opponent wasting a heal turn is good for us
     }
     // Toxic urgency: a Toxiced mon with a heal should use it NOW.
@@ -102,8 +102,8 @@ pub fn evaluate(state: &BattleState) -> f64 {
     if state.theirs.light_screen { score -= state.theirs.light_screen_turns as f64 * 15.0; }
 
     // ── 7. Speed advantage ────────────────────────────────────────────────
-    let our_spe   = effective_stats(&state.ours.active).map(|s| s.spe).unwrap_or(1) as f64;
-    let their_spe = effective_stats(&state.theirs.active).map(|s| s.spe).unwrap_or(1) as f64;
+    let our_spe   = effective_stats(&state.ours.active).spe   as f64;
+    let their_spe = effective_stats(&state.theirs.active).spe as f64;
     let spe_ratio = (our_spe - their_spe) / their_spe.max(1.0);
     score += spe_ratio.clamp(-1.0, 1.0) * 80.0;
 
@@ -115,10 +115,8 @@ pub fn evaluate(state: &BattleState) -> f64 {
     //
     // When PAR flips who has first-move advantage, award a discrete bonus.
     // We compute base speeds (pre-PAR) to detect the before/after flip.
-    let our_base_spe   = get_pokemon(state.ours.active.species_str())
-        .map(|b| calc_stat(b.spe) as f64).unwrap_or(1.0);
-    let their_base_spe = get_pokemon(state.theirs.active.species_str())
-        .map(|b| calc_stat(b.spe) as f64).unwrap_or(1.0);
+    let our_base_spe   = state.ours.active.base_spe   as f64;
+    let their_base_spe = state.theirs.active.base_spe as f64;
     let our_par   = state.ours.active.status   == Status::Par;
     let their_par = state.theirs.active.status == Status::Par;
     // Was trailing in speed before PAR, now leading after PAR?
@@ -145,10 +143,8 @@ pub fn evaluate(state: &BattleState) -> f64 {
     // proportional to the *difference* in expected crit rates when it's us
     // attacking a slower, lower-crit-rate defender. Kept small (max ~25 pts)
     // so it nudges move selection in close races without distorting strategy.
-    let our_crit_rate   = get_pokemon(state.ours.active.species_str())
-        .map(|b| b.spe as f64 / 512.0).unwrap_or(0.0);
-    let their_crit_rate = get_pokemon(state.theirs.active.species_str())
-        .map(|b| b.spe as f64 / 512.0).unwrap_or(0.0);
+    let our_crit_rate   = state.ours.active.base_spe   as f64 / 512.0;
+    let their_crit_rate = state.theirs.active.base_spe as f64 / 512.0;
     // Only apply when we're the faster attacker — crit pressure is asymmetric
     if our_spe > their_spe {
         let crit_edge = (our_crit_rate - their_crit_rate).max(0.0);
@@ -160,13 +156,13 @@ pub fn evaluate(state: &BattleState) -> f64 {
 
     // ── 8. KO threat ──────────────────────────────────────────────────────
     let we_threaten = state.ours.active.move_ids().iter().any(|&mid_u16| {
-        let mid = crate::ids::id_to_move(mid_u16);
-        if mid == "hyperbeam" && state.ours.active.status == Status::Par { return false; }
-        if mid == "hyperbeam" && their_has_heal { return false; }
-        can_ko(&state.ours.active, mid, &state.theirs.active)
+        let mid_str = crate::ids::id_to_move(mid_u16);
+        if mid_str == "hyperbeam" && state.ours.active.status == Status::Par { return false; }
+        if mid_str == "hyperbeam" && their_has_heal { return false; }
+        can_ko(&state.ours.active, mid_u16, &state.theirs.active)
     });
     let they_threaten = state.theirs.active.move_ids().iter()
-        .any(|&mid_u16| can_ko(&state.theirs.active, crate::ids::id_to_move(mid_u16), &state.ours.active));
+        .any(|&mid_u16| can_ko(&state.theirs.active, mid_u16, &state.ours.active));
     if we_threaten   { score += 220.0; }
     if they_threaten { score -= 220.0; }
 
@@ -196,8 +192,8 @@ pub fn evaluate(state: &BattleState) -> f64 {
     }
 
     // ── 10. Substitute value ──────────────────────────────────────────────
-    score += state.ours.active.sub_hp_frac   as f64 * 180.0;
-    score -= state.theirs.active.sub_hp_frac as f64 * 180.0;
+    score += (state.ours.active.sub_hp   as f64 / state.ours.active.max_hp.max(1)   as f64) * 180.0;
+    score -= (state.theirs.active.sub_hp as f64 / state.theirs.active.max_hp.max(1) as f64) * 180.0;
 
     // ── 11. Confusion ─────────────────────────────────────────────────────
     if state.ours.active.confused   { score -=  90.0; }
@@ -226,8 +222,7 @@ pub fn matchup_score(ours: &BattlePoke, theirs: &BattlePoke) -> f64 {
 
 fn best_expected_damage_pct(attacker: &BattlePoke, defender: &BattlePoke) -> f64 {
     attacker.move_ids().iter().map(|&mid_u16| {
-        let mid = crate::ids::id_to_move(mid_u16);
-        avg_damage_pct(attacker, mid, defender, false, false)
+        avg_damage_pct(attacker, mid_u16, defender, false, false)
     }).fold(0.0f64, f64::max)
 }
 
@@ -264,7 +259,7 @@ fn bench_quality(bench: &[BattlePoke], opponent_active: &BattlePoke) -> f64 {
         if p.status == Status::Slp || p.status == Status::Frz {
             return 0.0;
         }
-        let hp_w = p.hp_frac as f64;
+        let hp_w = p.hp_frac() as f64;
         let dmg  = best_expected_damage_pct(p, opponent_active);
         hp_w * dmg * 200.0
     }).sum()

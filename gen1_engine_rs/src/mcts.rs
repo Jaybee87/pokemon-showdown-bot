@@ -387,16 +387,15 @@ fn action_score(action: &Action, attacker: &Side, defender: &Side) -> f64 {
     match action {
         Action::Recharge => -500.0,
         Action::Move { id } => {
-            let mid = crate::ids::id_to_move(*id);
-            if guaranteed_ko(&attacker.active, mid, &defender.active) { return 10000.0; }
-            if can_ko(&attacker.active, mid, &defender.active)         { return  5000.0; }
-            avg_damage_pct(&attacker.active, mid, &defender.active, false, false) * 100.0
+            if guaranteed_ko(&attacker.active, *id, &defender.active) { return 10000.0; }
+            if can_ko(&attacker.active, *id, &defender.active)         { return  5000.0; }
+            avg_damage_pct(&attacker.active, *id, &defender.active, false, false) * 100.0
         }
         Action::Switch { species } => {
             let count = attacker.bench_count as usize;
             attacker.bench[..count].iter()
                 .find(|p| p.species == *species)
-                .map(|p| p.hp_frac as f64 * 25.0)
+                .map(|p| p.hp_frac() as f64 * 25.0)
                 .unwrap_or(10.0)
         }
     }
