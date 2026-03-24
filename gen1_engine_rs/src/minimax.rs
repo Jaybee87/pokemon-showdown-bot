@@ -8,7 +8,7 @@
 use crate::state::*;
 use crate::eval::*;
 use crate::sim::apply_turn;
-use crate::calc::{can_ko, avg_damage_pct, guaranteed_ko};
+use crate::calc::{can_ko, guaranteed_ko, sim_expected_damage_pct};
 
 pub struct MinimaxResult {
     pub best_action: Action,
@@ -19,6 +19,26 @@ pub struct MinimaxResult {
 pub fn minimax_search(state: &BattleState, max_depth: u8) -> MinimaxResult {
     let mut our_actions = legal_actions(&state.ours);
     order_our_moves(&mut our_actions, &state.ours, &state.theirs);
+
+    // Prune switch actions with clearly negative scores — same logic as MCTS.
+    // Only at the root and only when the active mon is healthy enough that
+    // an emergency switch isn't warranted.
+    let active_hp = state.ours.active.hp_frac();
+    let has_moves = our_actions.iter().any(|a| matches!(a, Action::Move { .. }));
+    if has_moves && active_hp > 0.25 {
+        let best_move_score = our_actions.iter()
+            .filter(|a| matches!(a, Action::Move { .. }))
+            .map(|a| score_our_action(a, &state.ours, &state.theirs))
+            .fold(f64::NEG_INFINITY, f64::max);
+        let pruned: Vec<Action> = our_actions.iter().filter(|a| match a {
+            Action::Switch { .. } => {
+                let s = score_our_action(a, &state.ours, &state.theirs);
+                s > -10.0 || s >= best_move_score * 0.5
+            }
+            _ => true,
+        }).copied().collect();
+        if !pruned.is_empty() { our_actions = pruned; }
+    }
 
     let mut nodes       = 0u64;
     let mut best_action = our_actions[0].clone();
@@ -128,14 +148,57 @@ fn score_our_action(action: &Action, attacker: &Side, defender: &Side) -> f64 {
         Action::Move { id } => {
             if guaranteed_ko(&attacker.active, *id, &defender.active) { return 10000.0; }
             if can_ko(&attacker.active, *id, &defender.active)         { return  5000.0; }
-            avg_damage_pct(&attacker.active, *id, &defender.active, false, false) * 100.0
+            sim_expected_damage_pct(&attacker.active, *id, &defender.active, false, false) * 100.0
         }
         Action::Switch { species } => {
-            let count = defender.bench_count as usize;
-            defender.bench[..count].iter()
-                .find(|p| p.species == *species)
-                .map(|p| p.hp_frac() as f64 * 20.0)
-                .unwrap_or(10.0)
+            // Look up incoming mon in ATTACKER's bench (was incorrectly using defender).
+            let count = attacker.bench_count as usize;
+            let incoming = attacker.bench[..count].iter()
+                .find(|p| p.species == *species);
+            let Some(inc) = incoming else { return -100.0 };
+
+            if inc.status == crate::state::Status::Slp
+            || inc.status == crate::state::Status::Frz {
+                return -200.0;
+            }
+
+            let explosion_id    = crate::ids::move_to_id("explosion");
+            let selfdestruct_id = crate::ids::move_to_id("selfdestruct");
+
+            let opp_best_in_vs_incoming = if defender.active.status == crate::state::Status::Slp
+                || defender.active.status == crate::state::Status::Frz {
+                0.0
+            } else {
+                defender.active.move_ids().iter()
+                    .filter(|&&mid| mid != explosion_id && mid != selfdestruct_id)
+                    .map(|&mid| sim_expected_damage_pct(&defender.active, mid, inc, false, false))
+                    .fold(0.0f64, f64::max)
+            };
+
+            let inc_best_out = inc.move_ids().iter()
+                .map(|&mid| sim_expected_damage_pct(inc, mid, &defender.active, false, false))
+                .fold(0.0f64, f64::max);
+
+            let cur_best_out = attacker.active.move_ids().iter()
+                .map(|&mid| sim_expected_damage_pct(&attacker.active, mid, &defender.active, false, false))
+                .fold(0.0f64, f64::max);
+
+            let cur_best_in = if defender.active.status == crate::state::Status::Slp
+                || defender.active.status == crate::state::Status::Frz {
+                0.0
+            } else {
+                defender.active.move_ids().iter()
+                    .filter(|&&mid| mid != explosion_id && mid != selfdestruct_id)
+                    .map(|&mid| sim_expected_damage_pct(&defender.active, mid, &attacker.active, false, false))
+                    .fold(0.0f64, f64::max)
+            };
+
+            let incoming_net = (inc_best_out - opp_best_in_vs_incoming) * (inc.hp_frac() as f64);
+            let current_net  =  cur_best_out - cur_best_in;
+            let improvement  = incoming_net - current_net;
+            let free_hit_cost = opp_best_in_vs_incoming;
+
+            (improvement - free_hit_cost) * 100.0
         }
     }
 }

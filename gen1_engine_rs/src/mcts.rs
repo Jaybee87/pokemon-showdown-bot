@@ -31,7 +31,7 @@ use rayon::prelude::*;
 use crate::state::*;
 use crate::eval::*;
 use crate::sim::apply_turn;
-use crate::calc::{avg_damage_pct, can_ko, guaranteed_ko};
+use crate::calc::{can_ko, guaranteed_ko, sim_expected_damage_pct};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -94,6 +94,32 @@ impl Node {
         let our_actions = {
             let mut v = legal_actions(&state.ours);
             order_actions(&mut v, &state.ours, &state.theirs);
+
+            // Prune switch actions whose score is clearly negative — they represent
+            // matchup downgrades or marginal improvements not worth the free hit.
+            // Only prune when: at least one move remains after pruning, AND the
+            // active mon is healthy enough that an emergency switch isn't needed.
+            // This prevents UCB from wasting exploration budget on bad switches.
+            let active_hp = state.ours.active.hp_frac();
+            let has_moves = v.iter().any(|a| matches!(a, Action::Move { .. }));
+            if has_moves && active_hp > 0.25 {
+                let best_move_score = v.iter()
+                    .filter(|a| matches!(a, Action::Move { .. }))
+                    .map(|a| action_score(a, &state.ours, &state.theirs))
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let pruned: Vec<Action> = v.iter().filter(|a| match a {
+                    Action::Switch { .. } => {
+                        let s = action_score(a, &state.ours, &state.theirs);
+                        // Keep switch only if it scores within striking range of the
+                        // best move — the matchup improvement must outweigh the cost.
+                        s > -10.0 || s >= best_move_score * 0.5
+                    }
+                    _ => true,
+                }).copied().collect();
+                // Only apply pruning if at least one action survives.
+                if !pruned.is_empty() { v = pruned; }
+            }
+
             v.into_iter().map(ActionStat::new).collect::<Vec<_>>()
         };
         let opp_actions = {
@@ -389,14 +415,66 @@ fn action_score(action: &Action, attacker: &Side, defender: &Side) -> f64 {
         Action::Move { id } => {
             if guaranteed_ko(&attacker.active, *id, &defender.active) { return 10000.0; }
             if can_ko(&attacker.active, *id, &defender.active)         { return  5000.0; }
-            avg_damage_pct(&attacker.active, *id, &defender.active, false, false) * 100.0
+            sim_expected_damage_pct(&attacker.active, *id, &defender.active, false, false) * 100.0
         }
         Action::Switch { species } => {
             let count = attacker.bench_count as usize;
-            attacker.bench[..count].iter()
-                .find(|p| p.species == *species)
-                .map(|p| p.hp_frac() as f64 * 25.0)
-                .unwrap_or(10.0)
+            let incoming = attacker.bench[..count].iter()
+                .find(|p| p.species == *species);
+            let Some(inc) = incoming else { return -100.0 };
+
+            // Skip incapacitated bench mons — they can't act on switch-in.
+            if inc.status == crate::state::Status::Slp
+            || inc.status == crate::state::Status::Frz {
+                return -200.0;
+            }
+
+            // Net matchup of the incoming mon vs current opponent.
+            // Exclude explosion/selfdestruct from opponent's best_in (same as eval.rs).
+            let explosion_id    = crate::ids::move_to_id("explosion");
+            let selfdestruct_id = crate::ids::move_to_id("selfdestruct");
+
+            let opp_best_in_vs_incoming = if defender.active.status == crate::state::Status::Slp
+                || defender.active.status == crate::state::Status::Frz {
+                0.0
+            } else {
+                defender.active.move_ids().iter()
+                    .filter(|&&mid| mid != explosion_id && mid != selfdestruct_id)
+                    .map(|&mid| sim_expected_damage_pct(&defender.active, mid, inc, false, false))
+                    .fold(0.0f64, f64::max)
+            };
+
+            let inc_best_out = inc.move_ids().iter()
+                .map(|&mid| sim_expected_damage_pct(inc, mid, &defender.active, false, false))
+                .fold(0.0f64, f64::max);
+
+            // Net matchup of the current active vs same opponent (opportunity cost).
+            let cur_best_out = attacker.active.move_ids().iter()
+                .map(|&mid| sim_expected_damage_pct(&attacker.active, mid, &defender.active, false, false))
+                .fold(0.0f64, f64::max);
+
+            let cur_best_in = if defender.active.status == crate::state::Status::Slp
+                || defender.active.status == crate::state::Status::Frz {
+                0.0
+            } else {
+                defender.active.move_ids().iter()
+                    .filter(|&&mid| mid != explosion_id && mid != selfdestruct_id)
+                    .map(|&mid| sim_expected_damage_pct(&defender.active, mid, &attacker.active, false, false))
+                    .fold(0.0f64, f64::max)
+            };
+
+            let incoming_net = (inc_best_out - opp_best_in_vs_incoming) * (inc.hp_frac() as f64);
+            let current_net  =  cur_best_out - cur_best_in;
+
+            // Switch is worthwhile only if the incoming mon's matchup is
+            // meaningfully better than the current mon's. Penalise by the
+            // free hit the opponent gets (approx. opp_best_in_vs_incoming).
+            let improvement = incoming_net - current_net;
+            let free_hit_cost = opp_best_in_vs_incoming;
+
+            // Scale to match move scores (moves score ~20-50, switches should
+            // score comparably only when the improvement is genuine).
+            (improvement - free_hit_cost) * 100.0
         }
     }
 }

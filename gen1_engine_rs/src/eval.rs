@@ -280,17 +280,25 @@ fn net_matchup_score(
         sim_expected_damage_pct(ours, mid, theirs, their_reflect, their_light_screen)
     }).fold(0.0f64, f64::max);
 
-    // Exclude Explosion/Selfdestruct from defensive pressure.
-    // These are one-shot suicide moves — they don't represent per-turn pressure
-    // and including them makes best_in spike to 100%+, causing the engine to
-    // always switch away from any Pokémon that might have them. The KO-threat
-    // section (§8 in evaluate) handles self-destruct risk separately.
-    let explosion_id    = crate::ids::move_to_id("explosion");
-    let selfdestruct_id = crate::ids::move_to_id("selfdestruct");
-    let best_in = theirs.move_ids().iter()
-        .filter(|&&mid| mid != explosion_id && mid != selfdestruct_id)
-        .map(|&mid| sim_expected_damage_pct(theirs, mid, ours, our_reflect, our_light_screen))
-        .fold(0.0f64, f64::max);
+    // A sleeping or frozen opponent cannot attack this turn — treat best_in as
+    // zero. Without this, the eval computes defensive pressure from a mon that
+    // is literally incapable of moving, causing the engine to switch away from
+    // a winning position against an immobilised opponent.
+    let best_in = if theirs.status == Status::Slp || theirs.status == Status::Frz {
+        0.0
+    } else {
+        // Exclude Explosion/Selfdestruct from defensive pressure.
+        // These are one-shot suicide moves — they don't represent per-turn pressure
+        // and including them makes best_in spike to 100%+, causing the engine to
+        // always switch away from any Pokémon that might have them. The KO-threat
+        // section (§8 in evaluate) handles self-destruct risk separately.
+        let explosion_id    = crate::ids::move_to_id("explosion");
+        let selfdestruct_id = crate::ids::move_to_id("selfdestruct");
+        theirs.move_ids().iter()
+            .filter(|&&mid| mid != explosion_id && mid != selfdestruct_id)
+            .map(|&mid| sim_expected_damage_pct(theirs, mid, ours, our_reflect, our_light_screen))
+            .fold(0.0f64, f64::max)
+    };
 
     (best_out - best_in) * hp_weight * 400.0
 }
