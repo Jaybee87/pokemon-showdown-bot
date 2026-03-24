@@ -83,8 +83,13 @@ def _is_confused(poke) -> bool:
 
 
 def _confusion_turns(poke) -> int:
-    """Approximate remaining confusion turns (poke-env may not expose this)."""
-    return 2 if _is_confused(poke) else 0  # conservative estimate
+    """Remaining confusion turns from poke-env volatile effects, or 0 if not confused."""
+    if not _is_confused(poke):
+        return 0
+    val = _get_effect_value(poke, "CONFUSION")
+    # poke-env stores remaining turns directly when available; fall back to a
+    # conservative mid-range estimate (Gen 1: 2–5 turns) when it doesn't.
+    return int(val) if val > 0 else 3
 
 
 def _trapping_turns(poke) -> int:
@@ -100,16 +105,28 @@ def _trapping_turns(poke) -> int:
     return 0
 
 
-def _toxic_counter(poke) -> int:
-    """Number of toxic ticks this Pokémon has taken (poke-env may expose this)."""
+def _toxic_counter(poke, toxic_counter_override: int = 0) -> int:
+    """
+    Number of toxic ticks this Pokémon has taken.
+
+    Prefers the externally-tracked override (passed from competitive_player.py)
+    over poke-env attributes, which are unreliable across versions.
+    """
+    if toxic_counter_override > 0:
+        return toxic_counter_override
     try:
-        # poke-env stores this as poke.toxic_turn_count in some versions
         val = getattr(poke, "toxic_turn_count", None)
         if val is not None:
             return int(val)
+        # Some poke-env versions expose this as n_turns_statused for TOX
+        if getattr(poke, "status", None) and poke.status.name == "TOX":
+            val = getattr(poke, "n_turns_statused", None)
+            if val is not None:
+                return int(val)
     except Exception:
         pass
-    # Fall back: if badly poisoned and we don't know the counter, guess based on HP lost
+    # Unknown — default to 1 (safest underestimate; Rust eval will be slightly
+    # optimistic but won't trigger futility logic prematurely)
     if getattr(poke, "status", None) and poke.status.name == "TOX":
         return 1
     return 0
@@ -142,7 +159,13 @@ def _disabled_move(poke) -> str:
 
 # ─── State builder ────────────────────────────────────────────────────────────
 
-def poke_dict(p, move_ids: Optional[list] = None, sleep_turns_override: int = 0) -> dict:
+def poke_dict(
+    p,
+    move_ids: Optional[list] = None,
+    sleep_turns_override: int = 0,
+    toxic_counter_override: int = 0,
+    sub_hp_frac_override: float = 0.0,
+) -> dict:
     """Convert a poke-env Pokémon to the Rust engine's BattlePoke schema."""
     boosts = {}
     if hasattr(p, "boosts") and p.boosts:
@@ -179,10 +202,10 @@ def poke_dict(p, move_ids: Optional[list] = None, sleep_turns_override: int = 0)
         "status":          status_name,
         "boosts":          boosts,
         "fainted":         bool(p.fainted),
-        "sub_hp_frac":     0.0,
+        "sub_hp_frac":     sub_hp_frac_override,
         "sleep_turns":     int(sleep_turns),
         "recharging":      _is_recharging(p),
-        "toxic_counter":   _toxic_counter(p),
+        "toxic_counter":   _toxic_counter(p, toxic_counter_override),
         "trapping_turns":  _trapping_turns(p),
         "confused":        _is_confused(p),
         "confusion_turns": _confusion_turns(p),
@@ -192,37 +215,27 @@ def poke_dict(p, move_ids: Optional[list] = None, sleep_turns_override: int = 0)
     }
 
 
-def side_dict(active, bench_pokes, side_conditions=None) -> dict:
-    reflect_on    = False
-    reflect_turns = 0
-    ls_on         = False
-    ls_turns      = 0
 
-    if side_conditions:
-        reflect_turns = _screen_turns(side_conditions, "REFLECT")
-        reflect_on    = reflect_turns > 0
-        ls_turns      = _screen_turns(side_conditions, "LIGHTSCREEN")
-        ls_on         = ls_turns > 0
-
-    return {
-        "active":              poke_dict(active),
-        "bench":               [poke_dict(p) for p in bench_pokes if not p.fainted],
-        "reflect":             reflect_on,
-        "reflect_turns":       reflect_turns,
-        "light_screen":        ls_on,
-        "light_screen_turns":  ls_turns,
-    }
-
-
-def build_state(battle, sleep_turns: dict = None) -> dict:
+def build_state(
+    battle,
+    sleep_turns: dict = None,
+    toxic_counters: dict = None,
+    sub_hp_fracs: dict = None,
+) -> dict:
     """
     Convert a poke-env Battle into the JSON dict the Rust engine expects.
 
-    sleep_turns: optional dict mapping species.lower() → turns_asleep (int).
-                 Tracked externally in competitive_player.py since poke-env
-                 doesn't reliably expose remaining sleep duration.
+    sleep_turns:    optional dict mapping species.lower() → turns_asleep (int).
+    toxic_counters: optional dict mapping species.lower() → tox ticks taken (int).
+    sub_hp_fracs:   optional dict mapping species.lower() → substitute HP fraction.
+
+    All three are tracked externally in competitive_player.py since poke-env
+    doesn't reliably expose these values across versions.
     """
-    sleep_turns = sleep_turns or {}
+    sleep_turns    = sleep_turns    or {}
+    toxic_counters = toxic_counters or {}
+    sub_hp_fracs   = sub_hp_fracs   or {}
+
     my_active   = battle.active_pokemon
     opp_active  = battle.opponent_active_pokemon
     my_bench    = [p for p in battle.available_switches if not p.fainted]
@@ -233,8 +246,14 @@ def build_state(battle, sleep_turns: dict = None) -> dict:
     opp_sc = getattr(battle, "opponent_side_conditions", {})
 
     def my_poke_dict(p, move_ids=None):
-        override = sleep_turns.get(p.species.lower(), 0)
-        return poke_dict(p, move_ids=move_ids, sleep_turns_override=override)
+        key = p.species.lower()
+        return poke_dict(
+            p,
+            move_ids=move_ids,
+            sleep_turns_override=sleep_turns.get(key, 0),
+            toxic_counter_override=toxic_counters.get(key, 0),
+            sub_hp_frac_override=sub_hp_fracs.get(key, 0.0),
+        )
 
     my_active_dict = my_poke_dict(my_active)
     my_bench_dicts = [my_poke_dict(p) for p in my_bench if not p.fainted]

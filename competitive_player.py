@@ -29,10 +29,24 @@ import random
 import string
 import re
 import glob
+import sys
 import time
 
 from poke_env.player import Player
 from poke_env import LocalhostServerConfiguration, AccountConfiguration
+
+try:
+    from poke_env.battle.side_condition import SideCondition
+except ImportError:
+    from poke_env.environment.side_condition import SideCondition
+
+try:
+    from poke_env.environment.move import Move as PokeEnvMove
+except ImportError:
+    try:
+        from poke_env.data.move import Move as PokeEnvMove
+    except ImportError:
+        PokeEnvMove = None  # type lookup via poke-env unavailable; gen1_data cache still works
 
 from config import POKE_ENV_LOG_LEVEL
 from gen1_engine import (
@@ -45,6 +59,11 @@ from gen1_engine import (
     FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, IGNORE_MOVES,
 )
 from rust_engine_bridge import RustEngine, build_state, action_to_poke_env
+
+# Measured Rust engine throughput (nodes/sec) on the 9800X3D with 6 threads.
+# Used to convert a time budget (ms) into an iteration cap so the time limit
+# and iteration cap fire at approximately the same point — no idle time wasted.
+NODES_PER_SEC = 57_000
 
 
 # =============================================================================
@@ -72,7 +91,7 @@ class TimeManager:
       - Python fast-path fired: zero — time manager not consulted at all
 
     Time budget floor: 300ms  (never slower than original for trivial spots)
-    Time budget ceiling: 12,000ms per turn (leaves headroom in bank)
+    Time budget ceiling: 30,000ms per turn (leaves headroom in bank)
     Default base budget: 2,000ms when bank is healthy
     """
 
@@ -205,6 +224,12 @@ class CompetitivePlayer(Player):
         # Sleep turn tracking: species.lower() → turns_asleep (increments each turn)
         # Used to give Rust an accurate sleep duration estimate.
         self._sleep_turns: dict        = {}
+        # Toxic turn tracking: species.lower() → ticks taken (increments each turn)
+        # Used to give Rust an accurate toxic counter since poke-env is unreliable.
+        self._toxic_turns: dict        = {}
+        # Substitute HP tracking: species.lower() → sub HP fraction (0.0 when no sub)
+        # poke-env doesn't expose this; we infer from Substitute use and damage taken.
+        self._sub_hp_fracs: dict       = {}
         # Sleep move tracking: species.lower() → move_id attempted
         # Prevents re-firing a sleep move that missed last turn.
         self._sleep_attempted_vs: dict = {}
@@ -226,7 +251,6 @@ class CompetitivePlayer(Player):
         print(msg)
 
     def _unsuppress(self):
-        import sys
         tee = sys.stdout
         if hasattr(tee, '_suppress_console'):
             tee._suppress_console = False
@@ -295,10 +319,9 @@ class CompetitivePlayer(Player):
                         self._opponent_move_names[species].append(move_name)
 
                     move_type = get_move_type(move_name)
-                    if not move_type:
+                    if not move_type and PokeEnvMove is not None:
                         try:
-                            from poke_env.environment.move import Move
-                            move_obj = Move(move_name, gen=1)
+                            move_obj = PokeEnvMove(move_name, gen=1)
                             if move_obj.type:
                                 move_type = move_obj.type.name.lower()
                                 register_move_type(move_name, move_type)
@@ -374,8 +397,7 @@ class CompetitivePlayer(Player):
                     break
             return f" [{', '.join(parts)}]" if parts else ''
 
-        import sys as _sys
-        _tee = _sys.stdout
+        _tee = sys.stdout
         if not self._verbose and hasattr(_tee, '_suppress_console'):
             _tee._suppress_console = True
 
@@ -390,6 +412,8 @@ class CompetitivePlayer(Player):
             self._battle_start_rust = self._rust_call_count
             self._sleep_clause_active  = False
             self._sleep_turns          = {}
+            self._toxic_turns          = {}
+            self._sub_hp_fracs         = {}
             self._sleep_attempted_vs   = {}
             self._last_healed_turn     = -99
             self._last_healed_species  = ""
@@ -417,6 +441,15 @@ class CompetitivePlayer(Player):
                 self._sleep_turns[key] = self._sleep_turns.get(key, 0) + 1
             elif key in self._sleep_turns:
                 del self._sleep_turns[key]  # woke up
+
+        # ── Toxic turn tracking ───────────────────────────────────────────
+        # Increment each turn the mon is badly poisoned; clear on cure/faint.
+        for p in battle.team.values():
+            key = p.species.lower()
+            if p.status and p.status.name in ('TOX', 'PSN'):
+                self._toxic_turns[key] = self._toxic_turns.get(key, 0) + 1
+            elif key in self._toxic_turns:
+                del self._toxic_turns[key]
 
         # Clear sleep attempt record when opponent is confirmed asleep — move landed.
         if opp_status_now and opp_status_now.name == 'SLP':
@@ -514,7 +547,7 @@ class CompetitivePlayer(Player):
                 opp_hp_frac    = opp_hp_frac,
                 is_faint_switch= True,
             )
-            faint_iters = max(3000, int(faint_time_ms * 4000 / 1000))
+            faint_iters = max(3000, int(faint_time_ms * NODES_PER_SEC / 1000))
             rust_order = self._try_rust_faint_switch(battle, switches,
                                                      time_ms=faint_time_ms,
                                                      iterations=faint_iters)
@@ -562,17 +595,16 @@ class CompetitivePlayer(Player):
         opp_has_reflect     = False
         opp_has_lightscreen = False
         try:
-            try:
-                from poke_env.battle.side_condition import SideCondition
-            except ImportError:
-                from poke_env.environment.side_condition import SideCondition
             opp_has_reflect     = SideCondition.REFLECT      in battle.opponent_side_conditions
             opp_has_lightscreen = SideCondition.LIGHT_SCREEN in battle.opponent_side_conditions
-        except (ImportError, AttributeError):
+        except AttributeError:
+            # Defensive fallback: iterate and match by name string in case the
+            # poke-env SideCondition enum values differ from what the battle
+            # object exposes (e.g. mid-version API changes).
             for sc in battle.opponent_side_conditions:
                 sc_name = sc.name if hasattr(sc, 'name') else str(sc)
-                if 'REFLECT'     in sc_name.upper(): opp_has_reflect     = True
-                if 'LIGHT'       in sc_name.upper(): opp_has_lightscreen = True
+                if 'REFLECT' in sc_name.upper(): opp_has_reflect     = True
+                if 'LIGHT'   in sc_name.upper(): opp_has_lightscreen = True
 
         calc_kwargs = {
             'atk_boosts':      my_boosts,
@@ -907,12 +939,7 @@ class CompetitivePlayer(Player):
         )
         print(f"  ⏱  Time budget: {time_budget_ms}ms ({self._time_manager.status()})")
 
-        # Dynamic iteration cap: nodes/sec × budget.
-        # Measured throughput is ~4000 nodes/sec on the 9800X3D with 6 threads.
-        # Setting iterations = budget_ms * 4 means the time limit and iteration
-        # cap both fire at approximately the same point — no idle time wasted.
         # Floor of 3000 preserves minimum quality on very short budgets.
-        NODES_PER_SEC = 57000
         iters = max(3000, int(time_budget_ms * NODES_PER_SEC / 1000))
 
         rust_result = self._try_rust_engine(
@@ -1028,7 +1055,12 @@ class CompetitivePlayer(Player):
         """
         self._last_rust_result = {}
         try:
-            state = build_state(battle, sleep_turns=self._sleep_turns)
+            state = build_state(
+                battle,
+                sleep_turns=self._sleep_turns,
+                toxic_counters=self._toxic_turns,
+                sub_hp_fracs=self._sub_hp_fracs,
+            )
             if active_move_ids is not None:
                 state["ours"]["active"]["moves"] = active_move_ids
             result = self._rust_engine.choose(state, time_ms=time_ms,
@@ -1082,22 +1114,6 @@ class CompetitivePlayer(Player):
             print(f"  ⚠️  Rust engine exception: {e}")
             return None
 
-    def _hard_fallback_dupe(self, battle, real_moves, switches):
-        """Duplicate — kept for reference only."""
-        my_poke  = battle.active_pokemon
-        opp_poke = battle.opponent_active_pokemon
-        my_types  = get_pokemon_types(my_poke)
-        opp_types = get_pokemon_types(opp_poke)
-
-        print(f"\n  🔄 HARD FALLBACK: rust unavailable")
-        best_move, _ = best_move_effectiveness(
-            real_moves, opp_types, attacker_types=my_types
-        )
-        if best_move:
-            self._python_call_count += 1
-            return self.create_order(best_move)
-        return self.choose_default_move()
-
     def _try_rust_faint_switch(self, battle, switches, time_ms: int = None,
                                iterations: int = None):
         """
@@ -1106,7 +1122,12 @@ class CompetitivePlayer(Player):
         so Rust returns a switch action, not a move.
         """
         try:
-            state = build_state(battle, sleep_turns=self._sleep_turns)
+            state = build_state(
+                battle,
+                sleep_turns=self._sleep_turns,
+                toxic_counters=self._toxic_turns,
+                sub_hp_fracs=self._sub_hp_fracs,
+            )
             state["ours"]["active"]["moves"] = []
             result = self._rust_engine.choose(state, time_ms=time_ms,
                                                iterations=iterations)
@@ -1241,7 +1262,6 @@ def load_latest_team(format_name="ou"):
 
 class Tee:
     def __init__(self, filepath):
-        import sys
         self.file = open(filepath, 'w')
         self.stdout = sys.stdout
         self._suppress_console = False
@@ -1258,7 +1278,6 @@ class Tee:
         self.file.flush()
 
     def close(self):
-        import sys
         sys.stdout = self.stdout
         self.file.close()
 
