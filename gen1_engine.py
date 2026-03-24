@@ -250,21 +250,68 @@ def outspeeds(species_a: str, species_b: str,
 
 
 # =============================================================================
-# FREEZE CHANCE VALUE
-# All damaging Ice-type moves have a 10% freeze chance in Gen 1.
-# Freeze is essentially permanent — significant strategic value.
+# SECONDARY EFFECT VALUE
+# Returns the expected damage equivalent (as a fraction of defender max HP)
+# for a move's secondary effect. Used in domination calculations so that
+# Body Slam (30% para) correctly outweighs Blizzard (10% freeze, lower damage).
+#
+# Methodology: effects are converted to expected HP advantage over a 3-turn
+# window, expressed as a fraction of the defender's max HP.
+#   - Paralysis (30%): 30% chance × ~0.25 immob/turn × 3 turns × ~30% avg dmg
+#     prevented ≈ 0.068 (~7% effective bonus). Used for Body Slam, Lick.
+#   - Paralysis (10%): same but ×10%/30% → ~0.023. Used for Thunder.
+#   - Freeze (10%): permanent until switch; ~0.10 chance × ~2 turns gained
+#     × ~30% avg dmg ≈ 0.060. Used for Blizzard, Ice Beam, Ice Punch.
+#   - Burn (10%): 1/16 drain per turn × ~3 turns + atk halved ≈ 0.030.
+#     Used for Fire Blast, Flamethrower, Fire Punch.
+#   - Flinch (30%): only relevant if attacker outspeeds — ~0.030 average.
+#   - Confusion (20-30%): ~0.025 average.
 # =============================================================================
+
+# Move → secondary effect bonus
+_SECONDARY_BONUS: dict = {
+    # 30% paralysis
+    'bodyslam':    0.068,
+    'lick':        0.068,
+    # 10% paralysis
+    'thunder':     0.023,
+    # 10% freeze
+    'blizzard':    0.060,
+    'icebeam':     0.060,
+    'icepunch':    0.060,
+    # 10% burn
+    'fireblast':   0.030,
+    'flamethrower':0.030,
+    'firepunch':   0.030,
+    # 30% flinch (value only if attacker outspeeds — use half as unconditional estimate)
+    'headbutt':    0.015,
+    'stomp':       0.015,
+    'rockslide':   0.015,
+    # 20% confusion
+    'confuseray':  0.000,  # status move, stripped before reaching here
+    'psybeam':     0.020,
+    'waterfall':   0.010,
+}
+
+
+def secondary_effect_value(move_id: str) -> float:
+    """
+    Expected damage equivalent (fraction of defender max HP) for a move's
+    secondary effect. Returns 0.0 for moves with no meaningful secondary.
+    """
+    return _SECONDARY_BONUS.get(move_id, 0.0)
+
 
 def freeze_chance_value(move_id: str, defender_species: str) -> int:
     """
-    Bonus score (0–15) for freeze potential.
-    Returns 0 if the move can't freeze or the defender is already Ice-type.
+    Legacy bonus score (0–15) for freeze potential.
+    Retained for backward compatibility. Prefer secondary_effect_value().
     """
     if move_id not in FREEZE_MOVES:
         return 0
     if 'ice' in get_types(defender_species):
         return 0
-    return 15  # 10% of a KO ≈ significant but not dominant
+    return 15
 
 
 # =============================================================================

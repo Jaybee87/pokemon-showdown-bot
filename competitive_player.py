@@ -55,7 +55,8 @@ from gen1_engine import (
     register_move_type, get_move_type,
     calc_damage_pct, can_ko, find_ko_move, outspeeds, get_speed,
     evaluate_matchup, find_best_matchup_switch,
-    freeze_chance_value, get_substitute_hp, can_break_substitute,
+    freeze_chance_value, secondary_effect_value,
+    get_substitute_hp, can_break_substitute,
     FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, IGNORE_MOVES,
 )
 from rust_engine_bridge import RustEngine, build_state, action_to_poke_env
@@ -233,12 +234,18 @@ class CompetitivePlayer(Player):
         # Sleep move tracking: species.lower() → move_id attempted
         # Prevents re-firing a sleep move that missed last turn.
         self._sleep_attempted_vs: dict = {}
+        # T-Wave tracking: species.lower() → True once attempted
+        # Prevents re-firing T-Wave every turn when it misses or is blocked.
+        self._twave_attempted_vs: dict = {}
         self._last_rust_result:   dict = {}
         self._last_healed_turn:   int  = -99
         self._last_healed_species: str = ""
         self._last_healed_hp_frac: float = 1.0   # HP at time of last heal (tox race check)
         self._last_switched_in_turn: int  = -99   # switch cooldown
         self._last_switched_in_species: str = ""  # which mon just switched in
+        # Opponent HP tracking: species.lower() → hp_fraction at end of last turn.
+        # Used to detect healing even when the move name was never revealed.
+        self._opp_hp_last_turn: dict = {}
         self._time_manager = TimeManager()
         self._rust_engine = RustEngine(
             algorithm="auto",
@@ -415,11 +422,13 @@ class CompetitivePlayer(Player):
             self._toxic_turns          = {}
             self._sub_hp_fracs         = {}
             self._sleep_attempted_vs   = {}
+            self._twave_attempted_vs   = {}
             self._last_healed_turn     = -99
             self._last_healed_species  = ""
             self._last_healed_hp_frac  = 1.0
             self._last_switched_in_turn    = -99
             self._last_switched_in_species = ""
+            self._opp_hp_last_turn         = {}
             self._time_manager.reset()
 
         # Record turn start for time bank tracking
@@ -454,6 +463,19 @@ class CompetitivePlayer(Player):
         # Clear sleep attempt record when opponent is confirmed asleep — move landed.
         if opp_status_now and opp_status_now.name == 'SLP':
             self._sleep_attempted_vs.pop(opp_species, None)
+        # Clear T-Wave attempt record when opponent is confirmed PAR — move landed.
+        if opp_status_now and opp_status_now.name == 'PAR':
+            self._twave_attempted_vs.pop(opp_species, None)
+
+        # ── Opponent HP tracking (heal detection) ─────────────────────────
+        # Record current opponent HP after each turn. If next turn's HP is
+        # higher than this turn's (same species, no switch), the opponent healed.
+        opp_hp_prev = self._opp_hp_last_turn.get(opp_species, None)
+        opp_healed_this_turn = (
+            opp_hp_prev is not None
+            and opp_hp_frac > opp_hp_prev + 0.05  # >5% gain = genuine heal
+        )
+        self._opp_hp_last_turn[opp_species] = opp_hp_frac
 
         # ── Build usable move list ─────────────────────────────────────────
         # Strip moves that can never work this turn
@@ -667,30 +689,14 @@ class CompetitivePlayer(Player):
                     self._python_call_count += 1
                     return self.create_order(sleep_move)
 
-            # Thunder Wave vs Recover user
-            opp_has_recover = any(
-                m in self._opponent_move_names.get(opp_species, [])
-                for m in ('recover', 'softboiled', 'rest')
-            )
-            if opp_has_recover:
-                twave = next((m for m in real_moves if m.id == 'thunderwave'), None)
-                if twave:
-                    best_dmg = 0.0
-                    for mv in real_moves:
-                        if mv.id in ('thunderwave', *HEAL_MOVES):
-                            continue
-                        try:
-                            lo, hi = calc_damage_pct(my_species, mv.id, opp_species,
-                                                     atk_boosts=my_boosts,
-                                                     def_boosts=opp_boosts)
-                            best_dmg = max(best_dmg, (lo + hi) / 2)
-                        except Exception:
-                            pass
-                    if best_dmg < 0.50:
-                        print(f"  ⚡ PYTHON: opponent has Recover, can't 2HKO "
-                              f"(best ~{int(best_dmg*100)}%) — Thunder Wave")
-                        self._python_call_count += 1
-                        return self.create_order(twave)
+            # Thunder Wave — paralysis is always valuable on an unstatused opponent.
+            # Track attempts per species so we don't re-fire if it missed/was blocked.
+            twave = next((m for m in real_moves if m.id == 'thunderwave'), None)
+            if twave and not self._twave_attempted_vs.get(opp_species):
+                self._twave_attempted_vs[opp_species] = True
+                print(f"  ⚡ PYTHON: Thunder Wave — inflicting PAR")
+                self._python_call_count += 1
+                return self.create_order(twave)
 
         # ══════════════════════════════════════════════════════════════════
         # STEP 6 — Toxic fast-heal
@@ -760,7 +766,10 @@ class CompetitivePlayer(Player):
             if reason:
                 strip_log[hm.id] = reason
 
-        # Attack strips — compute best expected damage first (heals excluded)
+        # Attack strips — compute best expected damage first (heals and
+        # explosion/selfdestruct excluded — sacrifice moves shouldn't set
+        # the domination baseline or they'd strip all regular attacks).
+        SACRIFICE_MOVES = ('explosion', 'selfdestruct')
         damaging = [m for m in real_moves
                     if m.id not in HEAL_MOVES and (m.base_power or 0) > 0]
         best_exp_dmg  = 0.0
@@ -772,8 +781,12 @@ class CompetitivePlayer(Player):
                 exp = (lo + hi) / 2
             except Exception:
                 exp = 0.0
+            # Add secondary effect value so Body Slam (30% para) correctly
+            # outweighs moves with slightly higher raw damage but no secondary.
+            exp += secondary_effect_value(mv.id)
             exp_dmg_cache[mv.id] = exp
-            best_exp_dmg = max(best_exp_dmg, exp)
+            if mv.id not in SACRIFICE_MOVES:
+                best_exp_dmg = max(best_exp_dmg, exp)
 
         for mv in damaging:
             if mv.id in strip_log:
@@ -787,8 +800,8 @@ class CompetitivePlayer(Player):
                 reason = "Dream Eater — opp not asleep"
             elif best_exp_dmg > 0:
                 exp = exp_dmg_cache.get(mv.id, 0.0)
-                if exp < best_exp_dmg * 0.70:
-                    reason = (f"dominated ({int(exp*100)}% < 70% of "
+                if exp < best_exp_dmg * 0.55:
+                    reason = (f"dominated ({int(exp*100)}% < 55% of "
                               f"best {int(best_exp_dmg*100)}%)")
             if reason:
                 strip_log[mv.id] = reason
