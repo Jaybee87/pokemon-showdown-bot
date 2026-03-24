@@ -302,7 +302,19 @@ impl From<JsonBattlePoke> for BattlePoke {
         let mut moves = [MOVE_NONE; 4];
         let count = j.moves.len().min(4);
         for (i, m) in j.moves.iter().take(4).enumerate() {
-            moves[i] = move_to_id(m);
+            let mid = move_to_id(m);
+            if mid == MOVE_NONE && !m.trim().is_empty() {
+                // A named move that doesn't resolve means MOVE_NAMES is missing it.
+                // This is always a bug — every real Gen 1 move must be in the table.
+                // We don't panic here (opponent moves can be inferred/unusual) but
+                // we write to stderr so it appears in logs and can be investigated.
+                eprintln!(
+                    "[WARN] move {:?} on species {:?} did not resolve to a known move ID. \
+                     Add it to MOVE_NAMES in ids.rs if it is a real Gen 1 move.",
+                    m, j.species
+                );
+            }
+            moves[i] = mid;
         }
         let mut boosts = [0i8; 6];
         for (k, v) in &j.boosts {
@@ -314,10 +326,25 @@ impl From<JsonBattlePoke> for BattlePoke {
 
         // Pre-compute battle stats from the table — happens once at JSON boundary,
         // never again during search.
+        // INVARIANT: every named species must resolve. The only legitimate unknown
+        // is an unrevealed opponent Pokémon sent as an empty string. A non-empty
+        // species that fails lookup means a name normalisation bug — panic loudly
+        // rather than silently using wrong types/stats.
         let (max_hp, base_atk, base_def, base_spc, base_spe, type1, type2) =
             if let Some(bs) = crate::data::get_battle_stats(species_id) {
                 (bs.hp, bs.atk, bs.def, bs.spc, bs.spe, bs.t1, bs.t2)
             } else {
+                let name = j.species.trim();
+                if !name.is_empty() {
+                    panic!(
+                        "Unknown species {:?} — not in SPECIES_NAMES. \
+                         Check poke-env name normalisation (e.g. 'mr-mime' → 'mrmime', \
+                         'farfetch\\'d' → 'farfetchd'). \
+                         Only empty-string species (unrevealed opponent) should reach this path.",
+                        name
+                    );
+                }
+                // Genuinely unknown opponent — use neutral placeholder
                 (100, 100, 100, 100, 100, crate::data::Type::Normal, None)
             };
 

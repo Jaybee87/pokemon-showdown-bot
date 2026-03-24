@@ -20,11 +20,14 @@ pub const SPECIES_UNKNOWN: u16 = 0;
 
 /// Linear scan — called only once per move at JSON parse time, not in search.
 pub fn move_to_id(name: &str) -> u16 {
-    match name.trim() {
+    // Normalise: lowercase, strip spaces/hyphens — matches poke-env's move ID format
+    let norm: String = name.trim().to_lowercase()
+        .chars().filter(|c| c.is_alphanumeric()).collect();
+    match norm.as_str() {
         ""             => MOVE_NONE,
         "struggle"     => MOVE_STRUGGLE,
         "recharge"     => MOVE_RECHARGE,
-        "__sleep_frz__"=> MOVE_SLEEP_FRZ,
+        "__sleepfrz__" => MOVE_SLEEP_FRZ,
         other => MOVE_NAMES.iter().position(|&n| n == other)
             .map(|i| i as u16 + MOVE_ID_OFFSET)
             .unwrap_or(MOVE_NONE),
@@ -45,9 +48,12 @@ pub fn id_to_move(id: u16) -> &'static str {
 }
 
 pub fn species_to_id(name: &str) -> u16 {
-    let name = name.trim();
-    if name.is_empty() { return SPECIES_UNKNOWN; }
-    SPECIES_NAMES.iter().position(|&n| n == name)
+    // Normalise: lowercase, strip spaces/hyphens/dots — handles poke-env variants
+    // like "mr-mime" → "mrmime", "farfetch'd" → "farfetchd"
+    let norm: String = name.trim().to_lowercase()
+        .chars().filter(|c| c.is_alphanumeric()).collect();
+    if norm.is_empty() { return SPECIES_UNKNOWN; }
+    SPECIES_NAMES.iter().position(|&n| n == norm.as_str())
         .map(|i| i as u16 + 1)
         .unwrap_or(SPECIES_UNKNOWN)
 }
@@ -81,8 +87,9 @@ pub fn boost_key_to_idx(key: &str) -> Option<usize> {
 
 // ─── Static name tables ───────────────────────────────────────────────────────
 
-/// All move names used anywhere in the engine, inference templates, or Python bridge.
+/// All real Gen 1 move names used by the engine, inference templates, or Python bridge.
 /// Order matters — index + MOVE_ID_OFFSET = the u16 ID.
+/// Names are lowercase, alphanumeric-only (same normalisation as move_to_id).
 pub static MOVE_NAMES: &[&str] = &[
     // Normal
     "tackle","bodyslam","doubleedge","hyperbeam","slash","scratch","cut","pound",
@@ -90,7 +97,7 @@ pub static MOVE_NAMES: &[&str] = &[
     "headbutt","takedown","lick","dreameater","nightshade","rage","mimic",
     "metronome","selfdestruct","explosion","swordsdance","growl","tailwhip",
     "screech","leer","smokescreen","stringshot","harden","minimize","softboiled",
-    "rest","recover",
+    "rest","recover","doubleslap","cometpunch","triattack","sharpen","defensecurl",
     // Fire
     "ember","fireblast","flamethrower","firespin","firepunch",
     // Water
@@ -103,33 +110,30 @@ pub static MOVE_NAMES: &[&str] = &[
     "agility","flash",
     // Grass
     "razorleaf","solarbeam","vinewhip","leechseed","absorb","megadrain",
-    "petaldance","spore","sleeppowder","stunspore","poisonpowder","synthesis",
+    "petaldance","spore","sleeppowder","stunspore","poisonpowder",
     // Psychic
     "psychic","psybeam","confusion","hypnosis","teleport","reflect","barrier",
     "amnesia","kinesis","meditate","psywave","lightscreen","seismictoss",
     // Fighting
     "karatechop","lowkick","jumpkick","highjumpkick","submission","focusenergy",
-    "counter","doubleslap","cometpunch","doublekick","rollingkick","triattack",
-    "superpower",
+    "counter","doublekick","rollingkick","superpower",
     // Poison
     "acid","sludge","poisonsting","twineedle","pinmissile","toxic","poisongas",
     // Ground
-    "earthquake","dig","fissure","mudslap","sandattack","bonemerang","boneclub",
+    "earthquake","dig","fissure","sandattack","bonemerang","boneclub",
     // Flying
-    "fly","wingattack","peck","drillpeck","gust","skyattack","mirrorshot",
+    "fly","wingattack","peck","drillpeck","gust","skyattack",
     // Rock
-    "rockslide","rockthrow","rockblast",
+    "rockslide","rockthrow",
     // Bug
-    "leechlife","spiderweb","signalbeam","twineedle2",
+    "leechlife","signalbeam",
     // Ghost
-    "lick2","nightshade2","confuseray","spite",
+    "confuseray","spite","lick","nightshade",
     // Dragon
-    "dragonfang","dragonrage","draco",
+    "dragonrage","dragonite",
     // Status / misc
     "substitute","disable","haze","whirlwind","roar","transform","conversion",
-    "sharpen","defensecurl","barrierx","acidarmor","clamp2","encore","glare",
-    "lovelykiss","sing","thunderwave2","spore2","supersonic","confuseray2",
-    "disable2","leechseed2","petalblizzard",
+    "acidarmor","encore","glare","lovelykiss","sing","supersonic",
 ];
 
 /// All 151 Gen 1 species names.

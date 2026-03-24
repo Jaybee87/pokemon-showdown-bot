@@ -15,7 +15,7 @@
 ///   - Recharge penalty increased (280 → 350) — free turns are more costly than estimated
 
 use crate::state::*;
-use crate::calc::{avg_damage_pct, can_ko, guaranteed_ko_screens, effective_stats};
+use crate::calc::{sim_expected_damage_pct, can_ko, guaranteed_ko_screens, effective_stats};
 
 // ─── Terminal detection ───────────────────────────────────────────────────────
 
@@ -250,16 +250,62 @@ pub fn evaluate(state: &BattleState) -> f64 {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-pub fn matchup_score(ours: &BattlePoke, theirs: &BattlePoke, their_reflect: bool, their_light_screen: bool, our_reflect: bool, our_light_screen: bool) -> f64 {
-    let our_out   = best_expected_damage_pct(ours,   theirs, their_reflect,  their_light_screen);
-    let their_out = best_expected_damage_pct(theirs, ours,   our_reflect,    our_light_screen);
-    (our_out - their_out) * 400.0
+/// Net matchup score: how much more damage we deal than we take, in expectation.
+///
+/// Uses sim_expected_damage_pct — identical formula to sim.rs (crit-blended,
+/// PAR-adjusted) — so this function and the search tree always agree on which
+/// move deals the most damage. Previously matchup_score used avg_damage_pct
+/// (no crit/PAR) and bench_quality used a different HP-weighted variant;
+/// those two paths disagreed, causing the engine to oscillate.
+///
+/// This is the single function used for:
+///   - Active matchup scoring (§3 in evaluate)
+///   - Bench quality scoring (§13 in evaluate)
+///   - KO threat evaluation (§8 in evaluate)
+///
+/// hp_weight: caller-supplied multiplier.
+///   - Active matchup: 1.0 (HP already captured in §2 total-HP score)
+///   - Bench quality: p.hp_frac() — a chipped bench mon's matchup is worth less
+#[inline]
+fn net_matchup_score(
+    ours:              &BattlePoke,
+    theirs:            &BattlePoke,
+    their_reflect:     bool,
+    their_light_screen:bool,
+    our_reflect:       bool,
+    our_light_screen:  bool,
+    hp_weight:         f64,
+) -> f64 {
+    let best_out = ours.move_ids().iter().map(|&mid| {
+        sim_expected_damage_pct(ours, mid, theirs, their_reflect, their_light_screen)
+    }).fold(0.0f64, f64::max);
+
+    // Exclude Explosion/Selfdestruct from defensive pressure.
+    // These are one-shot suicide moves — they don't represent per-turn pressure
+    // and including them makes best_in spike to 100%+, causing the engine to
+    // always switch away from any Pokémon that might have them. The KO-threat
+    // section (§8 in evaluate) handles self-destruct risk separately.
+    let explosion_id    = crate::ids::move_to_id("explosion");
+    let selfdestruct_id = crate::ids::move_to_id("selfdestruct");
+    let best_in = theirs.move_ids().iter()
+        .filter(|&&mid| mid != explosion_id && mid != selfdestruct_id)
+        .map(|&mid| sim_expected_damage_pct(theirs, mid, ours, our_reflect, our_light_screen))
+        .fold(0.0f64, f64::max);
+
+    (best_out - best_in) * hp_weight * 400.0
 }
 
-fn best_expected_damage_pct(attacker: &BattlePoke, defender: &BattlePoke, reflect: bool, light_screen: bool) -> f64 {
-    attacker.move_ids().iter().map(|&mid_u16| {
-        avg_damage_pct(attacker, mid_u16, defender, reflect, light_screen)
-    }).fold(0.0f64, f64::max)
+/// Convenience wrapper for the active matchup (hp_weight = 1.0).
+pub fn matchup_score(
+    ours:               &BattlePoke,
+    theirs:             &BattlePoke,
+    their_reflect:      bool,
+    their_light_screen: bool,
+    our_reflect:        bool,
+    our_light_screen:   bool,
+) -> f64 {
+    net_matchup_score(ours, theirs, their_reflect, their_light_screen,
+                      our_reflect, our_light_screen, 1.0)
 }
 
 fn status_score(p: &BattlePoke) -> f64 {
@@ -289,14 +335,15 @@ fn status_score(p: &BattlePoke) -> f64 {
 
 fn bench_quality(bench: &[BattlePoke], opponent_active: &BattlePoke, opp_reflect: bool, opp_light_screen: bool) -> f64 {
     bench.iter().filter(|p| !p.fainted).map(|p| {
-        // Sleeping or frozen mons contribute zero bench quality — they cannot
-        // be switched in productively (switches() already blocks them, but
-        // the evaluator should also not inflate our score because of them).
+        // Sleeping or frozen mons contribute zero — they can't act on switch-in.
         if p.status == Status::Slp || p.status == Status::Frz {
             return 0.0;
         }
-        let hp_w = p.hp_frac() as f64;
-        let dmg  = best_expected_damage_pct(p, opponent_active, opp_reflect, opp_light_screen);
-        hp_w * dmg * 200.0
+        // Net matchup weighted by HP — same formula as the active matchup,
+        // but scaled by the bench mon's current HP fraction. A chipped mon's
+        // good type matchup is worth proportionally less.
+        // Our side has no screens when switching in fresh.
+        net_matchup_score(p, opponent_active, opp_reflect, opp_light_screen,
+                          false, false, p.hp_frac() as f64)
     }).sum()
 }

@@ -185,6 +185,44 @@ pub fn avg_damage_pct(attacker: &BattlePoke, move_id_u16: u16, defender: &Battle
     (lo + hi) / 2.0
 }
 
+/// Expected damage as a fraction of the defender's max HP, using the same
+/// formula as sim.rs: crit-rate blended, PAR-immobilisation adjusted.
+///
+/// This is the single source of truth for "how much damage does this move
+/// deal in expectation". Both eval.rs and action_reason in main.rs must use
+/// this — not avg_damage_pct — so the reason string always agrees with what
+/// the search actually evaluated.
+#[inline]
+pub fn sim_expected_damage_pct(
+    attacker:     &BattlePoke,
+    move_id_u16:  u16,
+    defender:     &BattlePoke,
+    reflect:      bool,
+    light_screen: bool,
+) -> f64 {
+    const BASE_CRIT_RATE: f64 = 0.17;
+    const HIGH_CRIT_RATE: f64 = 0.63;
+    const PARA_IMMOB_PROB: f64 = 0.25;
+
+    let mid_str   = crate::ids::id_to_move(move_id_u16);
+    let par_factor = if attacker.status == Status::Par { 1.0 - PARA_IMMOB_PROB } else { 1.0 };
+    let crit_rate  = match mid_str {
+        "slash"|"crabhammer"|"karatechop"|"razorleaf"|"blizzard"|"waterfall" => HIGH_CRIT_RATE,
+        _ => BASE_CRIT_RATE,
+    };
+
+    let (lo_n, hi_n) = damage_range(attacker, move_id_u16, defender, reflect, light_screen);
+    let (lo_c, hi_c) = damage_range_crit(attacker, move_id_u16, defender);
+
+    let avg_n = (lo_n + hi_n) as f64 / 2.0;
+    let avg_c = (lo_c + hi_c) as f64 / 2.0;
+    let expected_hp = (avg_n * (1.0 - crit_rate) + avg_c * crit_rate) * par_factor;
+
+    let mhp = defender.max_hp as f64;
+    if mhp == 0.0 { return 0.0; }
+    expected_hp / mhp
+}
+
 // ─── KO checks — integer HP comparison, no float ──────────────────────────────
 
 #[inline]

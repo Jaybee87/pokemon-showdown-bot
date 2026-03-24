@@ -619,6 +619,11 @@ class CompetitivePlayer(Player):
         # Exclude Hyperbeam (recharge risk handled by Rust) and explosion/selfdestruct.
         # Also exclude Hyperbeam when we are below 15% HP — recharge turn is fatal.
         #
+        # PAR guard: a paralysed attacker has a 25% chance to not move at all.
+        # A KO that requires our move to land is not "guaranteed" when PAR means
+        # we may be immobilised. Skip the GKO fast-path entirely when we are PAR'd
+        # and let the Rust engine evaluate the risk properly.
+        #
         # Speed+heal guard: if the opponent is faster AND has a revealed heal move,
         # they will Recover/Softboiled BEFORE our attack lands on the same turn.
         # The hp_pct we have is pre-heal — the actual HP when we hit will be ~50% higher.
@@ -631,7 +636,8 @@ class CompetitivePlayer(Player):
             b_par=(opp_poke.status and opp_poke.status.name == 'PAR'
                    if opp_poke.status else False)
         )
-        skip_gko = opp_has_heal and opp_is_faster
+        my_is_par_now = my_status_now and my_status_now.name == 'PAR'
+        skip_gko = (opp_has_heal and opp_is_faster) or my_is_par_now
 
         my_hp_too_low_for_hb = my_hp_frac < 0.15
         ko_move_obj = None

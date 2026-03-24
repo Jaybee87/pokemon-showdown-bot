@@ -437,33 +437,87 @@ def worst_incoming_effectiveness(opponent_move_types: list, my_types: list) -> f
 
 def find_best_switch(battle, threat_type=None):
     """
-    Find the best available switch target.
-    Priority: immune to threat > resists threat > most HP > not active.
+    Find the best available switch-in using net matchup score.
 
-    Args:
-        battle:      poke-env Battle object
-        threat_type: type string we're escaping (e.g. 'electric'), or None
+    Score per candidate = (offensive_out - defensive_in) * hp_weight
 
-    Returns Pokemon object or None.
+    offensive_out: average damage % our best move deals to the opponent
+    defensive_in:  average damage % the opponent's best known/inferred move
+                   deals to us (using worst-case type effectiveness when
+                   moves are unknown)
+    hp_weight:     current_hp_fraction — a half-dead mon's good matchup
+                   is worth half as much
+
+    This naturally handles:
+      - Immunities (defensive_in = 0 → pure offensive value)
+      - Weaknesses (defensive_in spikes → score drops)
+      - Chipped mons (hp_weight scales the whole score down)
+      - Sleeping/frozen mons (score zeroed out explicitly)
+
+    threat_type is kept for API compatibility but is no longer the primary
+    scoring axis — it adjusts defensive_in when opponent moves are unknown.
     """
     candidates = [p for p in battle.available_switches if not p.fainted]
     if not candidates:
         return None
 
-    def switch_score(p):
-        types = get_pokemon_types(p)
-        hp_factor = p.current_hp_fraction
-        if threat_type:
-            eff = type_effectiveness(threat_type, types)
-            if eff == 0:
-                return 1000 + hp_factor
-            if eff < 1:
-                return 100 + hp_factor
-            if eff > 1:
-                return hp_factor - 10
-        return hp_factor
+    opp   = battle.opponent_active_pokemon
+    opp_species = opp.species.lower()
+    opp_types   = get_pokemon_types(opp)
+    opp_status  = opp.status.name if opp.status else None
 
-    return max(candidates, key=switch_score)
+    def net_score(p):
+        # Hard exclusions
+        if p.status and p.status.name in ('SLP', 'FRZ'):
+            return -9999.0
+        hp = p.current_hp_fraction or 0.0
+        if hp < 0.10:
+            return -9999.0
+
+        species = p.species.lower()
+        our_types = get_pokemon_types(p)
+        our_moves = [m.id for m in p.moves.values()] if p.moves else []
+
+        # Offensive: best avg damage % we deal to the opponent
+        best_out = 0.0
+        if our_moves:
+            for mid in our_moves:
+                m = get_move(mid)
+                if m and m[2] != 'status':
+                    lo, hi = calc_damage_pct(species, mid, opp_species)
+                    best_out = max(best_out, (lo + hi) / 2)
+        if best_out == 0.0:
+            # No known damaging moves — use type effectiveness as proxy
+            best_out = max(
+                (type_effectiveness(t, opp_types) * 0.20 for t in our_types),
+                default=0.10
+            )
+
+        # Defensive: best avg damage % opponent deals to us
+        # Prefer known revealed moves; fall back to threat_type or STAB proxy
+        opp_known = [
+            m.id for m in opp.moves.values()
+            if m and m.id not in IGNORE_MOVES
+        ] if opp.moves else []
+
+        best_in = 0.0
+        if opp_known:
+            for mid in opp_known:
+                m = get_move(mid)
+                if m and m[2] != 'status':
+                    lo, hi = calc_damage_pct(opp_species, mid, species)
+                    best_in = max(best_in, (lo + hi) / 2)
+        else:
+            # No revealed moves — use worst-case STAB type effectiveness
+            threat = threat_type or opp_types[0] if opp_types else 'normal'
+            eff = type_effectiveness(threat, our_types)
+            best_in = eff * 0.20  # ~20% per turn at neutral, scales with type chart
+
+        # Net score weighted by HP
+        # Multiply by 100 to keep the scale comparable to evaluate_matchup
+        return (best_out - best_in) * hp * 100.0
+
+    return max(candidates, key=net_score)
 
 
 # =============================================================================

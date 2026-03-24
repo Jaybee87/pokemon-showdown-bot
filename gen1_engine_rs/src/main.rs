@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use state::{BattleState, JsonBattleState, Decision, Action, ActionJson};
 use ids::id_to_move;
-use calc::{can_ko, guaranteed_ko, avg_damage_pct};
+use calc::{can_ko, guaranteed_ko, sim_expected_damage_pct};
 
 #[derive(Deserialize, Debug)]
 struct Request {
@@ -133,14 +133,32 @@ fn action_reason(action: &Action, state: &BattleState) -> String {
             let mid_str = id_to_move(*id);
             let ours    = &state.ours.active;
             let theirs  = &state.theirs.active;
-            if guaranteed_ko(ours, *id, theirs) {
+
+            let verdict = if guaranteed_ko(ours, *id, theirs) {
                 format!("guaranteed KO with {mid_str}")
             } else if can_ko(ours, *id, theirs) {
                 format!("likely KO with {mid_str}")
             } else {
-                let dmg = avg_damage_pct(ours, *id, theirs, false, false);
+                let dmg = sim_expected_damage_pct(ours, *id, theirs,
+                    state.theirs.reflect, state.theirs.light_screen);
                 format!("{mid_str} → ~{:.0}% avg dmg", dmg * 100.0)
-            }
+            };
+
+            // Append all-move breakdown so type mismatches are visible in logs
+            let mut scores: Vec<String> = ours.move_ids().iter().map(|&mid| {
+                let name = id_to_move(mid);
+                let dmg  = sim_expected_damage_pct(ours, mid, theirs,
+                    state.theirs.reflect, state.theirs.light_screen);
+                format!("{}={:.0}%", name, dmg * 100.0)
+            }).collect();
+            scores.sort_by(|a, b| {
+                let pct = |s: &str| s.split('=').nth(1)
+                    .and_then(|v| v.trim_end_matches('%').parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                pct(b).partial_cmp(&pct(a)).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            format!("{} [{}]", verdict, scores.join(", "))
         }
         Action::Switch { species } => {
             let name = ids::id_to_species(*species);
