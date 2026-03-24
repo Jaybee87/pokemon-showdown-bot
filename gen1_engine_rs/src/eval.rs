@@ -15,7 +15,7 @@
 ///   - Recharge penalty increased (280 → 350) — free turns are more costly than estimated
 
 use crate::state::*;
-use crate::calc::{avg_damage_pct, can_ko, effective_stats};
+use crate::calc::{avg_damage_pct, can_ko, guaranteed_ko_screens, effective_stats};
 
 // ─── Terminal detection ───────────────────────────────────────────────────────
 
@@ -52,7 +52,11 @@ pub fn evaluate(state: &BattleState) -> f64 {
     score += (our_hp - their_hp) * 250.0;
 
     // ── 3. Active matchup ─────────────────────────────────────────────────
-    score += matchup_score(&state.ours.active, &state.theirs.active) * 2.5;
+    score += matchup_score(
+        &state.ours.active, &state.theirs.active,
+        state.theirs.reflect, state.theirs.light_screen,
+        state.ours.reflect,   state.ours.light_screen,
+    ) * 2.5;
 
     // ── 4. Status conditions ─────────────────────────────────────────────
     score += status_score(&state.ours.active)   *  1.0;
@@ -154,14 +158,39 @@ pub fn evaluate(state: &BattleState) -> f64 {
     }
 
     // ── 8. KO threat ──────────────────────────────────────────────────────
+    // For most moves: use can_ko (average roll) as a threat heuristic.
+    // For Explosion/Selfdestruct: only count as a threat when the minimum
+    // damage roll guarantees the KO — the user always faints, so an
+    // optimistic average-roll KO that doesn't land is a losing trade.
+    // Pass the defender's active screens so damage is evaluated accurately.
+    let their_reflect      = state.theirs.reflect;
+    let their_light_screen = state.theirs.light_screen;
+    let our_reflect        = state.ours.reflect;
+    let our_light_screen   = state.ours.light_screen;
+
     let we_threaten = state.ours.active.move_ids().iter().any(|&mid_u16| {
         let mid_str = crate::ids::id_to_move(mid_u16);
         if mid_str == "hyperbeam" && state.ours.active.status == Status::Par { return false; }
         if mid_str == "hyperbeam" && their_has_heal { return false; }
+        if mid_str == "explosion" || mid_str == "selfdestruct" {
+            // Self-destruct: only a real threat when min roll KOs through screens
+            return guaranteed_ko_screens(
+                &state.ours.active, mid_u16, &state.theirs.active,
+                their_reflect, their_light_screen,
+            );
+        }
         can_ko(&state.ours.active, mid_u16, &state.theirs.active)
     });
-    let they_threaten = state.theirs.active.move_ids().iter()
-        .any(|&mid_u16| can_ko(&state.theirs.active, mid_u16, &state.ours.active));
+    let they_threaten = state.theirs.active.move_ids().iter().any(|&mid_u16| {
+        let mid_str = crate::ids::id_to_move(mid_u16);
+        if mid_str == "explosion" || mid_str == "selfdestruct" {
+            return guaranteed_ko_screens(
+                &state.theirs.active, mid_u16, &state.ours.active,
+                our_reflect, our_light_screen,
+            );
+        }
+        can_ko(&state.theirs.active, mid_u16, &state.ours.active)
+    });
     if we_threaten   { score += 220.0; }
     if they_threaten { score -= 220.0; }
 
@@ -205,23 +234,31 @@ pub fn evaluate(state: &BattleState) -> f64 {
     // ── 13. Bench quality ─────────────────────────────────────────────────
     // Weight reduced from 0.4 to 0.2 to reduce switch oscillation — the search
     // was over-valuing bench mons and switching every turn against neutral targets.
-    score += bench_quality(&state.ours.bench[..state.ours.bench_count as usize],   &state.theirs.active) * 0.2;
-    score -= bench_quality(&state.theirs.bench[..state.theirs.bench_count as usize], &state.ours.active)   * 0.2;
+    score += bench_quality(
+        &state.ours.bench[..state.ours.bench_count as usize],
+        &state.theirs.active,
+        state.theirs.reflect, state.theirs.light_screen,
+    ) * 0.2;
+    score -= bench_quality(
+        &state.theirs.bench[..state.theirs.bench_count as usize],
+        &state.ours.active,
+        state.ours.reflect, state.ours.light_screen,
+    ) * 0.2;
 
     score
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-pub fn matchup_score(ours: &BattlePoke, theirs: &BattlePoke) -> f64 {
-    let our_out   = best_expected_damage_pct(ours,   theirs);
-    let their_out = best_expected_damage_pct(theirs, ours);
+pub fn matchup_score(ours: &BattlePoke, theirs: &BattlePoke, their_reflect: bool, their_light_screen: bool, our_reflect: bool, our_light_screen: bool) -> f64 {
+    let our_out   = best_expected_damage_pct(ours,   theirs, their_reflect,  their_light_screen);
+    let their_out = best_expected_damage_pct(theirs, ours,   our_reflect,    our_light_screen);
     (our_out - their_out) * 400.0
 }
 
-fn best_expected_damage_pct(attacker: &BattlePoke, defender: &BattlePoke) -> f64 {
+fn best_expected_damage_pct(attacker: &BattlePoke, defender: &BattlePoke, reflect: bool, light_screen: bool) -> f64 {
     attacker.move_ids().iter().map(|&mid_u16| {
-        avg_damage_pct(attacker, mid_u16, defender, false, false)
+        avg_damage_pct(attacker, mid_u16, defender, reflect, light_screen)
     }).fold(0.0f64, f64::max)
 }
 
@@ -250,7 +287,7 @@ fn status_score(p: &BattlePoke) -> f64 {
     s
 }
 
-fn bench_quality(bench: &[BattlePoke], opponent_active: &BattlePoke) -> f64 {
+fn bench_quality(bench: &[BattlePoke], opponent_active: &BattlePoke, opp_reflect: bool, opp_light_screen: bool) -> f64 {
     bench.iter().filter(|p| !p.fainted).map(|p| {
         // Sleeping or frozen mons contribute zero bench quality — they cannot
         // be switched in productively (switches() already blocks them, but
@@ -259,7 +296,7 @@ fn bench_quality(bench: &[BattlePoke], opponent_active: &BattlePoke) -> f64 {
             return 0.0;
         }
         let hp_w = p.hp_frac() as f64;
-        let dmg  = best_expected_damage_pct(p, opponent_active);
+        let dmg  = best_expected_damage_pct(p, opponent_active, opp_reflect, opp_light_screen);
         hp_w * dmg * 200.0
     }).sum()
 }

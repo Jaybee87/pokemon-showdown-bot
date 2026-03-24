@@ -128,7 +128,7 @@ fn apply_damage_to_side(
     if mid == move_to_id("hyperbeam") && expected_hp > 0 {
         attacker_poke.recharging = true;
     }
-    // Explosion/Selfdestruct: attacker faints
+    // Explosion/Selfdestruct: attacker always faints — Gen 1 mechanics.
     if mid == move_to_id("explosion") || mid == move_to_id("selfdestruct") {
         attacker_poke.hp = 0;
         attacker_poke.fainted = true;

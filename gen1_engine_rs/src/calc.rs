@@ -189,14 +189,29 @@ pub fn avg_damage_pct(attacker: &BattlePoke, move_id_u16: u16, defender: &Battle
 
 #[inline]
 pub fn can_ko(attacker: &BattlePoke, move_id_u16: u16, defender: &BattlePoke) -> bool {
+    // Use average roll for "can KO" (i.e. "likely to KO") — used by the eval's
+    // KO-threat heuristic where we want to know if a move is a realistic threat.
     let (lo, hi) = damage_range(attacker, move_id_u16, defender, false, false);
     (lo + hi) / 2 >= defender.hp as u32
 }
 
+/// Returns true only if the minimum damage roll guarantees a KO — used for
+/// Explosion/Selfdestruct decisions where we must not self-destruct speculatively.
+#[inline]
+pub fn guaranteed_ko_screens(
+    attacker:     &BattlePoke,
+    move_id_u16:  u16,
+    defender:     &BattlePoke,
+    reflect:      bool,
+    light_screen: bool,
+) -> bool {
+    let (lo, _) = damage_range(attacker, move_id_u16, defender, reflect, light_screen);
+    lo >= defender.hp as u32
+}
+
 #[inline]
 pub fn guaranteed_ko(attacker: &BattlePoke, move_id_u16: u16, defender: &BattlePoke) -> bool {
-    let (lo, _) = damage_range(attacker, move_id_u16, defender, false, false);
-    lo >= defender.hp as u32
+    guaranteed_ko_screens(attacker, move_id_u16, defender, false, false)
 }
 
 // ─── String-based wrappers (Python bridge only, not in search hot path) ────────
