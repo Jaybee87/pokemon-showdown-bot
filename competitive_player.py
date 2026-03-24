@@ -1,7 +1,7 @@
 """
 competitive_player.py
 =====================
-Competitive Gen 1 OU player using a hybrid Python/Rust/LLM decision engine.
+Competitive Gen 1 OU player using a hybrid Python/Rust decision engine.
 
 Decision hierarchy — Python only handles mechanical certainties.
 Rust handles everything strategic.
@@ -9,13 +9,13 @@ Rust handles everything strategic.
   1. FORCED      — only one legal action (struggle / recharge / single switch)
   2. RECHARGE    — locked after Hyper Beam, no choice
   3. ASLEEP      — we can't act; queue best move or switch if clean
-  4. FAINT SWITCH — Rust picks the send-in; LLM fallback only on error
+  4. FAINT SWITCH — Rust picks the send-in; Python fallback if Rust errors
   5. GUARANTEED KO — Python math says we finish them this turn → do it
   6. IMMUNE       — opponent known moves do 0x to us → stay in and hit
   7. SLEEP MOVE   — opponent has no status and we have a sleep move → use it
   8. RUST ENGINE  — all other decisions: switch timing, Hyperbeam risk,
                     status moves, matchup evaluation, stall breaks
-  9. LLM          — last resort if Rust errors
+  9. PYTHON HARD FALLBACK — best type-effective move if Rust errors
 
 Python fast-paths that previously fired before Rust (danger switch, dominant
 matchup, matchup switch, Thunder Wave, heal, Dream Eater, sleep follow-up)
@@ -34,7 +34,7 @@ import time
 from poke_env.player import Player
 from poke_env import LocalhostServerConfiguration, AccountConfiguration
 
-from config import LLM_MODEL, LLM_TIMEOUT_SECONDS, POKE_ENV_LOG_LEVEL
+from config import POKE_ENV_LOG_LEVEL
 from gen1_engine import (
     type_effectiveness, get_pokemon_types, best_move_effectiveness,
     worst_incoming_effectiveness, find_best_switch, resolve_move_types,
@@ -42,11 +42,7 @@ from gen1_engine import (
     calc_damage_pct, can_ko, find_ko_move, outspeeds, get_speed,
     evaluate_matchup, find_best_matchup_switch,
     freeze_chance_value, get_substitute_hp, can_break_substitute,
-    FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, LLM_ONLY_MOVES, IGNORE_MOVES,
-)
-from llm_bridge import (
-    call_llm, call_llm_async, strip_think_tags,
-    parse_battle_decision, parse_lead_choice, ensure_ollama_running,
+    FIXED_DAMAGE_MOVES, OHKO_MOVES, SLEEP_MOVES, IGNORE_MOVES,
 )
 from rust_engine_bridge import RustEngine, build_state, action_to_poke_env
 
@@ -184,171 +180,6 @@ class TimeManager:
         return f"bank={self._bank_remaining_s:.1f}s"
 
 
-# =============================================================================
-# LLM PROMPT BUILDER
-# =============================================================================
-
-def build_battle_prompt(battle, available_moves, available_switches,
-                        opponent_move_types, reason_for_ambiguity):
-    my_poke  = battle.active_pokemon
-    opp_poke = battle.opponent_active_pokemon
-    my_types  = get_pokemon_types(my_poke)
-    opp_types = get_pokemon_types(opp_poke)
-    my_hp  = int(my_poke.current_hp_fraction * 100)
-    opp_hp = int((opp_poke.current_hp_fraction or 1.0) * 100)
-
-    def status_label(poke):
-        parts = []
-        if poke.status:
-            name = poke.status.name
-            descriptions = {
-                'SLP': 'ASLEEP (cannot move)',
-                'PAR': 'PARALYZED (25% chance to not move, Speed/4)',
-                'PSN': 'POISONED (loses HP each turn)',
-                'TOX': 'BADLY POISONED (escalating HP loss)',
-                'BRN': 'BURNED (loses HP, Attack halved)',
-                'FRZ': 'FROZEN (cannot move)',
-            }
-            parts.append(descriptions.get(name, name))
-        for eff in (poke.effects or {}):
-            if hasattr(eff, 'name') and eff.name == 'CONFUSION':
-                parts.append('CONFUSED (may hurt itself)')
-                break
-        return ' + '.join(parts) if parts else 'none'
-
-    my_status  = status_label(my_poke)
-    opp_status = status_label(opp_poke)
-
-    move_lines = []
-    for m in available_moves:
-        if m.id == 'struggle':
-            continue
-        mtype = m.type.name.lower() if m.type else 'normal'
-        bp    = m.base_power or 0
-        stab  = mtype in my_types
-        stab_note = ' +STAB(1.5x)' if stab else ''
-        if m.id in FIXED_DAMAGE_MOVES:
-            eff_label = 'deals fixed damage (~100 dmg at L100)'
-        elif m.id in OHKO_MOVES:
-            eff_label = 'OHKO move (if it hits)'
-        else:
-            eff = type_effectiveness(mtype, opp_types)
-            eff_label = (
-                f'SUPER EFFECTIVE ({eff}x)' if eff > 1
-                else f'not very effective ({eff}x)' if 0 < eff < 1
-                else 'NO EFFECT (immune)' if eff == 0
-                else 'neutral (1x)'
-            )
-        extra = ''
-        if m.id == 'hyperbeam':
-            extra = ' ⚠️ USER MUST RECHARGE NEXT TURN'
-        if m.id in ('explosion', 'selfdestruct'):
-            extra = ' ⚠️ USER FAINTS AFTER USE'
-        move_lines.append(
-            f'  {m.id:18s} type:{mtype:10s} bp:{bp:3d}{stab_note:14s} vs opp: {eff_label}{extra}'
-        )
-
-    switch_lines = []
-    opp_known_types = opponent_move_types.get(opp_poke.species, [])
-    for p in available_switches:
-        ptypes = get_pokemon_types(p)
-        php    = int(p.current_hp_fraction * 100)
-        pst    = status_label(p)
-        if opp_known_types:
-            worst = worst_incoming_effectiveness(opp_known_types, ptypes)
-            threat_str = (
-                f'DANGER: takes {worst}x from opp moves' if worst > 1
-                else f'resists opp moves ({worst}x)' if worst < 1
-                else 'neutral vs opp moves'
-            )
-        else:
-            threat_str = 'opp moveset unknown'
-        status_str_p = f' [{pst}]' if pst != 'none' else ''
-        switch_lines.append(
-            f'  {p.species:14s} ({"/".join(ptypes):16s}) {php:3d}% HP{status_str_p} | {threat_str}'
-        )
-
-    opp_team_lines = []
-    for p in battle.opponent_team.values():
-        ptypes = get_pokemon_types(p)
-        if p.fainted:
-            opp_team_lines.append(f'  {p.species}: FAINTED')
-        elif p == opp_poke:
-            opp_team_lines.append(
-                f'  {p.species} ({"/".join(ptypes)}): {opp_hp}% HP [ACTIVE] status:{opp_status}'
-            )
-        else:
-            opp_team_lines.append(
-                f'  {p.species} ({"/".join(ptypes)}): {int((p.current_hp_fraction or 1)*100)}% HP'
-            )
-
-    my_team_lines = []
-    for p in battle.team.values():
-        ptypes = get_pokemon_types(p)
-        if p.fainted:
-            my_team_lines.append(f'  {p.species}: FAINTED')
-        elif p == my_poke:
-            my_team_lines.append(
-                f'  {p.species} ({"/".join(ptypes)}): {my_hp}% HP [ACTIVE] status:{my_status}'
-            )
-        else:
-            pst     = status_label(p)
-            pst_str = f' [{pst}]' if pst != 'none' else ''
-            my_team_lines.append(
-                f'  {p.species} ({"/".join(ptypes)}): {int(p.current_hp_fraction*100)}% HP{pst_str}'
-            )
-
-    known_str = ', '.join(opp_known_types) if opp_known_types else 'none revealed yet'
-
-    prompt = f"""You are a Gen 1 competitive Pokemon battle AI making a single battle decision.
-
-════════════════════════════════════════
-TURN {battle.turn}
-════════════════════════════════════════
-
-MY ACTIVE:   {my_poke.species.upper()} | Type: {" / ".join(t.upper() for t in my_types)} | HP: {my_hp}% | Status: {my_status}
-OPP ACTIVE:  {opp_poke.species.upper()} | Type: {" / ".join(t.upper() for t in opp_types)} | HP: {opp_hp}% | Status: {opp_status}
-
-OPPONENT'S REVEALED MOVE TYPES: {known_str}
-
-────────────────────────────────────────
-MY MOVE OPTIONS:
-{chr(10).join(move_lines) if move_lines else "  (none — must switch)"}
-
-MY SWITCH OPTIONS:
-{chr(10).join(switch_lines) if switch_lines else "  (none — must attack)"}
-
-────────────────────────────────────────
-MY TEAM:
-{chr(10).join(my_team_lines)}
-
-OPPONENT'S KNOWN TEAM:
-{chr(10).join(opp_team_lines) if opp_team_lines else "  (unknown)"}
-
-────────────────────────────────────────
-GEN 1 KEY RULES:
-- Ghost immune to Normal+Fighting | Ground immune to Electric | Psychic 2x vs Fighting+Poison
-- STAB: moves matching user type deal 1.5x damage
-- Hyper Beam: user MUST recharge next turn. Don't use if opponent can KO on free turn.
-- Paralysis: 25% chance fully immobilized each turn. Speed/4.
-- Sleep: cannot move at all.
-- Switching costs your entire turn.
-- Thunder Wave: cannot miss. Very high value vs fast threats.
-
-════════════════════════════════════════
-SITUATION: {reason_for_ambiguity}
-════════════════════════════════════════
-
-Analyse the battle state, then output ONE decision:
-DECISION: move <moveid>      e.g. DECISION: move thunderbolt
-DECISION: switch <species>   e.g. DECISION: switch chansey
-
-Use ONLY the exact move IDs and species names listed above. Output DECISION on its own line at the end."""
-
-    valid_move_ids   = {m.id.lower() for m in available_moves if m.id != 'struggle'}
-    valid_switch_ids = {p.species.lower() for p in available_switches}
-    return prompt, valid_move_ids, valid_switch_ids
-
 
 # =============================================================================
 # COMPETITIVE PLAYER
@@ -356,26 +187,21 @@ Use ONLY the exact move IDs and species names listed above. Output DECISION on i
 
 class CompetitivePlayer(Player):
 
-    def __init__(self, *args, verbose=True, live_timeout=None,
-                 total_games=None, **kwargs):
+    def __init__(self, *args, verbose=True, total_games=None, **kwargs):
         super().__init__(*args, **kwargs)
         self._opponent_move_types = {}
         self._opponent_move_names = {}
-        self._llm_call_count      = 0
         self._python_call_count   = 0
         self._rust_call_count     = 0
         self._verbose             = verbose
         self._current_battle_tag  = None
-        self._llm_timeout         = live_timeout
         self._total_games         = total_games
         self._games_finished      = 0
         self._wins                = 0
         self._battle_start_py     = 0
-        self._battle_start_llm    = 0
         self._battle_start_rust   = 0
         self._sleep_clause_active = False
         self._last_rust_count     = 0
-        self._last_llm_count      = 0
         # Sleep turn tracking: species.lower() → turns_asleep (increments each turn)
         # Used to give Rust an accurate sleep duration estimate.
         self._sleep_turns: dict        = {}
@@ -408,75 +234,35 @@ class CompetitivePlayer(Player):
     def _emit_compact(self, turn, my_poke, my_hp, opp_poke, opp_hp, action, source):
         self._unsuppress()
         if not self._verbose:
-            indicator = "⚙️" if source == "rust" else ("🤖" if source == "llm" else "⚡")
+            indicator = "⚙️" if source == "rust" else "⚡"
             print(f"  {indicator} T{turn:02d} {my_poke}({my_hp}%) vs {opp_poke}({opp_hp}%) → {action} [{source}]")
 
     # -------------------------------------------------------------------------
-    # Team preview — Rust picks the lead, LLM fallback
+    # Team preview — matchup-based lead selection
     # -------------------------------------------------------------------------
 
     async def teampreview(self, battle):
         my_team  = list(battle.team.values())
         opp_team = list(battle.opponent_team.values())
 
-        def team_summary(pokemon_list):
-            return '\n'.join(
-                f"  {p.species} ({'/'.join(get_pokemon_types(p))})"
-                for p in pokemon_list
-            )
-
-        valid_leads = [p.species.lower() for p in my_team]
-
         print(f"\n{'='*60}")
         print(f"TEAM PREVIEW")
         print(f"  My team:  {', '.join(p.species for p in my_team)}")
         print(f"  Opp team: {', '.join(p.species for p in opp_team)}")
 
-        prompt = f"""You are a Gen 1 competitive Pokemon player choosing your lead for team preview.
+        # Score each of our mons as a lead against the full opponent team.
+        best_lead  = my_team[0]
+        best_score = -9999
+        for candidate in my_team:
+            score = sum(evaluate_matchup(candidate, opp) for opp in opp_team)
+            if score > best_score:
+                best_score = score
+                best_lead  = candidate
 
-MY TEAM:
-{team_summary(my_team)}
-
-OPPONENT'S TEAM:
-{team_summary(opp_team)}
-
-GEN 1 TEAM PREVIEW STRATEGY:
-- Pick a lead with a good type matchup against the opponent's likely lead
-- Gengar and Alakazam are common fast leads
-- Chansey leads absorb hits and set up Thunder Wave early
-- A fast Pokemon with Thunder Wave can cripple the opponent's lead immediately
-
-Your available leads (use exact species name):
-{', '.join(valid_leads)}
-
-Think through the matchups, then end with exactly:
-LEAD: <species>"""
-
-        try:
-            raw, err = await call_llm_async(prompt, timeout=self._llm_timeout)
-            if err:
-                print(f"  LLM error: {err}")
-            elif raw:
-                print(f"\n  💭 LLM LEAD REASONING:")
-                for line in strip_think_tags(raw).split('\n'):
-                    print(f"     {line}")
-                chosen_species = parse_lead_choice(raw, valid_leads)
-                if chosen_species:
-                    chosen = next(
-                        (p for p in my_team
-                         if re.sub(r'[^a-z0-9]', '', p.species.lower()) == chosen_species),
-                        None
-                    )
-                    if chosen:
-                        order     = [chosen] + [p for p in my_team if p != chosen]
-                        order_str = '/team ' + ''.join(str(my_team.index(p) + 1) for p in order)
-                        print(f"\n  ✅ LLM LEAD: {chosen.species}")
-                        return order_str
-        except Exception as e:
-            print(f"  LLM error during teampreview: {e}")
-
-        print(f"  🔄 FALLBACK: defaulting to slot 1 ({my_team[0].species})")
-        return self.random_teampreview(battle)
+        order     = [best_lead] + [p for p in my_team if p != best_lead]
+        order_str = '/team ' + ''.join(str(my_team.index(p) + 1) for p in order)
+        print(f"  ✅ LEAD: {best_lead.species} (score={best_score:.0f})")
+        return order_str
 
     # -------------------------------------------------------------------------
     # Opponent move tracking
@@ -550,10 +336,7 @@ LEAD: <species>"""
 
             if self._rust_call_count > self._last_rust_count:
                 source = "rust"
-            elif self._llm_call_count > self._last_llm_count:
-                source = "llm"
             self._last_rust_count = self._rust_call_count
-            self._last_llm_count  = self._llm_call_count
 
             self._emit_compact(battle.turn, my.species, my_hp,
                                opp.species, opp_hp, action_str, source)
@@ -604,7 +387,6 @@ LEAD: <species>"""
         # ── Battle-start snapshot ─────────────────────────────────────────
         if battle.turn == 1:
             self._battle_start_py   = self._python_call_count
-            self._battle_start_llm  = self._llm_call_count
             self._battle_start_rust = self._rust_call_count
             self._sleep_clause_active  = False
             self._sleep_turns          = {}
@@ -740,35 +522,9 @@ LEAD: <species>"""
                 self._time_manager.end_turn()
                 return rust_order
 
-            # LLM fallback
-            reason = (f"my Pokemon fainted — picking send-in vs "
-                      f"{opp_poke.species} ({'/'.join(opp_types)})")
-            print(f"  🤖 LLM FALLBACK (faint switch)")
-            prompt, _, _ = build_battle_prompt(
-                battle, [], switches, self._opponent_move_types, reason
-            )
-            raw, err = await call_llm_async(prompt, timeout=self._llm_timeout)
-            if not err and raw:
-                print(f"\n  💭 LLM REASONING:")
-                for line in strip_think_tags(raw).split('\n'):
-                    print(f"     {line}")
-                _, action_id = parse_battle_decision(
-                    raw,
-                    set(),
-                    {p.species.lower() for p in switches}
-                )
-                if action_id:
-                    norm   = lambda s: re.sub(r'[^a-z0-9]', '', s.lower())
-                    chosen = next(
-                        (p for p in switches if norm(p.species) == norm(action_id)), None
-                    )
-                    if chosen:
-                        print(f"  ✅ LLM FAINT SWITCH: {chosen.species}")
-                        self._llm_call_count += 1
-                        return self.create_order(chosen)
-
+            # Python fallback
             best = find_best_switch(battle)
-            print(f"  🔀 PYTHON FALLBACK: {best.species}")
+            print(f"  🔀 PYTHON FAINT SWITCH FALLBACK: {best.species}")
             self._python_call_count += 1
             return self.create_order(best)
 
@@ -1156,7 +912,7 @@ LEAD: <species>"""
         # Setting iterations = budget_ms * 4 means the time limit and iteration
         # cap both fire at approximately the same point — no idle time wasted.
         # Floor of 3000 preserves minimum quality on very short budgets.
-        NODES_PER_SEC = 4000
+        NODES_PER_SEC = 57000
         iters = max(3000, int(time_budget_ms * NODES_PER_SEC / 1000))
 
         rust_result = self._try_rust_engine(
@@ -1168,7 +924,7 @@ LEAD: <species>"""
         self._time_manager.end_turn()
 
         if rust_result is None:
-            return self._llm_fallback(battle, real_moves, switches)
+            return self._hard_fallback(battle, real_moves, switches)
 
         # Post-process: veto Hyperbeam when position is deeply losing
         # BUT: never veto a guaranteed KO — if they die, there's no recharge turn.
@@ -1236,15 +992,15 @@ LEAD: <species>"""
 
         return rust_result
 
-    def _llm_fallback(self, battle, real_moves, switches):
-        """LLM fallback when Rust engine is unavailable or errored."""
+    def _hard_fallback(self, battle, real_moves, switches):
+        """Hard Python fallback when Rust engine is unavailable or errored."""
         my_poke  = battle.active_pokemon
         opp_poke = battle.opponent_active_pokemon
         my_types  = get_pokemon_types(my_poke)
         opp_types = get_pokemon_types(opp_poke)
 
-        reason_str = "rust engine unavailable — LLM fallback"
-        print(f"\n  🤖 LLM FALLBACK: {reason_str}")
+        reason_str = "rust engine unavailable — python fallback"
+        print(f"\n  🔄 HARD FALLBACK: {reason_str}")
 
         best_move, _ = best_move_effectiveness(
             real_moves, opp_types, attacker_types=my_types
@@ -1252,8 +1008,6 @@ LEAD: <species>"""
         opp_known_names = self._opponent_move_names.get(opp_poke.species.lower(), [])
         print(f"     Opponent known moves: {opp_known_names or 'none'}")
 
-        # Hard fallback — LLM is async but we're in a sync context here.
-        # Return best move immediately to avoid blocking.
         if best_move:
             print(f"  🔄 HARD FALLBACK: {best_move.id}")
             self._python_call_count += 1
@@ -1328,8 +1082,8 @@ LEAD: <species>"""
             print(f"  ⚠️  Rust engine exception: {e}")
             return None
 
-    def _llm_fallback(self, battle, real_moves, switches):
-        """Hard fallback when Rust engine is unavailable or errored."""
+    def _hard_fallback_dupe(self, battle, real_moves, switches):
+        """Duplicate — kept for reference only."""
         my_poke  = battle.active_pokemon
         opp_poke = battle.opponent_active_pokemon
         my_types  = get_pokemon_types(my_poke)
@@ -1405,17 +1159,14 @@ LEAD: <species>"""
 
         game_py   = self._python_call_count - self._battle_start_py
         game_rust = self._rust_call_count   - self._battle_start_rust
-        game_llm  = self._llm_call_count    - self._battle_start_llm
-        game_total = game_py + game_rust + game_llm
+        game_total = game_py + game_rust
 
         print(f"\n{'='*60}")
         print(f"BATTLE OVER — {result} in {battle.turn} turns")
         print(f"  Python decisions: {game_py}")
         print(f"  Rust decisions:   {game_rust}")
-        print(f"  LLM decisions:    {game_llm}")
         if game_total > 0:
             print(f"  Rust involvement: {int(game_rust / game_total * 100)}% of turns")
-            print(f"  LLM involvement:  {int(game_llm  / game_total * 100)}% of turns")
         print(f"{'='*60}")
 
         super()._battle_finished_callback(battle)
@@ -1430,13 +1181,11 @@ LEAD: <species>"""
             print(f"📈 Record: {self._wins}W / {losses}L "
                   f"({self._games_finished} games)")
 
-        cum_total = self._python_call_count + self._rust_call_count + self._llm_call_count
+        cum_total = self._python_call_count + self._rust_call_count
         if cum_total > 0:
             print(f"  Python decisions: {self._python_call_count}")
             print(f"  Rust decisions:   {self._rust_call_count}")
-            print(f"  LLM decisions:    {self._llm_call_count}")
             print(f"  Rust involvement: {int(self._rust_call_count / cum_total * 100)}% cumulative")
-            print(f"  LLM involvement:  {int(self._llm_call_count  / cum_total * 100)}% cumulative")
         print(f"{'='*60}\n")
 
 
@@ -1546,7 +1295,6 @@ async def run_competitive_local(team, n_battles=1):
     print(f"\n📊 Final: {wins}/{n_battles} wins")
     print(f"   Python decisions: {player._python_call_count}")
     print(f"   Rust decisions:   {player._rust_call_count}")
-    print(f"   LLM decisions:    {player._llm_call_count}")
 
     player._rust_engine.close()
 
@@ -1556,10 +1304,6 @@ if __name__ == "__main__":
     parser.add_argument("--format",  default="ou")
     parser.add_argument("--battles", type=int, default=1)
     args = parser.parse_args()
-
-    if not ensure_ollama_running():
-        print("Please start Ollama: ollama serve")
-        exit(1)
 
     import os as _os
     _os.makedirs("live_logs", exist_ok=True)

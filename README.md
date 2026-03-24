@@ -1,10 +1,10 @@
-# Pokemon Showdown Bot — CDMG_217
+# Pokemon Showdown Bot — JofarLLM
 
-A competitive Gen 1 OU battle bot powered by a hybrid Python/LLM decision engine. Connects to the live Pokemon Showdown ladder and plays ranked games against real humans.
+A competitive Gen 1 OU battle bot powered by a hybrid Python/Rust decision engine. Connects to the live Pokemon Showdown ladder and plays ranked games against real humans.
 
 ## What does this project do?
 
-The bot connects to Pokemon Showdown and plays Gen 1 OU battles autonomously. A Python fast-path handles the majority of decisions — damage calculations, type matchups, speed checks, KO detection, switching logic — and hands off only genuinely ambiguous situations to a local LLM (via Ollama). It runs unattended and reconnects automatically on network drops.
+The bot connects to Pokemon Showdown and plays Gen 1 OU battles autonomously. A Python fast-path handles mechanical certainties — damage calculations, KO detection, status move gating, healing logic — and hands everything strategic to a Rust search engine (MCTS + minimax). It runs unattended and reconnects automatically on network drops.
 
 You provide a team file. The bot plays it.
 
@@ -12,7 +12,7 @@ You provide a team file. The bot plays it.
 
 ## Quick Start
 
-See [INSTALL.md](INSTALL.md) for full setup (Python, Ollama, credentials).
+See [INSTALL.md](INSTALL.md) for full setup.
 
 ```bash
 # Play 20 ranked ladder games
@@ -21,29 +21,25 @@ python3 main.py --ladder 20
 # Wait for challenges (recommended for new accounts)
 python3 main.py --accept
 
-# Or use the interactive menu
+# Interactive menu
 python3 main.py
 ```
 
 ### Live Play Modes
 
 ```bash
-python3 main.py --accept                     # Wait for challenge (you challenge from browser)
+python3 main.py --accept                     # Wait for challenge from your browser
 python3 main.py --opponent <username>         # Send challenge to a specific user
 python3 main.py --ladder N                    # Play N ranked ladder games
 python3 main.py --battles N                   # N battles for accept/opponent modes
 python3 main.py --format gen1ou              # Format (default: gen1ou)
 ```
 
-You can also use `live_challenge.py` directly with the same flags.
-
 ---
 
 ## Team Files
 
 Place your team in `teams/` with the naming convention `team_ou_iteration_N.txt`. The bot uses the highest-numbered iteration.
-
-Format: one Pokemon per block, moves prefixed with `- `, blocks separated by blank lines.
 
 ```
 Tauros
@@ -61,43 +57,38 @@ Snorlax
 
 ---
 
-## Configuration
-
-All settings in `config.py`, overridable with env vars:
-
-| Setting | Default | Env Var | Description |
-|---------|---------|---------|-------------|
-| `LLM_MODEL` | `deepseek-r1:14b` | `LLM_MODEL` | Ollama model for battle decisions |
-| `LLM_CONTEXT_LENGTH` | `2048` | `LLM_CONTEXT` | Context window (128K default wastes VRAM) |
-| `LLM_LIVE_TIMEOUT_SECONDS` | `25` | `LLM_LIVE_TIMEOUT` | Max seconds to wait for LLM response |
-| `LLM_TIMEOUT_SECONDS` | `30` | `LLM_TIMEOUT` | Timeout for local testing |
-
-```bash
-# Example: use 7b model with 12-second timeout
-LLM_MODEL=deepseek-r1:7b LLM_LIVE_TIMEOUT=12 python3 main.py --ladder 50
-```
-
----
-
 ## Project Structure
 
 ```
 pokemon-showdown-bot/
-├── main.py                # Entry point — battle menu, preflight, logging
-├── live_challenge.py      # Live Showdown connection (accept/challenge/ladder)
-├── competitive_player.py  # Hybrid Python/LLM decision engine
-    ├── llm_bridge.py      # All LLM interaction — async, thread-safe, system prompt
-    ├── gen1_engine.py     # Gen 1 math and calculations
-        ├── gen1_data.py   # Gen 1 Data Values, Base Stats, Typing and full Moves.
-├── config.py              # Central config — model, timeouts, server URLs
-├── credentials.py         # Bot's Showdown login (gitignored)
-├── teams/                 # Team files (gitignored)
-├── live_logs/             # Battle logs (gitignored)
-└── archive/               # Retired modules (team builder, local test runner)
-    ├── team_generator.py  # LLM-driven team builder with battle feedback loop
-    ├── battle_runner.py   # Local stress tester (StatTrackingPlayer vs RandomPlayer)
-    └── gen1_data.py       # Pokemon/move data from pokered ASM + Showdown tiers
-    └── gen1_calc.py       # Damage calculator, speed table, matchup evaluator
+├── main.py                  # Entry point — battle menu, preflight, logging
+├── live_challenge.py        # Live Showdown connection (accept/challenge/ladder)
+├── competitive_player.py    # Hybrid Python/Rust decision engine
+├── rust_engine_bridge.py    # Python ↔ Rust bridge (state serialisation, result parsing)
+├── gen1_engine.py           # Gen 1 damage calc, type chart, matchup scoring
+├── gen1_data.py             # Base stats, move data, type definitions
+├── gen1_engine_rs/          # Rust search engine (MCTS + minimax)
+│   └── src/
+│       ├── main.rs          # Engine entry point
+│       ├── sim.rs           # Battle simulator
+│       ├── calc.rs          # Damage calculation (integer arithmetic)
+│       ├── state.rs         # BattlePoke, BattleState (pre-computed inline stats)
+│       ├── data.rs          # BATTLE_STATS_TABLE, MOVE_DATA_BY_ID (OnceLock)
+│       ├── eval.rs          # Position evaluation
+│       ├── mcts.rs          # Monte Carlo Tree Search
+│       ├── minimax.rs       # Minimax with alpha-beta
+│       └── inference.rs     # Opponent team inference
+├── config.py                # Server config, format, log level
+├── credentials.py           # Bot's Showdown login (gitignored)
+├── teams/                   # Team files (gitignored)
+├── live_logs/               # Battle logs (gitignored)
+└── archive/                 # Retired modules
+    ├── llm_bridge.py        # Archived LLM integration (Ollama/deepseek-r1)
+    ├── team_generator.py    # LLM-driven team builder
+    ├── battle_runner.py     # Local stress tester
+    ├── gen1_data.py         # Original data module
+    ├── gen1_calc.py         # Original damage calculator
+    └── test_battle.py       # Original test suite
 ```
 
 ---
@@ -105,50 +96,63 @@ pokemon-showdown-bot/
 ## Decision Tree (competitive_player.py)
 
 ```
-PRE-FILTER     → Remove immune moves (0x), T-Wave if opponent has status,
-                 Dream Eater if opponent not asleep
-RECHARGE       → Forced (locked after Hyper Beam)
-STEP 1         → No moves + no switches → default
-STEP 2         → Fainted / no real moves → LLM picks switch-in
-STEP 3         → Compute best_move (STAB-aware, Hyper Beam penalised,
-                 Seismic Toss/Night Shade scored at 100 effective BP)
-STEP 4         → Immune to all opponent known moves → attack freely
-STEP 5         → Danger switch (confirmed 2x threat + low HP)
-STEP 5b        → Matchup switch (teammate scores 40+ points better)
-                 Only fires once per opponent switch-in
-STEP 6         → Dominant 2x+ advantage (bp ≥ 60) → attack
-STEP 6b        → KO check (damage calc confirms kill) → finish them
-                 Accounts for stat stages, Reflect, Light Screen
-STEP 6c        → Thunder Wave (opponent faster + no status) → paralyse
-STEP 7a        → Recover / Soft-Boiled at <55% HP → heal
-STEP 7b        → Rest at <40% HP (last resort, causes sleep)
-STEP 7c        → Dream Eater if opponent asleep
-STEP 8         → AMBIGUOUS → LLM called (25s timeout, Python fallback)
+STEP 1  RECHARGE       → Forced lock after Hyper Beam
+STEP 2  FORCED         → No moves + no switches → default
+STEP 3  FAINT SWITCH   → Rust picks send-in (Python fallback if Rust errors)
+STEP 4  ASLEEP         → Switch out cleanly, or queue best move
+STEP 5  GUARANTEED KO  → Python math confirms kill on min roll → finish them
+                         (skipped if opponent is faster + has a heal move)
+STEP 6  IMMUNE         → All revealed opponent moves do 0x → stay and attack
+STEP 7  SLEEP MOVE     → Opponent unstatused, sleep move available → use it
+STEP 7b HEAL FILTER    → Toxic: heal immediately (unless futile)
+                         Low HP + danger threshold: heal with Softboiled/Recover
+                         High HP / heal spam / winning position: suppress heals
+STEP 7e TWAVE RECOVER  → Opponent has Recover + we can't 2HKO → Thunder Wave
+STEP 8  RUST ENGINE    → All other decisions: switch timing, Hyperbeam risk,
+                         damage races, stall breaks, matchup evaluation
+STEP 9  HARD FALLBACK  → Best type-effective move if Rust errors
 ```
 
 ### Anti-Loop Protection
-- Sleep switch: won't switch out if only switch target is <30% HP
-- Danger switch: won't switch to asleep or <25% HP target when only 1 option
-- Both prevent the "ping-pong between last 2 Pokemon" death spiral
+- Sleep switch: won't switch out if only target is <30% HP or also asleep
+- Switch cooldown: won't immediately switch out a mon that just switched in (unless losing badly)
+- Heal spam: won't fire heal on the same mon twice within 2 turns at high HP
+- Toxic futility: stops healing when Toxic drain rate exceeds recovery rate
 
 ---
 
-## Damage Calculator (gen1_calc.py)
+## Rust Engine (gen1_engine_rs)
 
-All stats pre-computed for L100, max DVs (15), max Stat EXP. Gen 1 has no variation — every matchup is deterministic except the 217-255 random factor.
+The Rust engine runs as a subprocess, communicates via stdin/stdout JSON, and handles all strategic decisions not covered by Python fast-paths.
 
-### Features
+### Engine v5 (current) — 57,000 nodes/sec
+- `BattlePoke` stores pre-computed stats inline (zero table lookups in hot path)
+- Integer HP replacing f32 hp_frac
+- `MOVE_DATA_BY_ID` OnceLock replaces linear scan
+- All `apply_turn` arithmetic is integer
+- **14× throughput improvement** over v1 (4k → 57k nodes/sec)
+
+### Search
+- `auto` mode: minimax for endgame (≤4 total Pokémon alive), MCTS otherwise
+- Time budget allocated per turn by `TimeManager` based on position complexity
+- Depth-6 minimax for endgame; MCTS with 100k iteration ceiling for midgame
+- 210s total bank per game, 20% per-turn spending cap
+
+---
+
+## Damage Calculator (gen1_engine.py)
+
+All stats pre-computed for L100, max DVs (15), max Stat EXP. Gen 1 has no variation except the 217–255 random factor.
+
+### Implemented
 - [x] Full Gen 1 damage formula
-- [x] STAB calculation
-- [x] Type effectiveness (uses gen1_engine type chart)
-- [x] Stat stage modifiers (-6 to +6, Gen 1 approximation formula)
-- [x] Reflect (doubles physical defense)
-- [x] Light Screen (doubles special defense)
-- [x] Explosion/Self-Destruct (halves target defense)
+- [x] STAB, type effectiveness (Gen 1 chart including Ghost/Psychic bug)
+- [x] Stat stage modifiers (−6 to +6)
+- [x] Reflect / Light Screen
+- [x] Explosion/Self-Destruct (halves target defence)
 - [x] Critical hits (ignore stat stages and screens)
 - [x] Speed table with paralysis (quarters speed)
-- [x] KO check: guaranteed vs likely (min roll vs average)
-- [x] 2HKO check
+- [x] Guaranteed KO / likely KO / 2HKO checks
 - [x] Matchup evaluator (offensive pressure + defensive typing + speed + HP + status)
 
 ### Not Yet Implemented
@@ -156,81 +160,43 @@ All stats pre-computed for L100, max DVs (15), max Stat EXP. Gen 1 has no variat
 - [ ] Burn damage (1/16 per turn)
 - [ ] Leech Seed drain
 - [ ] Substitute HP tracking
-- [ ] Freeze chance from Ice moves (10% in Gen 1)
-
----
-
-## LLM Integration (llm_bridge.py)
-
-### Architecture
-- System prompt suppresses `<think>` tags → direct DECISION output
-- `num_ctx: 2048` passed at runtime (overrides model's 128K default)
-- `call_llm_async()` yields control to event loop during inference
-- Thread pool executor with 2 workers
-- Python fallback fires immediately on timeout or hallucinated move
-
-### LLM Trigger Conditions (Step 8)
-- Best move is resisted + no dominant alternative
-- Neutral matchup with unknown opponent moveset
-- Sleep move available + opponent unstatused
-- Hyper Beam is best move (recharge cost needs weighing)
-- Counter available (prediction move)
-- Explosion/Self-Destruct consideration
-
-### LLM-Only Moves (never auto-picked by Python)
-- Explosion / Self-Destruct
-- Counter
-
----
-
-## Infrastructure (live_challenge.py)
-
-- [x] Auto-reconnection on websocket drops (5 retries, 10s backoff)
-- [x] Battle progress counter (per-game + cumulative stats)
-- [x] Battle timer auto-start (disconnect protection)
-- [x] Ping tolerance 30s (accommodates LLM response time)
-- [x] Log filter: suppresses Wrap/Bind warnings, forfeit race conditions
-- [x] Compact console output (one line per turn, full detail in log)
+- [ ] Freeze chance from Ice moves
 
 ---
 
 ## Gen 1 Quirks Implemented
 
-- `Ghost → Psychic = 0x` (RBY programming bug)
-- `Psychic → Ghost = 1x` (not immune in Gen 1)
-- `Ice → Fire = 1x` (neutral, not resisted as in Gen 2+)
-- `Bug ↔ Poison = 2x` both ways (changed in Gen 2)
+- `Ghost → Psychic = 0×` (RBY programming bug)
+- `Psychic → Ghost = 1×` (not immune in Gen 1)
+- `Ice → Fire = 1×` (neutral, not resisted as in Gen 2+)
+- `Bug ↔ Poison = 2×` both ways (changed in Gen 2)
 - No Dark / Steel / Fairy types
-- Special is one stat (offense + defense)
+- Special is one stat (offence + defence)
 - Seismic Toss / Night Shade = fixed 100 damage at L100
 - Critical hits ignore stat stages and screens
 - Paralysis quarters speed (not halves)
-- Stat stages cap at 999
 
 ---
 
 ## What you'll see
 
 ```
-⚡ T01 tauros(100%) vs starmie(100%) → bodyslam [py]
-🎯 PYTHON GUARANTEED KO: surf finishes rhydon at 28%
-🔄 PYTHON MATCHUP SWITCH: snorlax is a better matchup vs chansey (+96 points)
-🤖 T08 alakazam(72%) vs exeggutor(50%) → seismictoss [llm]
+==============================
+Turn 8 | My: alakazam (72% HP) vs exeggutor (50% HP)
+  My types: ['psychic'] | Opp types: ['grass', 'psychic']
+  Moves: ['seismictoss', 'psychic', 'thunderwave', 'recover']
+  ⏱  Time budget: 4200ms (bank=187.3s)
+  ✅ RUST [minimax]: seismictoss (score=1840, nodes=28441) | guaranteed damage
+  ⚙️ T08 alakazam(72%) vs exeggutor(50%) → seismictoss [rust]
 
 ============================================================
-BATTLE OVER — WON ✓ in 25 turns
-  Python decisions: 18
-  LLM decisions:    7
-  LLM involvement:  28% of turns
+BATTLE OVER — WON ✓ in 31 turns
+  Python decisions: 14
+  Rust decisions:   17
+  Rust involvement: 54% of turns
 ============================================================
-📈 Progress: 14/50 (8W / 6L)
-  Python decisions: 312
-  LLM decisions:    89
-  LLM involvement:  22% of turns
-============================================================
+📈 Progress: 8/20 (5W / 3L)
 ```
-
-`⚡` = Python fast-path, `🤖` = LLM decision, `🎯` = damage calc KO, `🔄` = matchup switch.
 
 Full verbose reasoning is saved to `live_logs/live_log_NNN.txt`.
 
@@ -240,12 +206,12 @@ Full verbose reasoning is saved to `live_logs/live_log_NNN.txt`.
 
 ### Completed
 - [x] Live Showdown connection (accept / challenge / ladder)
-- [x] Thread-safe async LLM calls
+- [x] Rust engine v5 — 57k nodes/sec (14× improvement)
 - [x] Pre-computed damage calculator with stat stages
 - [x] Matchup-based switching
 - [x] KO check before healing
-- [x] Thunder Wave fast-path
-- [x] Recover / Soft-Boiled healing logic
+- [x] Thunder Wave fast-path + Recover-stall detection
+- [x] Recover / Soft-Boiled healing logic with spam prevention
 - [x] Sleep → switch out (with anti-loop)
 - [x] Seismic Toss / Night Shade scored correctly
 - [x] Reflect / Light Screen detection
@@ -253,7 +219,10 @@ Full verbose reasoning is saved to `live_logs/live_log_NNN.txt`.
 - [x] Type immunity pre-filtering
 - [x] Battle progress counter (per-game + cumulative)
 - [x] Auto-reconnection handler
-- [x] System prompt to suppress thinking tokens
-- [x] Runtime context length control (num_ctx)
-- [x] Compact console output
-- [x] 14b model with optimised VRAM usage
+- [x] Dynamic time bank allocation (TimeManager)
+- [x] Compact console output + full verbose log
+
+### Next
+- [ ] Gen 2 port (Special split, Steel/Dark types, held items)
+- [ ] Self-play distillation — logistic regression over position features
+- [ ] Post-game LLM pattern analysis over structured logs

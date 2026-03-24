@@ -116,6 +116,7 @@ impl BattlePoke {
         self.move_ids().contains(&id)
     }
 
+    #[allow(dead_code)]
     pub fn species_str(&self) -> &'static str {
         id_to_species(self.species)
     }
@@ -195,6 +196,7 @@ impl Action {
         if let Action::Move { id } = self { Some(*id) } else { None }
     }
     /// String name of the move (for sim/calc lookups that still use &str).
+    #[allow(dead_code)]
     pub fn move_str(&self) -> Option<&'static str> {
         self.move_id_u16().map(id_to_move)
     }
@@ -321,7 +323,7 @@ impl From<JsonBattlePoke> for BattlePoke {
 
         // Convert hp_frac from poke-env to integer HP
         let hp = ((j.hp_frac.clamp(0.0, 1.0) * max_hp as f32).round() as u16).min(max_hp);
-        let sub_hp = ((j.sub_hp_frac.clamp(0.0, 1.0) * max_hp as f32).round() as u16);
+        let sub_hp = (j.sub_hp_frac.clamp(0.0, 1.0) * max_hp as f32).round() as u16;
 
         BattlePoke {
             species:        species_id,

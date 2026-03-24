@@ -103,22 +103,11 @@ pub fn get_pokemon(name: &str) -> Option<PokeStats> {
 /// O(1) lookup by species ID — use this everywhere inside the search.
 /// species_id is the same u16 used in BattlePoke.species (from ids.rs).
 /// Returns None only for SPECIES_UNKNOWN (0).
+#[allow(dead_code)]
 pub fn get_pokemon_by_id(species_id: u16) -> Option<&'static PokeStats> {
     if species_id == 0 { return None; }
     let idx = (species_id - 1) as usize;
     POKEMON_TABLE_BY_ID.get(idx).map(|(_, ps)| ps)
-}
-
-/// Gen 1 stat formula at L100, DV=15, max StatExp.
-/// stat_exp_bonus = floor(min(255, ceil(sqrt(65535))) / 4) = floor(255/4) = 63
-pub fn calc_stat(base: u16) -> u16 {
-    // floor(((base + 15) * 2 + 63) * 100 / 100) + 5
-    ((base + 15) * 2 + 63 + 5)
-}
-
-pub fn calc_stat_hp(base: u16) -> u16 {
-    // floor(((base + 15) * 2 + 63) * 100 / 100) + 100 + 10
-    ((base + 15) * 2 + 63 + 110)
 }
 
 /// Pre-computed battle stats at L100/DV15/maxStatExp — stored per species by ID.
@@ -352,7 +341,7 @@ pub struct MoveData {
 }
 
 pub fn get_move(id: &str) -> Option<&'static MoveData> {
-    let key = normalise(id);
+    let key = id.trim();
     MOVE_TABLE.iter().find(|(k, _)| *k == key).map(|(_, v)| v)
 }
 

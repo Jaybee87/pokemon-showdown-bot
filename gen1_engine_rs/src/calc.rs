@@ -43,7 +43,7 @@ fn get_move_by_id(id: u16) -> Option<&'static MoveData> {
                 let mid = crate::ids::move_to_id(name);
                 if mid >= crate::ids::MOVE_ID_OFFSET {
                     let idx = (mid - crate::ids::MOVE_ID_OFFSET) as usize;
-                    if idx < n { v[idx] = Some(md); }
+                    if idx < n { v[idx] = Some(md.clone()); }
                 }
             }
         }
@@ -201,12 +201,15 @@ pub fn guaranteed_ko(attacker: &BattlePoke, move_id_u16: u16, defender: &BattleP
 
 // ─── String-based wrappers (Python bridge only, not in search hot path) ────────
 
+#[allow(dead_code)]
 pub fn can_ko_str(attacker: &BattlePoke, move_id: &str, defender: &BattlePoke) -> bool {
     can_ko(attacker, crate::ids::move_to_id(move_id), defender)
 }
+#[allow(dead_code)]
 pub fn guaranteed_ko_str(attacker: &BattlePoke, move_id: &str, defender: &BattlePoke) -> bool {
     guaranteed_ko(attacker, crate::ids::move_to_id(move_id), defender)
 }
+#[allow(dead_code)]
 pub fn avg_damage_pct_str(attacker: &BattlePoke, move_id: &str, defender: &BattlePoke, reflect: bool, light_screen: bool) -> f64 {
     avg_damage_pct(attacker, crate::ids::move_to_id(move_id), defender, reflect, light_screen)
 }

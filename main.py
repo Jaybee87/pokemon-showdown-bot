@@ -18,24 +18,12 @@ import re
 import glob
 import sys
 
-from config import LLM_MODEL, LLM_CONTEXT_LENGTH, LLM_LIVE_TIMEOUT_SECONDS
+from config import POKE_ENV_LOG_LEVEL
 
 
 # =============================================================================
 # PREFLIGHT CHECKS
 # =============================================================================
-
-def check_ollama():
-    """Check if Ollama is running and the configured model is available."""
-    try:
-        from llm_bridge import ensure_ollama_running
-        return ensure_ollama_running()
-    except Exception:
-        print(f"  ❌ Ollama not running or model '{LLM_MODEL}' not found")
-        print(f"     Install: curl -fsSL https://ollama.com/install.sh | sh")
-        print(f"     Pull:    ollama pull {LLM_MODEL}")
-        return False
-
 
 def check_credentials():
     """Check if credentials.py exists for live play."""
@@ -73,13 +61,12 @@ def run_preflight():
     """Run preflight checks. Returns True if battle mode can proceed."""
     print(f"\n🔧 Preflight checks")
 
-    poke_env_ok = check_poke_env()
-    ollama_ok = check_ollama()
+    poke_env_ok    = check_poke_env()
     credentials_ok = check_credentials()
 
     print()
 
-    if not poke_env_ok or not ollama_ok:
+    if not poke_env_ok:
         print("❌ Missing dependencies for battling")
         return False
     if not credentials_ok:
@@ -150,15 +137,13 @@ async def run_battle(team_path, mode, n_battles, format_name, opponent=None):
 def show_menu(latest):
     """Show the main menu and return the user's choice."""
     print(f"\n{'='*60}")
-    print(f"Pokemon Showdown Bot")
-    print(f"   LLM:     {LLM_MODEL} (ctx: {LLM_CONTEXT_LENGTH})")
-    print(f"   Timeout: {LLM_LIVE_TIMEOUT_SECONDS}s")
+    print(f"Pokemon Showdown Bot — Gen 1 OU")
     if latest:
         _, pokemon = load_team(latest)
-        print(f"   Team:    {latest}")
-        print(f"            {' / '.join(pokemon[:6])}")
+        print(f"   Team: {latest}")
+        print(f"         {' / '.join(pokemon[:6])}")
     else:
-        print(f"   Team:    (none — place a team file in teams/)")
+        print(f"   Team: (none — place a team file in teams/)")
     print(f"{'='*60}")
     print()
     print(f"  1. Battle (ladder)  — play ranked games on Showdown")
@@ -171,9 +156,9 @@ def show_menu(latest):
         except (EOFError, KeyboardInterrupt):
             print()
             return None
-        if choice in ('1', '2', '3'):
+        if choice in ('1', '2'):
             return choice
-        print("  Enter 1, 2, or 3.")
+        print("  Enter 1 or 2.")
 
 
 def setup_logging():
@@ -200,49 +185,38 @@ if __name__ == "__main__":
         description="Pokemon Showdown Bot — battle on the live ladder",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--ladder", type=int, default=None, help="Number of ladder games")
-    parser.add_argument("--accept", action="store_true", help="Accept mode (wait for challenges)")
-    parser.add_argument("--opponent", default=None, help="Challenge a specific user")
-    parser.add_argument("--battles", type=int, default=10, help="Battles per session (default: 10)")
-    parser.add_argument("--format", default="gen1ou", help="Format (default: gen1ou)")
+    parser.add_argument("--ladder",   type=int,          default=None,    help="Number of ladder games")
+    parser.add_argument("--accept",   action="store_true",                help="Accept mode (wait for challenges)")
+    parser.add_argument("--opponent", default=None,                        help="Challenge a specific user")
+    parser.add_argument("--battles",  type=int,          default=10,      help="Battles per session (default: 10)")
+    parser.add_argument("--format",   default="gen1ou",                    help="Format (default: gen1ou)")
 
     args = parser.parse_args()
-    
-    # Run Pre-Flight Checks
+
     if not run_preflight():
         sys.exit(1)
 
     latest = find_latest_team()
     if not latest:
         print("❌ No team found. Place a team file in teams/")
-        print(f"\n  Place your team file in teams/ with the format:")
-        print(f"    teams/team_ou_iteration_N.txt")
-        print(f"\n  The bot uses the highest-numbered iteration.")
-        print(f"  Format: one Pokemon per block, moves prefixed with '- '")
+        print(f"\n  teams/team_ou_iteration_N.txt")
         print(f"\n  Example:")
         print(f"    Tauros")
         print(f"    - bodyslam")
         print(f"    - hyperbeam")
         print(f"    - earthquake")
         print(f"    - blizzard")
-        print(f"\n  Separate Pokemon with a blank line.")
         sys.exit(1)
 
-    # Did the user bypass args?
     if args.ladder or args.accept or args.opponent:
-        # Determine battle mode
         if args.ladder:
-            mode = 'ladder'
-            n = args.ladder
+            mode, n = 'ladder', args.ladder
         elif args.opponent:
-            mode = 'challenge'
-            n = args.battles
+            mode, n = 'challenge', args.battles
         else:
-            mode = 'accept'
-            n = args.battles
+            mode, n = 'accept', args.battles
 
         log_path, tee = setup_logging()
-
         try:
             asyncio.run(run_battle(latest, mode, n, args.format, args.opponent))
         except KeyboardInterrupt:
@@ -255,14 +229,12 @@ if __name__ == "__main__":
     # Interactive menu
     choice = show_menu(latest)
 
-    if choice == '1': # Ladder
+    if choice == '1':
         try:
             n = int(input("How many ladder games? [20]: ").strip() or "20")
         except (ValueError, EOFError, KeyboardInterrupt):
             n = 20
-
         log_path, tee = setup_logging()
-
         try:
             asyncio.run(run_battle(latest, 'ladder', n, args.format))
         except KeyboardInterrupt:
@@ -271,9 +243,8 @@ if __name__ == "__main__":
             tee.close()
             print(f"\nLog saved to: {log_path}")
 
-    elif choice == '2': # Wait for Challenge
+    elif choice == '2':
         log_path, tee = setup_logging()
-
         try:
             asyncio.run(run_battle(latest, 'accept', 1, args.format))
         except KeyboardInterrupt:
@@ -281,5 +252,3 @@ if __name__ == "__main__":
         finally:
             tee.close()
             print(f"\nLog saved to: {log_path}")
-
-        

@@ -13,8 +13,7 @@ For new bot accounts, use --accept mode:
   This bypasses the restriction entirely.
 
 Prerequisites:
-    1. Ollama running with your model loaded
-    2. credentials.py with bot account details:
+    1. credentials.py with bot account details:
          username = "YourBotUsername"    # lowercase 'username'
          password = "YourBotPassword"   # lowercase 'password'
     3. A team file (team_ou_iteration_N.txt)
@@ -32,11 +31,10 @@ import sys
 from poke_env import AccountConfiguration, ShowdownServerConfiguration
 from poke_env.player import Player
 
-from config import LLM_MODEL, POKE_ENV_LOG_LEVEL, LLM_LIVE_TIMEOUT_SECONDS
+from config import POKE_ENV_LOG_LEVEL
 from competitive_player import (
     CompetitivePlayer, load_latest_team, random_suffix, Tee,
 )
-from llm_bridge import ensure_ollama_running
 
 
 # =============================================================================
@@ -282,7 +280,6 @@ async def run_challenge(opponent_name, team, n_battles=1, format_name="gen1ou"):
     print(f"\n🌐 Connecting to live Showdown...")
     print(f"   Format:   {format_name}")
     print(f"   Opponent: {opponent_name}")
-    print(f"   LLM:      {LLM_MODEL}")
 
     player = CompetitivePlayer(
         battle_format=format_name,
@@ -293,7 +290,6 @@ async def run_challenge(opponent_name, team, n_battles=1, format_name="gen1ou"):
         start_listening=True,
         start_timer_on_battle_start=True,
         verbose=False,
-        live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
         ping_interval=30.0,
         ping_timeout=30.0,
     )
@@ -318,13 +314,10 @@ async def run_challenge(opponent_name, team, n_battles=1, format_name="gen1ou"):
         return
 
     wins = sum(1 for b in player.battles.values() if b.won)
-    total_decisions = (player._python_call_count
-                       + player._rust_call_count
-                       + player._llm_call_count)
+    total_decisions = player._python_call_count + player._rust_call_count
     print(f"\n📊 Final: {wins}/{n_battles} wins vs {opponent_name}")
     print(f"   Python decisions: {player._python_call_count}")
     print(f"   Rust decisions:   {player._rust_call_count}")
-    print(f"   LLM decisions:    {player._llm_call_count}")
     if total_decisions > 0:
         print(f"   Rust involvement: {int(player._rust_call_count / total_decisions * 100)}%")
 
@@ -344,7 +337,6 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
     total_wins = 0
     total_py = 0
     total_rust = 0
-    total_llm = 0
     max_retries = 5
 
     retry_count = 0
@@ -354,7 +346,6 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
         print(f"\n🌐 Connecting to live Showdown...")
         print(f"   Format: {format_name}")
         print(f"   Mode:   accepting challenges ({remaining} remaining)")
-        print(f"   LLM:    {LLM_MODEL}")
 
         try:
             player = CompetitivePlayer(
@@ -366,7 +357,6 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
                 start_listening=True,
                 start_timer_on_battle_start=True,
                 verbose=False,
-                live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
                 total_games=n_battles,
                 ping_interval=30.0,
                 ping_timeout=30.0,
@@ -392,7 +382,6 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
                     total_wins += 1
             total_py   += player._python_call_count
             total_rust += player._rust_call_count
-            total_llm  += player._llm_call_count
             retry_count = 0  # reset on success
 
         except (ConnectionError, OSError, Exception) as e:
@@ -411,7 +400,6 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
                             total_wins += 1
                 total_py   += player._python_call_count
                 total_rust += player._rust_call_count
-                total_llm  += player._llm_call_count
 
             if is_disconnect:
                 retry_count += 1
@@ -426,10 +414,9 @@ async def run_accept(team, n_battles=1, format_name="gen1ou"):
 
     print(f"\n📊 Final: {total_wins}W / {games_completed - total_wins}L "
           f"across {games_completed} games")
-    total_decisions = total_py + total_rust + total_llm
+    total_decisions = total_py + total_rust
     print(f"   Python decisions: {total_py}")
     print(f"   Rust decisions:   {total_rust}")
-    print(f"   LLM decisions:    {total_llm}")
     if total_decisions > 0:
         print(f"   Rust involvement: {int(total_rust / total_decisions * 100)}%")
 
@@ -450,7 +437,6 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
     total_wins = 0
     total_py = 0
     total_rust = 0
-    total_llm = 0
     max_retries = 5
     last_rating = None
 
@@ -461,7 +447,6 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
         print(f"\n🌐 Connecting to live Showdown...")
         print(f"   Format: {format_name}")
         print(f"   Mode:   ladder ({remaining} games remaining of {n_games})")
-        print(f"   LLM:    {LLM_MODEL}")
 
         try:
             player = CompetitivePlayer(
@@ -473,7 +458,6 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
                 start_listening=True,
                 start_timer_on_battle_start=True,
                 verbose=False,
-                live_timeout=LLM_LIVE_TIMEOUT_SECONDS,
                 total_games=n_games,
                 ping_interval=30.0,
                 ping_timeout=30.0,
@@ -494,7 +478,6 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
                     last_rating = b.rating
             total_py   += player._python_call_count
             total_rust += player._rust_call_count
-            total_llm  += player._llm_call_count
             retry_count = 0  # reset on success
 
         except (ConnectionError, OSError, Exception) as e:
@@ -517,7 +500,6 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
                 games_completed += session_counted
                 total_py   += player._python_call_count
                 total_rust += player._rust_call_count
-                total_llm  += player._llm_call_count
 
             if is_disconnect:
                 retry_count += 1
@@ -532,10 +514,9 @@ async def run_ladder(team, n_games=5, format_name="gen1ou"):
 
     print(f"\n📊 Ladder results: {total_wins}W / {games_completed - total_wins}L "
           f"across {games_completed} games")
-    total_decisions = total_py + total_rust + total_llm
+    total_decisions = total_py + total_rust
     print(f"   Python decisions: {total_py}")
     print(f"   Rust decisions:   {total_rust}")
-    print(f"   LLM decisions:    {total_llm}")
     if total_decisions > 0:
         print(f"   Rust involvement: {int(total_rust / total_decisions * 100)}%")
     if last_rating:
@@ -600,9 +581,6 @@ Troubleshooting:
 
     # Preflight
     print("Preflight checks...\n")
-    if not ensure_ollama_running():
-        print("Please start Ollama: ollama serve")
-        exit(1)
 
     # Load and convert team
     team_raw = load_latest_team(args.team_format)

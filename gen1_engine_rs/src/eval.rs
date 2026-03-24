@@ -15,7 +15,6 @@
 ///   - Recharge penalty increased (280 → 350) — free turns are more costly than estimated
 
 use crate::state::*;
-use crate::calc::*;
 use crate::calc::{avg_damage_pct, can_ko, effective_stats};
 
 // ─── Terminal detection ───────────────────────────────────────────────────────
