@@ -510,42 +510,74 @@ class CompetitivePlayer(Player):
         if switches:
             print(f"  Switches: {[p.species for p in switches]}")
 
-        # ==================================================================
-        # STEP 1 — Recharge lock (no real choice)
-        # ==================================================================
+        # Shared status flags used across multiple steps
+        HEAL_MOVES   = ('softboiled', 'recover', 'rest')
+        my_is_par    = my_status_now and my_status_now.name == 'PAR'
+        my_is_tox    = my_status_now and my_status_now.name in ('TOX', 'PSN')
+        my_is_brn    = my_status_now and my_status_now.name == 'BRN'
+        my_is_asleep = my_status_now and my_status_now.name == 'SLP'
+        my_is_frz    = my_status_now and my_status_now.name == 'FRZ'
+        opp_is_asleep = opp_status_now and opp_status_now.name == 'SLP'
+
+        our_alive = sum(1 for p in battle.team.values() if not p.fainted)
+        opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
+
+        my_boosts  = dict(my_poke.boosts)  if my_poke.boosts  else {}
+        opp_boosts = dict(opp_poke.boosts) if opp_poke.boosts else {}
+        opp_has_reflect     = False
+        opp_has_lightscreen = False
+        try:
+            opp_has_reflect     = SideCondition.REFLECT      in battle.opponent_side_conditions
+            opp_has_lightscreen = SideCondition.LIGHT_SCREEN in battle.opponent_side_conditions
+        except AttributeError:
+            for sc in battle.opponent_side_conditions:
+                sc_name = sc.name if hasattr(sc, 'name') else str(sc)
+                if 'REFLECT' in sc_name.upper(): opp_has_reflect     = True
+                if 'LIGHT'   in sc_name.upper(): opp_has_lightscreen = True
+        calc_kwargs = {
+            'atk_boosts':      my_boosts,
+            'def_boosts':      opp_boosts,
+            'reflect':         opp_has_reflect,
+            'light_screen':    opp_has_lightscreen,
+            'attacker_burned': my_is_brn,
+        }
+
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 1 — Recharge lock
+        # ══════════════════════════════════════════════════════════════════
         if len(all_moves) == 1 and all_moves[0].id == 'recharge':
             print(f"  ⏳ PYTHON: recharge turn")
             self._python_call_count += 1
             return self.create_order(all_moves[0])
 
-        # ==================================================================
-        # STEP 2 — Forced: no moves and no switches
-        # ==================================================================
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 2 — No legal options
+        # ══════════════════════════════════════════════════════════════════
         if not real_moves and not switches:
             print("  🔒 FORCED: no options, using default")
             self._python_call_count += 1
             return self.choose_default_move()
 
-        # ==================================================================
-        # STEP 3 — Faint switch: Rust picks the send-in
-        # ==================================================================
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 3 — Field correctness: are we on the right mon?
+        #
+        # 3a. No moves → faint switch (Rust decides send-in)
+        # 3b. Incapacitated (asleep/frozen) → switch to best healthy mon
+        # 3c. Can act → stay (Rust's switch pruning handles bad matchups)
+        #
+        # 3b and 3c use find_best_switch for consistency.
+        # ══════════════════════════════════════════════════════════════════
+
+        # 3a — faint switch
         if not real_moves and switches:
             if len(switches) == 1:
                 print(f"  🔀 FORCED SWITCH: only {switches[0].species} left")
                 self._python_call_count += 1
                 return self.create_order(switches[0])
-
-            opp_known_types = self._opponent_move_types.get(opp_poke.species, [])
             print(f"\n  ⚙️  RUST ENGINE (faint switch)")
-            our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
-            opp_alive  = sum(1 for p in battle.opponent_team.values() if not p.fainted)
             faint_time_ms = self._time_manager.allocate(
-                battle_turn    = battle.turn,
-                our_alive      = our_alive,
-                opp_alive      = opp_alive,
-                our_hp_frac    = my_hp_frac,
-                opp_hp_frac    = opp_hp_frac,
-                is_faint_switch= True,
+                battle_turn=battle.turn, our_alive=our_alive, opp_alive=opp_alive,
+                our_hp_frac=my_hp_frac, opp_hp_frac=opp_hp_frac, is_faint_switch=True,
             )
             faint_iters = max(3000, int(faint_time_ms * NODES_PER_SEC / 1000))
             rust_order = self._try_rust_faint_switch(battle, switches,
@@ -554,398 +586,253 @@ class CompetitivePlayer(Player):
             if rust_order:
                 self._time_manager.end_turn()
                 return rust_order
-
-            # Python fallback
             best = find_best_switch(battle)
             print(f"  🔀 PYTHON FAINT SWITCH FALLBACK: {best.species}")
             self._python_call_count += 1
             return self.create_order(best)
 
-        # ==================================================================
-        # STEP 4 — We are asleep: switch out cleanly or queue best move
-        # ==================================================================
-        if my_is_asleep:
-            if switches:
-                best_sw = find_best_switch(battle)
-                if best_sw:
-                    sw_hp     = best_sw.current_hp_fraction or 0
-                    sw_asleep = best_sw.status and best_sw.status.name == 'SLP'
-                    # Don't switch to another sleeping mon or a nearly-dead mon
-                    if not sw_asleep and not (len(switches) == 1 and sw_hp < 0.30):
-                        print(f"  💤 PYTHON: asleep — switching to {best_sw.species}")
-                        self._python_call_count += 1
-                        return self.create_order(best_sw)
+        # 3b — incapacitated: switch to best non-incapacitated mon
+        if (my_is_asleep or my_is_frz) and switches:
+            best_sw = find_best_switch(battle)
+            if best_sw:
+                sw_incap = best_sw.status and best_sw.status.name in ('SLP', 'FRZ')
+                sw_hp    = best_sw.current_hp_fraction or 0
+                if not sw_incap and not (len(switches) == 1 and sw_hp < 0.30):
+                    status_name = 'asleep' if my_is_asleep else 'frozen'
+                    print(f"  💤 PYTHON: {status_name} — switching to {best_sw.species}")
+                    self._python_call_count += 1
+                    return self.create_order(best_sw)
+            # No good switch — queue best move (mon likely can't act but must submit)
             if real_moves:
-                best_asleep, _ = best_move_effectiveness(
-                    real_moves, opp_types, attacker_types=my_types
-                )
-                fallback = best_asleep or real_moves[0]
-                print(f"  💤 PYTHON: asleep — queuing {fallback.id}")
+                best_m, _ = best_move_effectiveness(real_moves, opp_types,
+                                                    attacker_types=my_types)
+                fallback = best_m or real_moves[0]
+                status_name = 'asleep' if my_is_asleep else 'frozen'
+                print(f"  💤 PYTHON: {status_name} — queuing {fallback.id}")
                 self._python_call_count += 1
                 return self.create_order(fallback)
 
-        # ==================================================================
-        # STEP 5 — Guaranteed KO: Python math is certain, no need for search
-        # (Only non-Hyperbeam KOs — HB recharge risk is a search problem)
-        # ==================================================================
-        my_boosts  = dict(my_poke.boosts)  if my_poke.boosts  else {}
-        opp_boosts = dict(opp_poke.boosts) if opp_poke.boosts else {}
-        my_burned  = my_status_now and my_status_now.name == 'BRN'
+        # 3c — we can act; fall through with confidence
 
-        opp_has_reflect     = False
-        opp_has_lightscreen = False
-        try:
-            opp_has_reflect     = SideCondition.REFLECT      in battle.opponent_side_conditions
-            opp_has_lightscreen = SideCondition.LIGHT_SCREEN in battle.opponent_side_conditions
-        except AttributeError:
-            # Defensive fallback: iterate and match by name string in case the
-            # poke-env SideCondition enum values differ from what the battle
-            # object exposes (e.g. mid-version API changes).
-            for sc in battle.opponent_side_conditions:
-                sc_name = sc.name if hasattr(sc, 'name') else str(sc)
-                if 'REFLECT' in sc_name.upper(): opp_has_reflect     = True
-                if 'LIGHT'   in sc_name.upper(): opp_has_lightscreen = True
-
-        calc_kwargs = {
-            'atk_boosts':      my_boosts,
-            'def_boosts':      opp_boosts,
-            'reflect':         opp_has_reflect,
-            'light_screen':    opp_has_lightscreen,
-            'attacker_burned': my_burned,
-        }
-
-        # Guaranteed KO check — use min damage roll (use_avg=False) so "guaranteed"
-        # means the WORST roll still kills.
-        # Exclude Hyperbeam (recharge risk handled by Rust) and explosion/selfdestruct.
-        # Also exclude Hyperbeam when we are below 15% HP — recharge turn is fatal.
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 4 — Guaranteed KO
         #
-        # PAR guard: a paralysed attacker has a 25% chance to not move at all.
-        # A KO that requires our move to land is not "guaranteed" when PAR means
-        # we may be immobilised. Skip the GKO fast-path entirely when we are PAR'd
-        # and let the Rust engine evaluate the risk properly.
-        #
-        # Speed+heal guard: if the opponent is faster AND has a revealed heal move,
-        # they will Recover/Softboiled BEFORE our attack lands on the same turn.
-        # The hp_pct we have is pre-heal — the actual HP when we hit will be ~50% higher.
-        # In this case the GKO math is correct but the premise is wrong, so skip the gate.
+        # Min-roll kills → commit, no search needed.
+        # Guards: PAR (25% miss), opp faster+healer (heals before we hit),
+        #         Hyperbeam at <15% HP, explosion/selfdestruct (Rust's call).
+        # ══════════════════════════════════════════════════════════════════
         opp_revealed_heals = self._opponent_move_names.get(opp_species, [])
-        opp_has_heal = any(m in opp_revealed_heals for m in ('recover', 'softboiled', 'rest'))
+        opp_has_heal = any(m in opp_revealed_heals
+                           for m in ('recover', 'softboiled', 'rest'))
         opp_is_faster = not outspeeds(
             my_species, opp_species,
-            a_par=(my_status_now and my_status_now.name == 'PAR'),
-            b_par=(opp_poke.status and opp_poke.status.name == 'PAR'
-                   if opp_poke.status else False)
+            a_par=bool(my_is_par),
+            b_par=bool(opp_poke.status and opp_poke.status.name == 'PAR'
+                       if opp_poke.status else False),
         )
-        my_is_par_now = my_status_now and my_status_now.name == 'PAR'
-        skip_gko = (opp_has_heal and opp_is_faster) or my_is_par_now
+        skip_gko = bool(my_is_par) or (opp_has_heal and opp_is_faster)
 
-        my_hp_too_low_for_hb = my_hp_frac < 0.15
-        ko_move_obj = None
         if not skip_gko:
             for mv in real_moves:
                 if mv.id in ('explosion', 'selfdestruct'):
                     continue
-                if mv.id == 'hyperbeam' and my_hp_too_low_for_hb:
+                if mv.id == 'hyperbeam' and my_hp_frac < 0.15:
                     continue
                 try:
-                    is_ko = can_ko(
-                        my_species, mv.id, opp_species,
-                        hp_pct=opp_hp_frac,
-                        use_avg=False,      # min roll — truly guaranteed
-                        **calc_kwargs
-                    )
+                    is_ko = can_ko(my_species, mv.id, opp_species,
+                                   hp_pct=opp_hp_frac, use_avg=False, **calc_kwargs)
                 except Exception:
                     is_ko = False
                 if is_ko:
-                    ko_move_obj = mv
-                    break
-        if ko_move_obj:
-            print(f"  🎯 PYTHON GUARANTEED KO: {ko_move_obj.id} finishes "
-                  f"{opp_poke.species} at {int(opp_hp_frac*100)}%")
-            self._python_call_count += 1
-            return self.create_order(ko_move_obj)
-
-        # ==================================================================
-        # STEP 6 — Immune to all revealed opponent moves: stay in and hit
-        # ==================================================================
-        opp_known_types = self._opponent_move_types.get(opp_poke.species, [])
-        if opp_known_types:
-            worst_incoming = worst_incoming_effectiveness(opp_known_types, my_types)
-            if worst_incoming == 0:
-                best_move, _ = best_move_effectiveness(
-                    real_moves, opp_types, attacker_types=my_types
-                )
-                if best_move:
-                    print(f"  🛡️  PYTHON: immune to all revealed moves — {best_move.id}")
+                    print(f"  🎯 PYTHON GUARANTEED KO: {mv.id} finishes "
+                          f"{opp_poke.species} at {int(opp_hp_frac*100)}%")
                     self._python_call_count += 1
-                    return self.create_order(best_move)
+                    return self.create_order(mv)
 
-        # ==================================================================
-        # STEP 7 — Sleep move: opponent has no status, we have a sleep move
-        # (Deterministic — always correct when conditions are met)
-        # Track attempts per species so we don't re-fire if the move missed.
-        # ==================================================================
-        if not self._sleep_clause_active and not opp_status_now and not _opp_has_sub:
-            sleep_move = next(
-                (m for m in real_moves if m.id in SLEEP_MOVES), None
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 5 — Status control
+        #
+        # Opponent has no status → inflict one. Priority: sleep > paralysis.
+        # Sleep eliminates turns entirely; always higher value than attacking.
+        # T-Wave: only when opp has Recover and we can't 2HKO through it.
+        # ══════════════════════════════════════════════════════════════════
+        if not opp_status_now and not _opp_has_sub:
+            # Sleep (highest priority)
+            if not self._sleep_clause_active:
+                sleep_move = next((m for m in real_moves if m.id in SLEEP_MOVES), None)
+                already_tried = self._sleep_attempted_vs.get(opp_species)
+                if sleep_move and already_tried != sleep_move.id:
+                    self._sleep_attempted_vs[opp_species] = sleep_move.id
+                    print(f"  😴 PYTHON: using {sleep_move.id}")
+                    self._python_call_count += 1
+                    return self.create_order(sleep_move)
+
+            # Thunder Wave vs Recover user
+            opp_has_recover = any(
+                m in self._opponent_move_names.get(opp_species, [])
+                for m in ('recover', 'softboiled', 'rest')
             )
-            already_tried = self._sleep_attempted_vs.get(opp_species)
-            if sleep_move and already_tried != sleep_move.id:
-                self._sleep_attempted_vs[opp_species] = sleep_move.id
-                print(f"  😴 PYTHON: using {sleep_move.id}")
-                self._python_call_count += 1
-                return self.create_order(sleep_move)
+            if opp_has_recover:
+                twave = next((m for m in real_moves if m.id == 'thunderwave'), None)
+                if twave:
+                    best_dmg = 0.0
+                    for mv in real_moves:
+                        if mv.id in ('thunderwave', *HEAL_MOVES):
+                            continue
+                        try:
+                            lo, hi = calc_damage_pct(my_species, mv.id, opp_species,
+                                                     atk_boosts=my_boosts,
+                                                     def_boosts=opp_boosts)
+                            best_dmg = max(best_dmg, (lo + hi) / 2)
+                        except Exception:
+                            pass
+                    if best_dmg < 0.50:
+                        print(f"  ⚡ PYTHON: opponent has Recover, can't 2HKO "
+                              f"(best ~{int(best_dmg*100)}%) — Thunder Wave")
+                        self._python_call_count += 1
+                        return self.create_order(twave)
 
-        # ==================================================================
-        # STEP 7b/c/e — Unified heal filter.
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 6 — Toxic fast-heal
         #
-        # All heal logic in one place with clear precedence. Applies to
-        # all Gen 1 heal moves: softboiled, recover, rest.
-        #
-        # ALWAYS heal (fire immediately before Rust):
-        #   - Toxic/Poison: escalating damage, cure now regardless of HP
-        #   - HP < 40% with Softboiled/Recover available: one hit from death
-        #
-        # NEVER offer to Rust (strip from move list):
-        #   - Rest at ≥ 85% HP without poison: 2-turn sleep for near-zero gain
-        #   - Any heal within 3 turns of last heal AND HP ≥ 80%: spam prevention
-        #   - Any heal when HP ≥ 80% AND we're up 2+ mons: press the win
-        #
-        # Everything else (40–85% HP, no active status forcing action):
-        #   defer to Rust — it has context we don't.
-        # ==================================================================
-        HEAL_MOVES = ('softboiled', 'recover', 'rest')
-        my_is_tox  = my_status_now and my_status_now.name in ('TOX', 'PSN')
-        my_is_par  = my_status_now and my_status_now.name == 'PAR'
-
-        # ALWAYS: Toxic/Poison — heal immediately, BUT only when recovery
-        # can actually help. Gen 1 Toxic escalates: counter N → N/16 HP lost
-        # per turn. Recover restores 50%. Once the counter hits 9+, Toxic
-        # drains more than 56%/turn — recovery can never catch up and we just
-        # waste turns. The correct play at that point is to switch or attack.
-        #
-        # Futility check: if we healed last turn AND HP is still lower than
-        # it was before that heal (net negative), recovery has failed — stop.
-        # Also cap at tox_counter >= 9 (>50%/turn drain beats 50% recovery).
+        # Escalating Toxic drain → heal immediately unless futile.
+        # Futile: counter ≥ 9 (drain > recovery) or losing race (healed
+        # last turn but HP still fell). Both fall through to Rust.
+        # ══════════════════════════════════════════════════════════════════
         if my_is_tox:
             heal_move = next((m for m in real_moves if m.id in HEAL_MOVES), None)
             if heal_move:
                 tox_counter = getattr(my_poke, 'toxic_turn_counter',
-                                      getattr(my_poke, 'toxic_turns_left',
-                                      None))
-                # poke-env sometimes exposes this as n_turns_statused for TOX
+                                      getattr(my_poke, 'toxic_turns_left', None))
                 if tox_counter is None:
                     try:
                         tox_counter = battle.active_pokemon.n_turns_statused
                     except AttributeError:
                         tox_counter = None
-
-                # Hard cap: counter >= 9 means ≥56.25% drain vs 50% recovery
-                tox_is_futile = (tox_counter is not None and tox_counter >= 9)
-
-                # Soft cap: if we healed last turn and HP is still trending down,
-                # recovery is not keeping up — hand off to Rust
-                healed_last_turn = (
-                    self._last_healed_turn == battle.turn - 1
-                    and self._last_healed_species == my_species
-                )
-                tox_losing_race = (
-                    healed_last_turn
-                    and my_hp_frac < self._last_healed_hp_frac - 0.05
-                )
-
+                tox_is_futile   = (tox_counter is not None and tox_counter >= 9)
+                healed_last_turn = (self._last_healed_turn == battle.turn - 1
+                                    and self._last_healed_species == my_species)
+                tox_losing_race  = (healed_last_turn
+                                    and my_hp_frac < self._last_healed_hp_frac - 0.05)
                 if not tox_is_futile and not tox_losing_race:
                     print(f"  💊 PYTHON: Toxiced — healing with {heal_move.id}")
-                    self._last_healed_turn     = battle.turn
-                    self._last_healed_species  = my_species
-                    self._last_healed_hp_frac  = my_hp_frac
-                    self._python_call_count   += 1
+                    self._last_healed_turn    = battle.turn
+                    self._last_healed_species = my_species
+                    self._last_healed_hp_frac = my_hp_frac
+                    self._python_call_count  += 1
                     return self.create_order(heal_move)
                 elif tox_is_futile:
-                    print(f"  🚫 PYTHON: Toxic futile (counter={tox_counter}, "
-                          f"drain>{50:.0f}%) — deferring to Rust")
+                    print(f"  🚫 PYTHON: Toxic futile (counter={tox_counter}) — deferring")
                 else:
-                    print(f"  🚫 PYTHON: Toxic recovery losing race "
-                          f"(HP {int(self._last_healed_hp_frac*100)}%→{int(my_hp_frac*100)}% after heal) "
-                          f"— deferring to Rust")
+                    print(f"  🚫 PYTHON: Toxic recovery losing race — deferring")
 
-        # ALWAYS: low HP — but only if we're actually in danger this turn
-        # AND healing can actually help us win.
-        heal_move_nontox = next(
-            (m for m in real_moves if m.id in ('softboiled', 'recover')), None
-        )
-        if heal_move_nontox and my_hp_frac < 0.55:
-            turns_since_heal = battle.turn - self._last_healed_turn
-            same_species     = (self._last_healed_species == my_species)
-            consecutive_heals = turns_since_heal <= 2 and same_species
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 7 — Strip non-viable moves
+        #
+        # Strip heals that are wasteful; strip attacks that are dominated.
+        # Heal moves are NEVER treated as dominated attacks — they are a
+        # separate category that Rust weighs (heal vs attack trade-off).
+        #
+        # After stripping, count remaining moves:
+        #   0 → Rust gets switches or hard fallback
+        #   1 → Python uses it (no search needed — decision is obvious)
+        #   2+ → Rust decides among legitimate options
+        # ══════════════════════════════════════════════════════════════════
+        turns_since_heal  = battle.turn - self._last_healed_turn
+        same_species_heal = (self._last_healed_species == my_species)
+        strip_log = {}  # move_id → reason
 
-            # Never fire if we've healed 2+ consecutive turns — we're in a loop.
-            # Rust should handle it; Python healing repeatedly achieves nothing.
-            if consecutive_heals:
-                pass  # fall through to Rust
-            else:
-                # Build opponent's max damage per turn from revealed moves
-                opp_known_names = self._opponent_move_names.get(opp_species, [])
-                opp_max_dmg = 0.0
-                if opp_known_names:
-                    for move_id in opp_known_names:
-                        try:
-                            lo, hi = calc_damage_pct(
-                                opp_species, move_id, my_species,
-                                atk_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
-                                def_boosts=dict(my_poke.boosts)  if my_poke.boosts  else {},
-                            )
-                            opp_max_dmg = max(opp_max_dmg, hi)
-                        except Exception:
-                            pass
-                if opp_max_dmg == 0.0:
-                    # No revealed moves — conservative fallback, but cap it
-                    # at 0.25 (not 0.30) to reduce false positives.
-                    opp_known_types = self._opponent_move_types.get(opp_species, [])
-                    worst_eff = worst_incoming_effectiveness(opp_known_types, my_types)
-                    opp_max_dmg = min(0.25 * worst_eff, 0.40)
+        # Heal strips
+        for hm in [m for m in real_moves if m.id in HEAL_MOVES]:
+            reason = None
+            if hm.id == 'rest' and my_is_par:
+                reason = "PAR+Rest = 2+ dead turns"
+            elif hm.id == 'rest' and my_hp_frac >= 0.85 and not my_is_tox:
+                reason = f"{int(my_hp_frac*100)}% HP ≥ 85% (Rest cost too high)"
+            elif hm.id in ('softboiled', 'recover'):
+                threshold = 0.95 if my_is_par else 0.90
+                if my_hp_frac >= threshold and not my_is_tox:
+                    reason = f"{int(my_hp_frac*100)}% HP ≥ {int(threshold*100)}%"
+            if reason is None and turns_since_heal <= 3 and same_species_heal and my_hp_frac >= 0.80:
+                reason = f"healed {turns_since_heal}t ago"
+            if reason is None and my_hp_frac >= 0.80 and our_alive >= opp_alive + 2:
+                reason = f"up {our_alive - opp_alive} mons"
+            if reason:
+                strip_log[hm.id] = reason
 
-                # Can-win check: if opponent also has a heal move, healing
-                # into their heal is a treadmill — don't fire, let Rust decide.
-                opp_has_heal = any(
-                    m in self._opponent_move_names.get(opp_species, [])
-                    for m in ('softboiled', 'recover', 'rest')
-                )
+        # Attack strips — compute best expected damage first (heals excluded)
+        damaging = [m for m in real_moves
+                    if m.id not in HEAL_MOVES and (m.base_power or 0) > 0]
+        best_exp_dmg  = 0.0
+        exp_dmg_cache = {}
+        for mv in damaging:
+            try:
+                lo, hi = calc_damage_pct(my_species, mv.id, opp_species,
+                                         atk_boosts=my_boosts, def_boosts=opp_boosts)
+                exp = (lo + hi) / 2
+            except Exception:
+                exp = 0.0
+            exp_dmg_cache[mv.id] = exp
+            best_exp_dmg = max(best_exp_dmg, exp)
 
-                # Net gain check: Recover restores ~50%. If opp does more
-                # than ~40% per turn, we're net negative every cycle — switch
-                # is the right answer, not heal. Let Rust decide.
-                heal_is_futile = opp_max_dmg > 0.42
+        for mv in damaging:
+            if mv.id in strip_log:
+                continue
+            reason = None
+            if mv.id == 'hyperbeam' and my_is_par:
+                reason = "PAR+Hyperbeam"
+            elif mv.id == 'hyperbeam' and my_hp_frac < 0.15:
+                reason = "Hyperbeam at <15% HP"
+            elif mv.id == 'dreameater' and not opp_is_asleep:
+                reason = "Dream Eater — opp not asleep"
+            elif best_exp_dmg > 0:
+                exp = exp_dmg_cache.get(mv.id, 0.0)
+                if exp < best_exp_dmg * 0.70:
+                    reason = (f"dominated ({int(exp*100)}% < 70% of "
+                              f"best {int(best_exp_dmg*100)}%)")
+            if reason:
+                strip_log[mv.id] = reason
 
-                if not opp_has_heal and not heal_is_futile:
-                    we_are_slower = not outspeeds(my_species, opp_species,
-                                                  a_par=(my_is_par),
-                                                  b_par=(opp_poke.status and
-                                                         opp_poke.status.name=='PAR'
-                                                         if opp_poke.status else False))
-                    hits_before_heal = 2 if we_are_slower else 1
+        # Strip status moves (base_power = 0, not heals).
+        # All status decisions were made in Step 5 — any status move
+        # that survives to Step 7 is irrelevant in the current situation.
+        for mv in real_moves:
+            if mv.id in strip_log or mv.id in HEAL_MOVES:
+                continue
+            if (mv.base_power or 0) == 0:
+                strip_log[mv.id] = "status move — handled in Step 5"
 
-                    par_scale = 1.0
-                    if my_is_par:
-                        par_success_prob = 0.75 ** hits_before_heal
-                        par_scale = 1.0 / par_success_prob
+        # Apply strips (only when alternatives survive)
+        if strip_log:
+            filtered = [m for m in real_moves if m.id not in strip_log]
+            if filtered:
+                for mv_id, reason in sorted(strip_log.items()):
+                    print(f"  🚫 PYTHON: suppressing {mv_id} ({reason})")
+                real_moves = filtered
 
-                    danger_threshold = opp_max_dmg * hits_before_heal * 1.2 * par_scale
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 8 — Single viable move: no search needed
+        # ══════════════════════════════════════════════════════════════════
+        if len(real_moves) == 1:
+            mv = real_moves[0]
+            print(f"  ⚡ PYTHON: only viable move — {mv.id}")
+            self._python_call_count += 1
+            return self.create_order(mv)
 
-                    if my_hp_frac <= danger_threshold:
-                        opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
-                        our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
-                        if not (opp_alive == 1 and our_alive >= 2):
-                            print(f"  💊 PYTHON: danger heal ({int(my_hp_frac*100)}% HP, "
-                                  f"opp max ~{int(opp_max_dmg*100)}%/turn, "
-                                  f"{'slower' if we_are_slower else 'faster'}"
-                                  f"{f', PAR ×{par_scale:.2f}' if my_is_par else ''}) "
-                                  f"— healing with {heal_move_nontox.id}")
-                            self._last_healed_turn    = battle.turn
-                            self._last_healed_species = my_species
-                            self._python_call_count  += 1
-                            return self.create_order(heal_move_nontox)
-
-        # NEVER (strip from move list before Rust):
-        heal_moves_available = [m for m in real_moves if m.id in HEAL_MOVES]
-        if heal_moves_available:
-            opp_alive = sum(1 for p in battle.opponent_team.values() if not p.fainted)
-            our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
-            turns_since_heal = battle.turn - self._last_healed_turn
-            same_species     = (self._last_healed_species == my_species)
-
-            strip_heals = {}  # move_id → reason string
-            for hm in heal_moves_available:
-                # Rest at high HP without poison: 2-turn sleep cost is too high.
-                # Instant heals (Softboiled/Recover) use a higher threshold since
-                # they don't incapacitate. When paralysed, PAR chip (~10%/turn)
-                # erodes HP quickly so we allow healing until 95% (not 90%).
-                if hm.id == 'rest':
-                    hp_threshold = 0.85
-                elif my_is_par:
-                    hp_threshold = 0.95  # PAR chip will eat the margin fast
-                else:
-                    hp_threshold = 0.90
-                if my_hp_frac >= hp_threshold and not my_is_tox:
-                    strip_heals[hm.id] = f"{int(my_hp_frac*100)}% HP ≥ {int(hp_threshold*100)}%"
-                # Heal spam: healed same mon within last 3 turns and HP still high
-                elif turns_since_heal <= 3 and same_species and my_hp_frac >= 0.80:
-                    strip_heals[hm.id] = f"healed {turns_since_heal}t ago"
-                # Up on mons significantly: press the advantage, don't stall
-                elif my_hp_frac >= 0.80 and our_alive >= opp_alive + 2:
-                    strip_heals[hm.id] = f"up {our_alive - opp_alive} mons"
-
-            if strip_heals:
-                filtered = [m for m in real_moves if m.id not in strip_heals]
-                if filtered:  # only strip if alternatives exist
-                    for mv_id, reason in sorted(strip_heals.items()):
-                        print(f"  🚫 PYTHON: suppressing {mv_id} ({reason})")
-                    real_moves = filtered
-
-        # ==================================================================
-        # STEP 7e — Recover stall prevention: if opponent has Recover and
-        # we cannot 2HKO them, Thunder Wave is higher value than attacking.
-        # Paralysing a Recover user cuts their speed and creates win conditions
-        # through PAR immobilisation. Without T-Wave the matchup is unwinnable
-        # by damage alone.
-        # ==================================================================
-        opp_has_recover = any(
-            m in self._opponent_move_names.get(opp_species, [])
-            for m in ('recover', 'softboiled', 'rest')
-        )
-        if opp_has_recover and not (opp_poke.status and opp_poke.status.name == 'PAR'):
-            twave = next((m for m in real_moves if m.id == 'thunderwave'), None)
-            if twave:
-                # Check if we can 2HKO (deal >50% per hit)
-                best_dmg = 0.0
-                for mv in real_moves:
-                    if mv.id in ('thunderwave', 'recover', 'softboiled', 'rest'):
-                        continue
-                    try:
-                        lo, hi = calc_damage_pct(
-                            my_species, mv.id, opp_species,
-                            atk_boosts=dict(my_poke.boosts) if my_poke.boosts else {},
-                            def_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
-                        )
-                        best_dmg = max(best_dmg, (lo + hi) / 2)
-                    except Exception:
-                        pass
-                if best_dmg < 0.50:
-                    # Can't 2HKO — T-Wave is the winning move
-                    print(f"  ⚡ PYTHON: opponent has Recover, can't 2HKO "
-                          f"(best ~{int(best_dmg*100)}%) — Thunder Wave")
-                    self._python_call_count += 1
-                    return self.create_order(twave)
-        # ==================================================================
-        if my_is_par and any(m.id == 'hyperbeam' for m in real_moves):
-            non_hb = [m for m in real_moves if m.id != 'hyperbeam']
-            if any((m.base_power or 0) > 0 for m in non_hb):
-                real_moves = non_hb
-                print(f"  🚫 PYTHON: paralysed — suppressing Hyperbeam")
-
-        # ==================================================================
-        # STEP 8 — RUST ENGINE
-        # Everything else: switch timing, Hyperbeam risk/reward, Thunder Wave,
-        # matchup evaluation, stall breaks, damage races, late-game decisions.
-        # ==================================================================
-        # Pass the filtered move list so suppressed moves (e.g. HB when PAR)
-        # are never visible to the search.
+        # ══════════════════════════════════════════════════════════════════
+        # STEP 9 — Rust engine
+        #
+        # 2+ viable moves remain. Rust decides:
+        #   heal vs attack trade-off, switch timing, Hyperbeam risk/reward,
+        #   damage races, endgame trades.
+        # ══════════════════════════════════════════════════════════════════
         active_move_ids = [m.id for m in real_moves]
 
-        # Allocate compute time based on position complexity
-        our_alive  = sum(1 for p in battle.team.values() if not p.fainted)
-        opp_alive  = sum(1 for p in battle.opponent_team.values() if not p.fainted)
         time_budget_ms = self._time_manager.allocate(
-            battle_turn    = battle.turn,
-            our_alive      = our_alive,
-            opp_alive      = opp_alive,
-            our_hp_frac    = my_hp_frac,
-            opp_hp_frac    = opp_hp_frac,
-            is_faint_switch= False,
+            battle_turn=battle.turn, our_alive=our_alive, opp_alive=opp_alive,
+            our_hp_frac=my_hp_frac, opp_hp_frac=opp_hp_frac, is_faint_switch=False,
         )
         print(f"  ⏱  Time budget: {time_budget_ms}ms ({self._time_manager.status()})")
-
-        # Floor of 3000 preserves minimum quality on very short budgets.
         iters = max(3000, int(time_budget_ms * NODES_PER_SEC / 1000))
 
         rust_result = self._try_rust_engine(
@@ -959,69 +846,38 @@ class CompetitivePlayer(Player):
         if rust_result is None:
             return self._hard_fallback(battle, real_moves, switches)
 
-        # Post-process: veto Hyperbeam when position is deeply losing
-        # BUT: never veto a guaranteed KO — if they die, there's no recharge turn.
-        # BUT: never veto when opponent is asleep — a sleeping opponent can't move
-        # during our recharge turn, so the recharge risk is zero.
+        # Post-process: veto Hyperbeam in deeply losing positions
+        # (unless it's a guaranteed KO — dead opp can't punish recharge)
         last = getattr(self, '_last_rust_result', {})
-        opp_is_asleep = opp_poke.status and opp_poke.status.name == 'SLP'
         if (last.get('action', {}).get('id') == 'hyperbeam'
                 and last.get('score', 0) < -2000
                 and not opp_is_asleep):
-            # Check if this is a guaranteed KO before vetoing
-            hb_is_guaranteed_ko = can_ko(
+            hb_is_gko = can_ko(
                 my_species, 'hyperbeam', opp_species,
-                hp_pct=opp_hp_frac, use_avg=False,  # use min roll = guaranteed
-                atk_boosts=dict(my_poke.boosts) if my_poke.boosts else {},
-                def_boosts=dict(opp_poke.boosts) if opp_poke.boosts else {},
+                hp_pct=opp_hp_frac, use_avg=False,
+                atk_boosts=my_boosts, def_boosts=opp_boosts,
             ) if opp_hp_frac > 0 else False
-            if not hb_is_guaranteed_ko:
+            if not hb_is_gko:
                 alt = next(
                     (m for m in real_moves
                      if m.id != 'hyperbeam' and m.base_power and m.base_power > 0),
-                    None
+                    None,
                 )
                 if alt:
-                    print(f"  🚫 PYTHON: vetoing Hyperbeam (score={last['score']:.0f}, losing) "
-                          f"— using {alt.id} instead")
+                    print(f"  🚫 PYTHON: vetoing Hyperbeam (score={last['score']:.0f}, "
+                          f"losing) — using {alt.id} instead")
                     self._python_call_count += 1
                     return self.create_order(alt)
 
-        # Post-process: switch cooldown — if the active mon switched in last
-        # turn, don't immediately switch out again unless HP is below 50%.
-        # Repeated pivoting wastes turns and chips our own mons on switch-in damage.
-        # EXCEPTION: disabled when position is deeply losing (score < -3000) —
-        # in that case the search found a switch as the recovery line and we
-        # should trust it. 7 cases in logs where this blocked a score=-8976 escape.
-        last_action = last.get('action', {})
+        # Track heal and switch state for next turn's strip logic
+        last_action    = last.get('action', {})
         last_action_id = last_action.get('id', '')
-        last_score = last.get('score', 0)
-        if last_action.get('type') == 'switch' and last_score > -3000:
-            just_switched_in = (
-                self._last_switched_in_species == my_species
-                and battle.turn - self._last_switched_in_turn == 1
-            )
-            if just_switched_in and my_hp_frac > 0.50 and real_moves:
-                best_move, _ = best_move_effectiveness(
-                    real_moves, opp_types, attacker_types=my_types
-                )
-                if best_move:
-                    print(f"  🚫 PYTHON: switch cooldown (just switched in) "
-                          f"— attacking with {best_move.id}")
-                    self._python_call_count += 1
-                    return self.create_order(best_move)
-
-        # Track heals so the unified heal filter above can apply the
-        # spam-prevention cooldown next turn.
         if last_action_id in ('softboiled', 'recover', 'rest'):
             self._last_healed_turn    = battle.turn
             self._last_healed_species = my_species
-
-        # Track the switch we're about to make
         if last_action.get('type') == 'switch':
-            target_species = last_action.get('species', '').lower()
             self._last_switched_in_turn    = battle.turn
-            self._last_switched_in_species = target_species
+            self._last_switched_in_species = last_action.get('species', '').lower()
 
         return rust_result
 
