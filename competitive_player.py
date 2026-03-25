@@ -340,7 +340,31 @@ class CompetitivePlayer(Player):
                         if move_type not in self._opponent_move_types[species]:
                             self._opponent_move_types[species].append(move_type)
 
-        await super()._handle_battle_message(split_messages)
+        # Sanitise |request| messages: Showdown sends "id": "fight" when the
+        # active mon is asleep (sleep-locked forced move). poke-env rejects
+        # "fight" because it's not in the mon's known moveset. Replace with
+        # "struggle" which poke-env handles as a valid forced-move fallback.
+        import json as _json
+        sanitised = []
+        for msg in split_messages:
+            if msg and len(msg) >= 3 and msg[1] == 'request':
+                try:
+                    req = _json.loads(msg[2])
+                    changed = False
+                    for slot in req.get('active', [{}]):
+                        for mv in slot.get('moves', []):
+                            if mv.get('id') == 'fight':
+                                mv['id']   = 'struggle'
+                                mv['move'] = 'Struggle'
+                                changed = True
+                    if changed:
+                        msg = list(msg)
+                        msg[2] = _json.dumps(req)
+                except Exception:
+                    pass
+            sanitised.append(msg)
+
+        await super()._handle_battle_message(sanitised)
 
     # -------------------------------------------------------------------------
     # Core decision engine
@@ -565,12 +589,29 @@ class CompetitivePlayer(Player):
         }
 
         # ══════════════════════════════════════════════════════════════════
-        # STEP 1 — Recharge lock
+        # STEP 1 — Forced single-move turns
         # ══════════════════════════════════════════════════════════════════
         if len(all_moves) == 1 and all_moves[0].id == 'recharge':
             print(f"  ⏳ PYTHON: recharge turn")
             self._python_call_count += 1
             return self.create_order(all_moves[0])
+
+        # 'struggle' covers real Struggle (no PP) and sleep-locked 'fight'
+        # sanitised to struggle. When switches exist, Showdown expects a switch.
+        # When no switches exist, use choose_default_move() — it sends the
+        # correct protocol message for locked turns that Showdown accepts.
+        if len(all_moves) == 1 and all_moves[0].id == 'struggle':
+            switches = battle.available_switches
+            if switches:
+                best_sw = find_best_switch(battle)
+                target = best_sw if best_sw else switches[0]
+                print(f"  💤 PYTHON: sleep-locked — switching to {target.species}")
+                self._python_call_count += 1
+                return self.create_order(target)
+            else:
+                print(f"  💤 PYTHON: sleep-locked (no switches) — default move")
+                self._python_call_count += 1
+                return self.choose_default_move()
 
         # ══════════════════════════════════════════════════════════════════
         # STEP 2 — No legal options
@@ -624,7 +665,18 @@ class CompetitivePlayer(Player):
                     print(f"  💤 PYTHON: {status_name} — switching to {best_sw.species}")
                     self._python_call_count += 1
                     return self.create_order(best_sw)
-            # No good switch — queue best move (mon likely can't act but must submit)
+            # All available switches are also incapacitated — don't ping-pong.
+            # Use default move (sleep-locked token) same as Step 1 handles it.
+            all_incap = all(
+                p.status and p.status.name in ('SLP', 'FRZ')
+                for p in switches
+            )
+            if all_incap:
+                status_name = 'asleep' if my_is_asleep else 'frozen'
+                print(f"  💤 PYTHON: {status_name} — all switches also incapacitated, default move")
+                self._python_call_count += 1
+                return self.choose_default_move()
+            # No good switch but some switches are healthy — queue best move
             if real_moves:
                 best_m, _ = best_move_effectiveness(real_moves, opp_types,
                                                     attacker_types=my_types)
@@ -652,7 +704,7 @@ class CompetitivePlayer(Player):
             b_par=bool(opp_poke.status and opp_poke.status.name == 'PAR'
                        if opp_poke.status else False),
         )
-        skip_gko = bool(my_is_par) or (opp_has_heal and opp_is_faster)
+        skip_gko = bool(my_is_par) or bool(my_is_asleep) or bool(my_is_frz) or (opp_has_heal and opp_is_faster)
 
         if not skip_gko:
             for mv in real_moves:

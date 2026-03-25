@@ -81,6 +81,7 @@ fn exec_our_move(state: &mut BattleState, mid: Option<u16>) {
         if state.ours.active.hp == 0 { state.ours.active.fainted = true; return; }
     }
 
+    if apply_heal(&mut state.ours.active, mid) { return; }
     apply_damage_to_side(state.ours.active, mid, &mut state.theirs, &mut state.ours.active);
 }
 
@@ -94,6 +95,7 @@ fn exec_opp_move(state: &mut BattleState, mid: Option<u16>) {
         if state.theirs.active.hp == 0 { state.theirs.active.fainted = true; return; }
     }
 
+    if apply_heal(&mut state.theirs.active, mid) { return; }
     apply_damage_to_side(state.theirs.active, mid, &mut state.ours, &mut state.theirs.active);
 }
 
@@ -103,6 +105,28 @@ fn valid_mid(mid: Option<u16>, user: &BattlePoke) -> Option<u16> {
     if user.recharging { return None; }
     if user.status.is_immobilising() { return None; }
     Some(m)
+}
+
+// ─── Heal move application ────────────────────────────────────────────────────
+
+/// Returns true if the move was a heal move and was applied.
+/// Recover / Softboiled: restore 50% of max HP (Gen 1 — no fail at high HP).
+/// Rest: restore to full HP, set SLP with 2 sleep turns, clear other status.
+fn apply_heal(user: &mut BattlePoke, mid: u16) -> bool {
+    match id_to_move(mid) {
+        "recover" | "softboiled" => {
+            let heal = user.max_hp / 2;
+            user.hp = (user.hp + heal).min(user.max_hp);
+            true
+        }
+        "rest" => {
+            user.hp     = user.max_hp;
+            user.status = Status::Slp;
+            user.sleep_turns = 2;
+            true
+        }
+        _ => false,
+    }
 }
 
 // ─── Core damage application — pure integer arithmetic ────────────────────────
