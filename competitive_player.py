@@ -596,22 +596,23 @@ class CompetitivePlayer(Player):
             self._python_call_count += 1
             return self.create_order(all_moves[0])
 
-        # 'struggle' covers real Struggle (no PP) and sleep-locked 'fight'
-        # sanitised to struggle. When switches exist, Showdown expects a switch.
-        # When no switches exist, use choose_default_move() — it sends the
-        # correct protocol message for locked turns that Showdown accepts.
+        # 'struggle' = sleep-locked 'fight' token sanitised, or real Struggle.
+        # When switches exist, defer to Rust — it models stay-in vs switch.
+        # Only intervene when all switches are also incapacitated (Rust can't
+        # help there) or when there are genuinely no switches.
         if len(all_moves) == 1 and all_moves[0].id == 'struggle':
             switches = battle.available_switches
-            if switches:
-                best_sw = find_best_switch(battle)
-                target = best_sw if best_sw else switches[0]
-                print(f"  💤 PYTHON: sleep-locked — switching to {target.species}")
-                self._python_call_count += 1
-                return self.create_order(target)
-            else:
+            if not switches:
                 print(f"  💤 PYTHON: sleep-locked (no switches) — default move")
                 self._python_call_count += 1
                 return self.choose_default_move()
+            non_incap = [p for p in switches
+                         if not (p.status and p.status.name in ('SLP', 'FRZ'))]
+            if not non_incap:
+                print(f"  💤 PYTHON: sleep-locked — all switches incapacitated, default move")
+                self._python_call_count += 1
+                return self.choose_default_move()
+            # Healthy switches exist — fall through to Rust
 
         # ══════════════════════════════════════════════════════════════════
         # STEP 2 — No legal options
@@ -631,8 +632,8 @@ class CompetitivePlayer(Player):
         # 3b and 3c use find_best_switch for consistency.
         # ══════════════════════════════════════════════════════════════════
 
-        # 3a — faint switch
-        if not real_moves and switches:
+        # 3a — faint switch (no moves because mon is fainted, not sleep-locked)
+        if not real_moves and switches and not (my_is_asleep or my_is_frz):
             if len(switches) == 1:
                 print(f"  🔀 FORCED SWITCH: only {switches[0].species} left")
                 self._python_call_count += 1
@@ -654,19 +655,11 @@ class CompetitivePlayer(Player):
             self._python_call_count += 1
             return self.create_order(best)
 
-        # 3b — incapacitated: switch to best non-incapacitated mon
+        # 3b — incapacitated (asleep/frozen): Rust now models both "stay in"
+        # and "switch out" since legal_actions includes switches for sleeping mons.
+        # Python only intervenes when all switches are also incapacitated
+        # (ping-pong avoidance) or when Rust is unavailable.
         if (my_is_asleep or my_is_frz) and switches:
-            best_sw = find_best_switch(battle)
-            if best_sw:
-                sw_incap = best_sw.status and best_sw.status.name in ('SLP', 'FRZ')
-                sw_hp    = best_sw.current_hp_fraction or 0
-                if not sw_incap and not (len(switches) == 1 and sw_hp < 0.30):
-                    status_name = 'asleep' if my_is_asleep else 'frozen'
-                    print(f"  💤 PYTHON: {status_name} — switching to {best_sw.species}")
-                    self._python_call_count += 1
-                    return self.create_order(best_sw)
-            # All available switches are also incapacitated — don't ping-pong.
-            # Use default move (sleep-locked token) same as Step 1 handles it.
             all_incap = all(
                 p.status and p.status.name in ('SLP', 'FRZ')
                 for p in switches
@@ -676,15 +669,7 @@ class CompetitivePlayer(Player):
                 print(f"  💤 PYTHON: {status_name} — all switches also incapacitated, default move")
                 self._python_call_count += 1
                 return self.choose_default_move()
-            # No good switch but some switches are healthy — queue best move
-            if real_moves:
-                best_m, _ = best_move_effectiveness(real_moves, opp_types,
-                                                    attacker_types=my_types)
-                fallback = best_m or real_moves[0]
-                status_name = 'asleep' if my_is_asleep else 'frozen'
-                print(f"  💤 PYTHON: {status_name} — queuing {fallback.id}")
-                self._python_call_count += 1
-                return self.create_order(fallback)
+            # Fall through to Rust — it will decide stay-in vs switch
 
         # 3c — we can act; fall through with confidence
 
@@ -1006,26 +991,12 @@ class CompetitivePlayer(Player):
             label  = action.get("id") or action.get("species") or atype or "?"
 
             # ── Handle __sleep_frz__ internal token ───────────────────────
+            # Rust returned this when it evaluated staying in the sleeping/frozen
+            # mon as better than switching. Submit the sleep-locked move token.
             if atype == "move" and action.get("id") == "__sleep_frz__":
-                print(f"  ⚙️  RUST: active is frozen/asleep — finding best switch")
-                switches = battle.available_switches
-                if switches:
-                    best = max(
-                        (p for p in switches
-                         if not (p.status and p.status.name in ('SLP', 'FRZ'))),
-                        key=lambda p: p.current_hp_fraction or 0,
-                        default=None
-                    ) or switches[0]
-                    print(f"  ✅ RUST [frozen/sleep switch]: {best.species}")
-                    self._rust_call_count += 1
-                    return self.create_order(best)
-                real_moves = [m for m in battle.available_moves
-                              if m.id not in ('struggle', 'recharge', '__sleep_frz__')]
-                if real_moves:
-                    best_m = max(real_moves, key=lambda m: m.base_power or 0)
-                    self._rust_call_count += 1
-                    return self.create_order(best_m)
-                return None
+                print(f"  ⚙️  RUST: staying in while asleep/frozen (better than switching)")
+                self._rust_call_count += 1
+                return self.choose_default_move()
 
             print(f"  ✅ RUST [{algo}]: {label} (score={score:.0f}, nodes={nodes}) | {reason}")
             self._rust_call_count += 1

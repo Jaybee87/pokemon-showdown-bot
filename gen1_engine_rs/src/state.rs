@@ -208,8 +208,17 @@ pub fn legal_actions(side: &Side) -> Vec<Action> {
     if side.active.recharging {
         return vec![Action::Recharge];
     }
+
+    // When the active mon is sleeping or frozen it cannot use moves,
+    // but it CAN be switched out. Include the sleep/frz token so the
+    // search models the "stay in and wait" line, plus all switches so
+    // it can evaluate whether switching is better.
     if side.active.status.is_immobilising() {
-        return vec![Action::Move { id: MOVE_SLEEP_FRZ }];
+        let mut out = vec![Action::Move { id: MOVE_SLEEP_FRZ }];
+        for p in side.switches() {
+            out.push(Action::Switch { species: p.species });
+        }
+        return out;
     }
 
     let mut out = Vec::with_capacity(8);

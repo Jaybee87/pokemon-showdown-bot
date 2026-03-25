@@ -413,6 +413,15 @@ fn action_score(action: &Action, attacker: &Side, defender: &Side) -> f64 {
     match action {
         Action::Recharge => -500.0,
         Action::Move { id } => {
+            if *id == crate::ids::MOVE_SLEEP_FRZ {
+                // Staying in while asleep: we do nothing, opponent hits freely.
+                // Score as negative expected damage taken this turn so the search
+                // correctly weighs "sleep through it" vs switching out.
+                let opp_best = defender.active.move_ids().iter()
+                    .map(|&mid| sim_expected_damage_pct(&defender.active, mid, &attacker.active, false, false))
+                    .fold(0.0f64, f64::max);
+                return -opp_best * 100.0;
+            }
             if guaranteed_ko(&attacker.active, *id, &defender.active) { return 10000.0; }
             if can_ko(&attacker.active, *id, &defender.active)         { return  5000.0; }
             sim_expected_damage_pct(&attacker.active, *id, &defender.active, false, false) * 100.0

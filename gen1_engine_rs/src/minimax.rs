@@ -146,6 +146,12 @@ fn score_our_action(action: &Action, attacker: &Side, defender: &Side) -> f64 {
     match action {
         Action::Recharge => -1000.0,
         Action::Move { id } => {
+            if *id == crate::ids::MOVE_SLEEP_FRZ {
+                let opp_best = defender.active.move_ids().iter()
+                    .map(|&mid| sim_expected_damage_pct(&defender.active, mid, &attacker.active, false, false))
+                    .fold(0.0f64, f64::max);
+                return -opp_best * 100.0;
+            }
             if guaranteed_ko(&attacker.active, *id, &defender.active) { return 10000.0; }
             if can_ko(&attacker.active, *id, &defender.active)         { return  5000.0; }
             sim_expected_damage_pct(&attacker.active, *id, &defender.active, false, false) * 100.0
